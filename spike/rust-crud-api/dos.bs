@@ -1,0 +1,6 @@
+#!/bin/bash
+while :
+do
+curl -s -X POST localhost:3000/transaction -H "Content-Type: application/json" -d @badtx.json -o /dev/null
+
+done
