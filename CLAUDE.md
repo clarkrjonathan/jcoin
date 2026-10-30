@@ -33,7 +33,10 @@ not in this repo:
     signing bytes + verification, SHA-256 tx id).
   - `src/node.rs` — node core: `NodeRequest`/`SubmitResult`/`StatusResult` and
     the `run_node` task.
-  - `src/bin/node.rs` — axum REST server.
+  - `src/p2p/` — peer-to-peer layer: `frame` (JEFY codec), `message` (gossip-v1
+    messages), `link` (the `PeerLink` seam), `peer` (handshake, run loop,
+    `run_peer`), `network` (peer registry and gossip fan-out).
+  - `src/bin/node.rs` — axum REST server plus the P2P listener and dialers.
   - `src/bin/wallet.rs` — clap wallet CLI.
 - `spike/` — **frozen scratchwork**. The original `rust-crud-api` spike where the
   wallet → REST → node → signature-verify path was first proven. Do not build on
@@ -53,14 +56,20 @@ A clearly-defined proof-of-concept slice (from `Design/Initial vertical.md`):
   `oneshot` reply. The core owns all state (no locks).
 - Validation is **signature only**. Nonce and balance checks are intentionally
   not performed yet. Balance and status endpoints return dummy values.
-- A valid transaction is passed to a `relay_handler` stub (the "listener type"
-  from the notes) that will later gossip to peers over TCP.
+
+### Built since the vertical
+
+- Transaction gossip over **direct TCP** (`src/p2p/`): the `JEFY` frame codec,
+  the symmetric `HELLO` handshake, `PING`/`PONG` heartbeat, and
+  `NEW_TRANSACTION` relayed to peers except the source. Verified by a two-node
+  integration test. See `docs/p2p-protocol.md`.
 
 ### Explicitly out of scope (later phases)
 
-Proof of work / mining, real P2P / TCP gossip, the AWS CGNAT relay, balance and
-nonce validation, persistence / database, blocks and the chain, difficulty, peer
-discovery, and the `type/amount/fee` transaction freeze.
+Proof of work / mining, the relay transport (multiplexing router, designed in
+`docs/p2p-protocol.md` but not built), peer discovery (`GET_ADDR` / `ADDR`),
+balance and nonce validation, persistence / database, blocks and the chain,
+difficulty, and the `type/amount/fee` transaction freeze.
 
 ## Build and run
 
@@ -68,13 +77,19 @@ discovery, and the `type/amount/fee` transaction freeze.
 cd jcoin
 cargo build
 
-# Terminal A: start the node (defaults to 0.0.0.0:3000; override with JCOIN_NODE_ADDR)
-cargo run --bin node
+# Terminal A: node A (REST on :3000, P2P on :8333)
+cargo run --bin node -- --rest-addr 127.0.0.1:3000 --p2p-addr 127.0.0.1:8333
 
-# Terminal B: use the wallet
+# Terminal B: node B, dialing node A
+cargo run --bin node -- --rest-addr 127.0.0.1:3001 --p2p-addr 127.0.0.1:8334 \
+  --peer 127.0.0.1:8333
+
+# Terminal C: use the wallet against either node
 cargo run --bin wallet -- key new alice
-cargo run --bin wallet -- transaction new alice <recipient-hex-64> 1000 --fee 50
-cargo run --bin wallet -- transaction status <tx_id>
+cargo run --bin wallet -- --node http://127.0.0.1:3000 \
+  transaction new alice <recipient-hex-64> 1000 --fee 50
+cargo run --bin wallet -- --node http://127.0.0.1:3001 \
+  transaction status <tx_id>   # a tx sent to A is visible from B
 ```
 
 Wallet keys are stored as a hex seed under `--key-dir` (default `.jcoin-keys`),

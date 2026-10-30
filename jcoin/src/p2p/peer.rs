@@ -280,3 +280,113 @@ mod tests {
         );
     }
 }
+
+/// Two in-process nodes connected over a real TCP socket, exercising handshake,
+/// the run loop, and gossip end to end.
+#[cfg(test)]
+mod gossip_tests {
+    use super::run_peer;
+
+    use std::time::Duration;
+
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{mpsc, oneshot};
+
+    use crate::node::{run_node, NodeRequest, StatusResult, SubmitResult};
+    use crate::p2p::Network;
+    use crate::Transaction;
+
+    fn signed_tx(nonce: u32) -> Transaction {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut tx = Transaction {
+            sender: key.verifying_key().to_bytes(),
+            recipient: [5u8; 32],
+            input: 100,
+            output: 90,
+            nonce,
+            signature: [0u8; 64],
+        };
+        tx.signature = key.sign(&tx.signing_bytes()).to_bytes();
+        tx
+    }
+
+    fn spawn_core() -> mpsc::Sender<NodeRequest> {
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(run_node(rx));
+        tx
+    }
+
+    async fn is_seen(core: &mpsc::Sender<NodeRequest>, tx_id: &str) -> bool {
+        let (reply, rx) = oneshot::channel();
+        core.send(NodeRequest::GetStatus {
+            tx_id: tx_id.to_string(),
+            reply,
+        })
+        .await
+        .unwrap();
+        matches!(rx.await.unwrap(), StatusResult::Seen)
+    }
+
+    async fn wait_until<F: Fn() -> bool>(check: F) -> bool {
+        for _ in 0..100 {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        check()
+    }
+
+    #[tokio::test]
+    async fn gossip_propagates_between_two_nodes() {
+        let core_a = spawn_core();
+        let core_b = spawn_core();
+        let net_a = Network::new();
+        let net_b = Network::new();
+
+        // A real loopback TCP connection between the two nodes.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client_stream = connect.await.unwrap();
+
+        tokio::spawn(run_peer(server_stream, 1, core_a.clone(), net_a.clone(), "A".into()));
+        tokio::spawn(run_peer(client_stream, 2, core_b.clone(), net_b.clone(), "B".into()));
+
+        assert!(
+            wait_until(|| net_a.peer_count() == 1 && net_b.peer_count() == 1).await,
+            "handshake did not complete"
+        );
+
+        // Submit to A on the same path the REST layer uses: accept, then relay.
+        let tx = signed_tx(1);
+        let tx_id = tx.tx_id_hex();
+        let (reply, rx) = oneshot::channel();
+        core_a
+            .send(NodeRequest::SubmitTransaction {
+                tx: tx.clone(),
+                reply,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.await.unwrap(),
+            SubmitResult::Accepted { is_new: true, .. }
+        ));
+        net_a.broadcast_transaction(&tx, None);
+
+        // B should receive the gossiped transaction and record it as seen.
+        let mut reached_b = false;
+        for _ in 0..100 {
+            if is_seen(&core_b, &tx_id).await {
+                reached_b = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(reached_b, "transaction did not gossip to node B");
+    }
+}

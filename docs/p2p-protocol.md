@@ -1,9 +1,11 @@
 # JeffyCoin peer-to-peer protocol
 
-Status: gossip v1 and the outer relay transport are settled at the architecture
-level. Byte-level encodings and a few tuning values are marked as "to fix at
-implementation". This document records decisions; the design discussion lives in
-the Obsidian vault note `Design/Network Communication.md`.
+Status: gossip v1 is implemented over direct TCP (frame codec, handshake,
+heartbeat, `NEW_TRANSACTION` gossip) and verified by unit tests and a two-node
+integration test. `GET_ADDR` / `ADDR` and the outer relay transport are designed
+but not yet built. Byte-level encodings and a few tuning values are marked as "to
+fix at implementation". This document records decisions; the design discussion
+lives in the Obsidian vault note `Design/Network Communication.md`.
 
 ## Design principles
 
