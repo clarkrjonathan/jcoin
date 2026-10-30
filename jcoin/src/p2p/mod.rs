@@ -7,7 +7,9 @@
 pub mod frame;
 pub mod link;
 pub mod message;
+pub mod peer;
 
 pub use frame::{FrameError, RawFrame, HEADER_LEN, MAGIC, MAX_PAYLOAD, PROTOCOL_VERSION};
 pub use link::PeerLink;
 pub use message::{read_message, write_message, Hello, Message, MessageError};
+pub use peer::{handshake, local_hello, HandshakeError};
