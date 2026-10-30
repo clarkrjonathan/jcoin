@@ -40,7 +40,9 @@ not in this repo:
   it; it is kept for reference only.
 - `docs/p2p-protocol.md` — the peer-to-peer wire protocol. Gossip v1 (frame
   envelope, symmetric `HELLO` handshake, `PING`/`PONG`, `NEW_TRANSACTION`,
-  `GET_ADDR`/`ADDR`) is settled; the outer relay transport is a draft.
+  `GET_ADDR`/`ADDR`) and the outer relay transport (multiplexing router with
+  ephemeral directory handles, `Direct`/`Relay` addressing) are settled at the
+  architecture level; byte encodings and tuning values remain.
 
 ## Current scope: the Initial Vertical
 

@@ -1,8 +1,9 @@
 # JeffyCoin peer-to-peer protocol
 
-Status: gossip v1 is settled. The outer relay transport is a draft and is marked
-as such. This document records decisions; the design discussion lives in the
-Obsidian vault note `Design/Network Communication.md`.
+Status: gossip v1 and the outer relay transport are settled at the architecture
+level. Byte-level encodings and a few tuning values are marked as "to fix at
+implementation". This document records decisions; the design discussion lives in
+the Obsidian vault note `Design/Network Communication.md`.
 
 ## Design principles
 
@@ -26,7 +27,7 @@ Obsidian vault note `Design/Network Communication.md`.
     PeerLink  (a byte stream to one peer)       <- the seam
        /  \
  DirectLink  RelayLink
- (TcpStream) (paired connection through a relay)
+ (TcpStream) (one channel of the node's relay connection)
 ```
 
 `PeerLink` is the abstraction that makes principle 2 hold. Establishing a
@@ -125,38 +126,99 @@ A node keeps a local database of known peers and shares it with any node that
 asks (per the vault research note). `GET_ADDR` has an empty payload. `ADDR`
 carries a list of peer address records.
 
-A peer address is a tagged union, so a record states how a peer is reachable
-rather than assuming a dialable IP. This is what lets the relay be added later
-without reshaping the record:
+A peer record lists one or more reachability endpoints, so it states how a peer
+is reachable rather than assuming a dialable IP. An endpoint is one of:
 
-- `Direct { ip, port }` — used now, for direct connections.
-- `Relay { relay_endpoint, routing_token }` — reserved; filled in with the relay
-  transport. The `routing_token` is ephemeral and rotatable, lives only here and
-  in the outer transport, and never appears in `HELLO` or in a transaction.
+- `Direct { ip, port }` — a directly dialable address (a public node).
+- `Relay { relay_endpoint, handle }` — reach the peer through a relay, where
+  `handle` is the peer's ephemeral directory handle (section 7). The handle lives
+  only here and in the outer transport, and never appears in `HELLO` or in a
+  transaction.
 
-The exact byte encoding of the union and of the `ADDR` list is to be fixed when
+A node advertising itself bundles its own endpoints in one record, for example a
+public node with relay fallback advertises both a `Direct` and a `Relay`
+endpoint. `dial` tries `Direct` first and falls back to `Relay`, so a peer moves
+between transports with no change above the `PeerLink` seam.
+
+Stable cross-path node identity (recognizing that a `Direct` and a `Relay`
+endpoint are the same node when they are not bundled in one record) is deferred.
+Duplicate links are harmless because gossip dedups by transaction id. The exact
+byte encoding of an endpoint and of the `ADDR` list is to be fixed when
 `GET_ADDR` / `ADDR` are implemented.
 
-## 7. Outer relay transport (DRAFT, not yet settled)
+## 7. Outer relay transport
 
 Goal: two nodes behind carrier-grade NAT (CGNAT) talk through a relay that
-forwards bytes and understands no chain data, and the switch between relay and
-direct links is seamless.
+forwards opaque bytes and understands no chain data, and the switch between relay
+and direct links is seamless.
 
-Direction under discussion:
+Settled model: a **multiplexing router**. Each node keeps one TCP connection to
+the relay (both nodes dial out, which CGNAT permits). That connection carries
+many **channels**; one channel is one logical peer link.
 
-- A relayed link uses one TCP connection to the relay per peer (no multiplexing).
-  Both nodes dial out to the relay (CGNAT permits outbound). The relay pairs two
-  connections, signals "paired," then copies bytes blindly. After pairing, a
-  relayed connection is byte-identical to a direct connection, so the `JEFY`
-  handshake and everything above it run unchanged.
-- The only outer-protocol exchange is a short relay-control handshake at setup,
-  before the `JEFY` `HELLO`, to request pairing under a token. The relay never
-  sees a `JEFY` frame.
-- Open: the rendezvous mechanism by which two outbound-only nodes agree on a
-  pairing token without creating a persistent, predictable map. Candidates:
-  out-of-band shared token per link; relay directory of ephemeral handles carried
-  in `ADDR` `Relay` records. Must keep handles ephemeral and confined to the
-  outer transport.
+### Opacity
 
-This section is updated once the outer transport is settled.
+A channel carries an opaque byte stream, not framed `JEFY` messages. The relay
+forwards byte chunks tagged by channel; it never learns where one `JEFY` message
+ends and the next begins, so it never parses chain data. `RelayLink` presents a
+channel to the node as a plain byte stream, and the inner `JEFY` reader frames
+messages over it exactly as over a direct `TcpStream`. This is why the router
+costs no seamlessness: `DirectLink` and `RelayLink` both implement `PeerLink`,
+and node logic is identical.
+
+### Outer frame (relay connection)
+
+| Field | Size | Purpose |
+|-------|------|---------|
+| `channel_id` | 4 (u32) | Logical stream, local to this node-to-relay connection |
+| `type` | 1 (u8) | Control or data kind (below) |
+| `length` | 4 (u32) | Payload byte length |
+| `payload` | varies | `DATA`: opaque bytes. `OPEN`: target handle. Control: small fields |
+
+Channel ids are local to each side; the relay maps one node's channel id to the
+paired peer's channel id. No global namespace and no persistent identifier.
+
+Control and data types: `REGISTER`, `REGISTERED`, `OPEN`, `INCOMING`, `PAIRED`,
+`DATA`, `CLOSE`, `ERROR`.
+
+### Rendezvous: ephemeral directory handles
+
+- A node that wants to be reachable sends `REGISTER`; the relay returns a short,
+  random `handle` in `REGISTERED`. The relay keeps a directory of
+  `handle -> that node's connection`.
+- The node advertises `Relay { relay_endpoint, handle }` in its `ADDR` records,
+  so peers learn the handle through gossip.
+- To reach that peer, a node sends `OPEN` naming the handle. The relay finds the
+  owner, sends it an `INCOMING` on a fresh channel, sends both sides `PAIRED`,
+  and from then on routes `DATA` between the two channels. `CLOSE` tears a channel
+  down; `ERROR` reports a missing handle or a failed pairing.
+- The handle is ephemeral: a node gets a new one each time it connects to the
+  relay (a new relay session), which keeps the map unpredictable across sessions
+  while staying stable within a session. Rotation cadence must stay slow relative
+  to `ADDR` gossip, or peers will hold stale handles; tune when implemented.
+
+### Relationship to direct links and the transition to full peer-to-peer
+
+Public nodes advertise a `Direct` endpoint; CGNAT nodes advertise a `Relay`
+endpoint; a node with both advertises both. `dial` prefers `Direct` and falls
+back to `Relay`. As nodes gain public addresses, their peers move from relay
+channels to direct connections automatically, one peer at a time, with no change
+above `PeerLink`. CGNAT friend nodes keep using the relay; "full peer-to-peer"
+means the wider network of directly dialable public nodes, not CGNAT friends.
+NAT hole punching to retire the relay entirely is a long-term stretch, out of
+scope for now.
+
+### Known limitations to revisit
+
+- **Head-of-line blocking.** One TCP connection carrying all channels means a
+  stalled reader on one channel backs up the others. Negligible for 148-byte
+  transactions; revisit when large blocks arrive (per-channel flow-control
+  windows, or a separate channel for bulk transfer).
+- **Relay liveness.** The inner `PING`/`PONG` on each channel keeps the links and
+  the relay connection busy. A relay-layer keepalive is needed only if every
+  channel goes idle; decide at build time.
+
+### Still to fix at implementation
+
+Exact byte encodings of the control messages, handle length, handle-rotation
+cadence, and whether per-channel flow control is added now or later.
