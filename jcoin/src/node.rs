@@ -32,7 +32,10 @@ pub enum NodeRequest {
 
 /// Outcome of submitting a transaction.
 pub enum SubmitResult {
-    Accepted { tx_id: String },
+    /// The transaction is valid. `is_new` is true only the first time this node
+    /// sees it; the caller gossips a transaction only when `is_new` is true, so
+    /// a relayed transaction does not loop forever.
+    Accepted { tx_id: String, is_new: bool },
     Rejected { reason: String },
 }
 
@@ -46,7 +49,9 @@ pub enum StatusResult {
 ///
 /// For the initial vertical the only validation is the Ed25519 signature. Nonce
 /// and balance checks are intentionally not performed. The "seen" set is an
-/// in-memory stand-in for the mempool.
+/// in-memory stand-in for the mempool, and it also provides gossip dedup: a
+/// transaction is only new the first time it is inserted. Relaying is the
+/// network layer's job, driven by the `is_new` flag returned here.
 pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>) {
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -55,9 +60,8 @@ pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>) {
             NodeRequest::SubmitTransaction { tx, reply } => {
                 let tx_id = tx.tx_id_hex();
                 let result = if tx.verify_signature() {
-                    seen.insert(tx_id.clone());
-                    relay_handler(&tx);
-                    SubmitResult::Accepted { tx_id }
+                    let is_new = seen.insert(tx_id.clone());
+                    SubmitResult::Accepted { tx_id, is_new }
                 } else {
                     SubmitResult::Rejected {
                         reason: "invalid signature".to_string(),
@@ -82,14 +86,4 @@ pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>) {
             }
         }
     }
-}
-
-/// The relay handler ("listener type" in the design notes). In a later phase it
-/// gossips the transaction to connected peers over TCP. For the vertical it only
-/// logs, since no peers are connected.
-fn relay_handler(tx: &Transaction) {
-    println!(
-        "[relay] signature valid for tx {} — would relay to peers (none connected yet)",
-        tx.tx_id_hex()
-    );
 }

@@ -1,9 +1,24 @@
 //! Per-connection peer logic: the handshake, and (added next) the run loop.
 
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
+
+use crate::node::{NodeRequest, SubmitResult};
 
 use super::frame::PROTOCOL_VERSION;
+use super::link::PeerLink;
 use super::message::{read_message, write_message, Hello, Message, MessageError};
+use super::network::{Network, PeerId};
+
+/// Idle time on a link before sending a `PING`.
+pub const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Silence after which a peer is dropped.
+pub const PEER_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Bound on each per-peer channel.
+const CHANNEL_BOUND: usize = 64;
 
 /// Lowest wire version this node will talk to.
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
@@ -90,6 +105,140 @@ where
     }
 
     Ok(peer)
+}
+
+/// Drive one peer connection to completion: handshake, then serve messages until
+/// the link closes or the peer times out.
+///
+/// `listen_port` is this node's own P2P port, placed in the outgoing `HELLO`.
+/// `node` submits received transactions to the node core; `network` registers
+/// the peer and relays accepted transactions to the others. `label` is for logs.
+pub async fn run_peer<L: PeerLink + 'static>(
+    mut link: L,
+    listen_port: u16,
+    node: mpsc::Sender<NodeRequest>,
+    network: Network,
+    label: String,
+) {
+    let nonce = rand::random::<u64>();
+    let local = local_hello(nonce, listen_port);
+
+    let peer = match handshake(&mut link, &local).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[p2p] handshake with {label} failed: {e}");
+            return;
+        }
+    };
+    println!(
+        "[p2p] connected to {label} (peer wire v{}, port {})",
+        peer.version, peer.listen_port
+    );
+
+    let (read_half, mut write_half) = tokio::io::split(link);
+
+    // A dedicated reader task keeps frame reads off the select loop, so an
+    // in-progress read is never cancelled mid-frame (read_exact is not
+    // cancellation-safe). It forwards decoded messages to the loop below.
+    let (in_tx, mut in_rx) = mpsc::channel::<Message>(CHANNEL_BOUND);
+    let reader = tokio::spawn(read_loop(read_half, in_tx));
+
+    // Outbound channel the network pushes gossip into.
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(CHANNEL_BOUND);
+    let id = network.register(out_tx);
+
+    let mut ticker = interval(PING_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last_activity = Instant::now();
+
+    loop {
+        tokio::select! {
+            incoming = in_rx.recv() => {
+                match incoming {
+                    Some(msg) => {
+                        last_activity = Instant::now();
+                        if !handle_incoming(msg, id, &node, &network, &mut write_half).await {
+                            break;
+                        }
+                    }
+                    None => break, // reader ended: EOF or stream error
+                }
+            }
+            outgoing = out_rx.recv() => {
+                if let Some(msg) = outgoing {
+                    if write_message(&mut write_half, &msg).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                let idle = last_activity.elapsed();
+                if idle >= PEER_TIMEOUT {
+                    println!("[p2p] {label} timed out");
+                    break;
+                }
+                if idle >= PING_INTERVAL
+                    && write_message(&mut write_half, &Message::Ping(rand::random())).await.is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    network.remove(id);
+    reader.abort();
+    println!("[p2p] disconnected from {label}");
+}
+
+/// Read frames until the stream fails. Decode errors that leave the stream in
+/// sync (unknown type, bad length, bad transaction) are skipped; a frame-level
+/// error (EOF, bad magic, bad checksum) ends the loop.
+async fn read_loop<R: AsyncRead + Unpin>(mut read: R, out: mpsc::Sender<Message>) {
+    loop {
+        match read_message(&mut read).await {
+            Ok(msg) => {
+                if out.send(msg).await.is_err() {
+                    break; // the peer loop is gone
+                }
+            }
+            Err(MessageError::Frame(_)) => break,
+            Err(_) => continue,
+        }
+    }
+}
+
+/// Handle one message from a peer. Returns false only on a fatal write error.
+async fn handle_incoming<W: AsyncWrite + Unpin>(
+    msg: Message,
+    peer_id: PeerId,
+    node: &mpsc::Sender<NodeRequest>,
+    network: &Network,
+    write_half: &mut W,
+) -> bool {
+    match msg {
+        Message::Ping(nonce) => write_message(write_half, &Message::Pong(nonce)).await.is_ok(),
+        Message::Pong(_) => true,
+        Message::NewTransaction(tx) => {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if node
+                .send(NodeRequest::SubmitTransaction {
+                    tx: tx.clone(),
+                    reply: reply_tx,
+                })
+                .await
+                .is_err()
+            {
+                return true; // node core gone; nothing to relay
+            }
+            if let Ok(SubmitResult::Accepted { is_new: true, .. }) = reply_rx.await {
+                network.broadcast_transaction(&tx, Some(peer_id));
+            }
+            true
+        }
+        // A HELLO or HELLO_ACK after the handshake is unexpected; ignore it.
+        Message::Hello(_) | Message::HelloAck => true,
+    }
 }
 
 #[cfg(test)]
