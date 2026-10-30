@@ -1,0 +1,4 @@
+/target
+# Wallet key material and local transaction records
+/.jcoin-keys
+*_ed25519
