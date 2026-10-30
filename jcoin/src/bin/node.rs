@@ -21,7 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 use jcoin::node::{run_node, NodeRequest, StatusResult, SubmitResult};
-use jcoin::p2p::{run_peer, Endpoint, Network};
+use jcoin::p2p::{run_peer, run_relay_client, Endpoint, Network};
 
 #[derive(Parser)]
 #[command(name = "jcoin-node", about = "JeffyCoin node")]
@@ -42,6 +42,13 @@ struct Cli {
     /// Soft cap on peers before the auto-dialer stops reaching out.
     #[arg(long, default_value_t = 8)]
     max_peers: usize,
+    /// Relay address to connect through for peers behind carrier-grade NAT.
+    #[arg(long)]
+    relay: Option<String>,
+    /// A peer's relay directory handle (hex) to open a channel to on startup,
+    /// used to bootstrap before handles are learned via gossip. Repeatable.
+    #[arg(long = "relay-open")]
+    relay_open: Vec<String>,
 }
 
 /// Shared state for REST handlers: a channel into the node core and the peer set.
@@ -86,6 +93,32 @@ async fn main() {
     // One dialer per configured peer; each retries on disconnect.
     for peer in cli.peers {
         tokio::spawn(p2p_dial(peer, network.clone()));
+    }
+
+    // Optional relay client for peers behind carrier-grade NAT.
+    if let Some(relay) = cli.relay {
+        let relay_sock: SocketAddr = relay.parse().expect("relay must be an ip:port");
+        // Seed bootstrap handles into the book so the client opens them once it
+        // registers.
+        let seeds: Vec<Endpoint> = cli
+            .relay_open
+            .iter()
+            .map(|h| {
+                let bytes = hex::decode(h).expect("relay-open must be hex");
+                let handle: jcoin::p2p::Handle =
+                    bytes.try_into().expect("relay-open handle must be 16 bytes");
+                Endpoint::Relay {
+                    relay: relay_sock,
+                    handle,
+                }
+            })
+            .collect();
+        if !seeds.is_empty() {
+            network.learn(seeds);
+        }
+        tokio::spawn(run_relay_client(relay_sock, network.clone()));
+    } else if !cli.relay_open.is_empty() {
+        eprintln!("--relay-open requires --relay");
     }
 
     let state = AppState {

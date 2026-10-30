@@ -14,6 +14,10 @@ path = "src/bin/node.rs"
 name = "wallet"
 path = "src/bin/wallet.rs"
 
+[[bin]]
+name = "relay"
+path = "src/bin/relay.rs"
+
 [dependencies]
 # Web + async runtime
 axum = "0.8"

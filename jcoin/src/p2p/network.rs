@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use crate::node::NodeRequest;
 use crate::Transaction;
 
-use super::addr::Endpoint;
+use super::addr::{Endpoint, Handle};
 use super::message::Message;
 
 /// Local, per-process identifier for a connected peer. Assigned on connect and
@@ -34,14 +34,18 @@ struct Inner {
     book: Mutex<HashSet<Endpoint>>,
     /// Direct addresses already dialed, to avoid hammering the same peer.
     attempted: Mutex<HashSet<SocketAddr>>,
-    /// This node's own reachable endpoints, advertised to peers.
-    advertised: Vec<Endpoint>,
+    /// This node's own reachable endpoints, advertised to peers. Mutable so the
+    /// relay client can add a `Relay` endpoint once it has a handle.
+    advertised: Mutex<Vec<Endpoint>>,
     /// This node's P2P listen port, placed in the outgoing `HELLO`.
     listen_port: u16,
     /// Channel into the node core.
     node: mpsc::Sender<NodeRequest>,
     /// Soft cap on the number of peers before the dialer stops reaching out.
     max_peers: usize,
+    /// When a relay client is running, learned `Relay` endpoints are opened
+    /// through it by sending the handle here.
+    relay_open: Mutex<Option<mpsc::Sender<Handle>>>,
 }
 
 #[derive(Clone)]
@@ -62,10 +66,11 @@ impl Network {
                 next_id: AtomicU64::new(0),
                 book: Mutex::new(HashSet::new()),
                 attempted: Mutex::new(HashSet::new()),
-                advertised,
+                advertised: Mutex::new(advertised),
                 listen_port,
                 node,
                 max_peers,
+                relay_open: Mutex::new(None),
             }),
         }
     }
@@ -78,8 +83,28 @@ impl Network {
         self.inner.listen_port
     }
 
-    pub fn advertised(&self) -> &[Endpoint] {
-        &self.inner.advertised
+    pub fn advertised(&self) -> Vec<Endpoint> {
+        self.inner.advertised.lock().unwrap().clone()
+    }
+
+    /// Add one of this node's own reachable endpoints (used by the relay client
+    /// once it has a handle).
+    pub fn add_advertised(&self, endpoint: Endpoint) {
+        let mut advertised = self.inner.advertised.lock().unwrap();
+        if !advertised.contains(&endpoint) {
+            advertised.push(endpoint);
+        }
+    }
+
+    /// Register the relay client's open channel. Learned `Relay` endpoints are
+    /// routed here to be opened.
+    pub fn set_relay_opener(&self, opener: mpsc::Sender<Handle>) {
+        *self.inner.relay_open.lock().unwrap() = Some(opener);
+    }
+
+    /// Clear the relay opener when the relay client stops.
+    pub fn clear_relay_opener(&self) {
+        *self.inner.relay_open.lock().unwrap() = None;
     }
 
     /// Register a peer's outbound channel and return its new id.
@@ -113,7 +138,7 @@ impl Network {
     /// Addresses to share in an `ADDR`: this node's own endpoints plus a sample
     /// of the book.
     pub fn known_addrs(&self) -> Vec<Endpoint> {
-        let mut out = self.inner.advertised.clone();
+        let mut out = self.inner.advertised.lock().unwrap().clone();
         let book = self.inner.book.lock().unwrap();
         for endpoint in book.iter().take(ADDR_SAMPLE) {
             out.push(endpoint.clone());
@@ -121,13 +146,29 @@ impl Network {
         out
     }
 
+    /// Handles in the book reachable through the given relay. Used by the relay
+    /// client at registration to open channels to peers already known.
+    pub fn relay_handles(&self, relay: SocketAddr) -> Vec<Handle> {
+        self.inner
+            .book
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|endpoint| match endpoint {
+                Endpoint::Relay { relay: r, handle } if *r == relay => Some(*handle),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Add endpoints to the book, returning the ones not already known. This
     /// node's own advertised endpoints are never stored.
     pub fn learn(&self, endpoints: Vec<Endpoint>) -> Vec<Endpoint> {
+        let advertised = self.inner.advertised.lock().unwrap().clone();
         let mut book = self.inner.book.lock().unwrap();
         let mut fresh = Vec::new();
         for endpoint in endpoints {
-            if self.inner.advertised.contains(&endpoint) {
+            if advertised.contains(&endpoint) {
                 continue;
             }
             if book.insert(endpoint.clone()) {
@@ -137,28 +178,36 @@ impl Network {
         fresh
     }
 
-    /// Dial newly-learned `Direct` endpoints, within the peer cap, skipping any
-    /// already attempted or belonging to this node. `Relay` endpoints are left
-    /// to the relay transport.
+    /// Act on newly-learned endpoints. A `Direct` endpoint is dialed within the
+    /// peer cap, skipping any already attempted or belonging to this node. A
+    /// `Relay` endpoint is handed to the relay client to open, if one is running.
     pub fn maybe_dial(&self, endpoints: Vec<Endpoint>) {
+        let advertised = self.inner.advertised.lock().unwrap().clone();
         for endpoint in endpoints {
-            let Endpoint::Direct(addr) = endpoint else {
-                continue;
-            };
-            if self.peer_count() >= self.inner.max_peers {
-                break;
-            }
-            if self.inner.advertised.contains(&Endpoint::Direct(addr)) {
-                continue;
-            }
-            {
-                let mut attempted = self.inner.attempted.lock().unwrap();
-                if !attempted.insert(addr) {
-                    continue; // already tried
+            match endpoint {
+                Endpoint::Direct(addr) => {
+                    if self.peer_count() >= self.inner.max_peers {
+                        continue;
+                    }
+                    if advertised.contains(&Endpoint::Direct(addr)) {
+                        continue;
+                    }
+                    {
+                        let mut attempted = self.inner.attempted.lock().unwrap();
+                        if !attempted.insert(addr) {
+                            continue; // already tried
+                        }
+                    }
+                    let this = self.clone();
+                    tokio::spawn(this.dial(addr));
+                }
+                Endpoint::Relay { handle, .. } => {
+                    let opener = self.inner.relay_open.lock().unwrap().clone();
+                    if let Some(tx) = opener {
+                        let _ = tx.try_send(handle);
+                    }
                 }
             }
-            let this = self.clone();
-            tokio::spawn(this.dial(addr));
         }
     }
 

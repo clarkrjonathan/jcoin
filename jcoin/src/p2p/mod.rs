@@ -10,6 +10,9 @@ pub mod link;
 pub mod message;
 pub mod network;
 pub mod peer;
+pub mod relay;
+pub mod relay_client;
+pub mod relay_server;
 
 pub use addr::{Endpoint, Handle, HANDLE_LEN};
 pub use frame::{FrameError, RawFrame, HEADER_LEN, MAGIC, MAX_PAYLOAD, PROTOCOL_VERSION};
@@ -17,3 +20,4 @@ pub use link::PeerLink;
 pub use message::{read_message, write_message, Hello, Message, MessageError};
 pub use network::{Network, PeerId};
 pub use peer::{handshake, local_hello, run_peer, HandshakeError, PEER_TIMEOUT, PING_INTERVAL};
+pub use relay_client::run_relay_client;

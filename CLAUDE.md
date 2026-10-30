@@ -34,10 +34,15 @@ not in this repo:
   - `src/node.rs` — node core: `NodeRequest`/`SubmitResult`/`StatusResult` and
     the `run_node` task.
   - `src/p2p/` — peer-to-peer layer: `frame` (JEFY codec), `message` (gossip-v1
-    messages), `link` (the `PeerLink` seam), `peer` (handshake, run loop,
-    `run_peer`), `network` (peer registry and gossip fan-out).
-  - `src/bin/node.rs` — axum REST server plus the P2P listener and dialers.
+    messages), `addr` (Endpoint/handle encoding), `link` (the `PeerLink` seam),
+    `peer` (handshake, run loop, `run_peer`), `network` (peer registry, address
+    book, gossip fan-out, dialer), `relay` (outer transport framing),
+    `relay_server` (the multiplexing router), `relay_client` (node-side relay
+    connection).
+  - `src/bin/node.rs` — axum REST server plus the P2P listener, dialers, and
+    optional relay client.
   - `src/bin/wallet.rs` — clap wallet CLI.
+  - `src/bin/relay.rs` — the relay server (thin wrapper over `relay_server`).
 - `spike/` — **frozen scratchwork**. The original `rust-crud-api` spike where the
   wallet → REST → node → signature-verify path was first proven. Do not build on
   it; it is kept for reference only.
@@ -59,17 +64,27 @@ A clearly-defined proof-of-concept slice (from `Design/Initial vertical.md`):
 
 ### Built since the vertical
 
-- Transaction gossip over **direct TCP** (`src/p2p/`): the `JEFY` frame codec,
-  the symmetric `HELLO` handshake, `PING`/`PONG` heartbeat, and
-  `NEW_TRANSACTION` relayed to peers except the source. Verified by a two-node
-  integration test. See `docs/p2p-protocol.md`.
+A working P2P network layer (`src/p2p/`, see `docs/p2p-protocol.md`):
+
+- Transaction gossip over **direct TCP**: `JEFY` frame codec, symmetric `HELLO`
+  handshake, `PING`/`PONG` heartbeat, `NEW_TRANSACTION` relayed to peers except
+  the source.
+- **Peer discovery**: `GET_ADDR` / `ADDR` with an address book and auto-dial of
+  learned direct peers (`--advertise`, `--max-peers`).
+- **Relay transport**: a multiplexing router (`relay` binary) pairs node
+  channels by ephemeral directory handle and forwards opaque `DATA`; nodes
+  connect with `--relay` and bootstrap with `--relay-open <handle>`. A relayed
+  channel is a `PeerLink` like any other, so gossip and discovery work through
+  it unchanged.
+
+Verified by unit tests plus two-node direct and relay gossip integration tests.
 
 ### Explicitly out of scope (later phases)
 
-Proof of work / mining, the relay transport (multiplexing router, designed in
-`docs/p2p-protocol.md` but not built), peer discovery (`GET_ADDR` / `ADDR`),
-balance and nonce validation, persistence / database, blocks and the chain,
-difficulty, and the `type/amount/fee` transaction freeze.
+Proof of work / mining, balance and nonce validation, persistence / database,
+blocks and the chain, difficulty, and the `type/amount/fee` transaction freeze.
+Open tuning within the P2P layer: relay handle rotation cadence and per-channel
+flow control (head-of-line blocking is noted in `docs/p2p-protocol.md`).
 
 ## Build and run
 
