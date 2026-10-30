@@ -21,7 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 use jcoin::node::{run_node, NodeRequest, StatusResult, SubmitResult};
-use jcoin::p2p::{run_peer, Network};
+use jcoin::p2p::{run_peer, Endpoint, Network};
 
 #[derive(Parser)]
 #[command(name = "jcoin-node", about = "JeffyCoin node")]
@@ -35,6 +35,13 @@ struct Cli {
     /// Peer address to dial on startup (repeatable).
     #[arg(long = "peer")]
     peers: Vec<String>,
+    /// A directly reachable address of this node to advertise (repeatable). A
+    /// concrete (non-wildcard) --p2p-addr is advertised automatically.
+    #[arg(long = "advertise")]
+    advertise: Vec<String>,
+    /// Soft cap on peers before the auto-dialer stops reaching out.
+    #[arg(long, default_value_t = 8)]
+    max_peers: usize,
 }
 
 /// Shared state for REST handlers: a channel into the node core and the peer set.
@@ -57,24 +64,28 @@ async fn main() {
     let (node_tx, node_rx) = mpsc::channel::<NodeRequest>(100);
     tokio::spawn(run_node(node_rx));
 
-    let network = Network::new();
+    // Addresses this node advertises: the configured ones, plus a concrete
+    // --p2p-addr.
+    let mut advertised: Vec<Endpoint> = cli
+        .advertise
+        .iter()
+        .map(|s| Endpoint::Direct(s.parse().expect("advertise must be ip:port")))
+        .collect();
+    if !p2p_sock.ip().is_unspecified() {
+        let own = Endpoint::Direct(p2p_sock);
+        if !advertised.contains(&own) {
+            advertised.push(own);
+        }
+    }
+
+    let network = Network::new(node_tx.clone(), listen_port, advertised, cli.max_peers);
 
     // P2P listener.
-    tokio::spawn(p2p_listen(
-        p2p_sock,
-        listen_port,
-        node_tx.clone(),
-        network.clone(),
-    ));
+    tokio::spawn(p2p_listen(p2p_sock, network.clone()));
 
     // One dialer per configured peer; each retries on disconnect.
     for peer in cli.peers {
-        tokio::spawn(p2p_dial(
-            peer,
-            listen_port,
-            node_tx.clone(),
-            network.clone(),
-        ));
+        tokio::spawn(p2p_dial(peer, network.clone()));
     }
 
     let state = AppState {
@@ -100,12 +111,7 @@ async fn main() {
 }
 
 /// Accept inbound P2P connections and run each as a peer.
-async fn p2p_listen(
-    addr: SocketAddr,
-    listen_port: u16,
-    node: mpsc::Sender<NodeRequest>,
-    network: Network,
-) {
+async fn p2p_listen(addr: SocketAddr, network: Network) {
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -120,8 +126,6 @@ async fn p2p_listen(
             Ok((stream, peer_addr)) => {
                 tokio::spawn(run_peer(
                     stream,
-                    listen_port,
-                    node.clone(),
                     network.clone(),
                     format!("{peer_addr} (in)"),
                 ));
@@ -131,24 +135,12 @@ async fn p2p_listen(
     }
 }
 
-/// Dial a peer and run it; on disconnect, wait and retry.
-async fn p2p_dial(
-    addr: String,
-    listen_port: u16,
-    node: mpsc::Sender<NodeRequest>,
-    network: Network,
-) {
+/// Dial a configured peer and run it; on disconnect, wait and retry.
+async fn p2p_dial(addr: String, network: Network) {
     loop {
         match TcpStream::connect(&addr).await {
             Ok(stream) => {
-                run_peer(
-                    stream,
-                    listen_port,
-                    node.clone(),
-                    network.clone(),
-                    format!("{addr} (out)"),
-                )
-                .await;
+                run_peer(stream, network.clone(), format!("{addr} (out)")).await;
             }
             Err(e) => eprintln!("[p2p] dial {addr} failed: {e}"),
         }

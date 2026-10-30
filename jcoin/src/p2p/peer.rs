@@ -9,7 +9,7 @@ use crate::node::{NodeRequest, SubmitResult};
 use super::frame::PROTOCOL_VERSION;
 use super::link::PeerLink;
 use super::message::{read_message, write_message, Hello, Message, MessageError};
-use super::network::{Network, PeerId};
+use super::network::Network;
 
 /// Idle time on a link before sending a `PING`.
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -110,18 +110,12 @@ where
 /// Drive one peer connection to completion: handshake, then serve messages until
 /// the link closes or the peer times out.
 ///
-/// `listen_port` is this node's own P2P port, placed in the outgoing `HELLO`.
-/// `node` submits received transactions to the node core; `network` registers
-/// the peer and relays accepted transactions to the others. `label` is for logs.
-pub async fn run_peer<L: PeerLink + 'static>(
-    mut link: L,
-    listen_port: u16,
-    node: mpsc::Sender<NodeRequest>,
-    network: Network,
-    label: String,
-) {
+/// `network` is the shared P2P handle: it carries the node-core channel, this
+/// node's listen port and advertised addresses, the peer registry, and the
+/// address book. `label` is for logs.
+pub async fn run_peer<L: PeerLink + 'static>(mut link: L, network: Network, label: String) {
     let nonce = rand::random::<u64>();
-    let local = local_hello(nonce, listen_port);
+    let local = local_hello(nonce, network.listen_port());
 
     let peer = match handshake(&mut link, &local).await {
         Ok(p) => p,
@@ -136,6 +130,10 @@ pub async fn run_peer<L: PeerLink + 'static>(
     );
 
     let (read_half, mut write_half) = tokio::io::split(link);
+
+    // Advertise our own addresses and ask for the peer's, to grow the mesh.
+    let _ = write_message(&mut write_half, &Message::Addr(network.known_addrs())).await;
+    let _ = write_message(&mut write_half, &Message::GetAddr).await;
 
     // A dedicated reader task keeps frame reads off the select loop, so an
     // in-progress read is never cancelled mid-frame (read_exact is not
@@ -157,7 +155,7 @@ pub async fn run_peer<L: PeerLink + 'static>(
                 match incoming {
                     Some(msg) => {
                         last_activity = Instant::now();
-                        if !handle_incoming(msg, id, &node, &network, &mut write_half).await {
+                        if !handle_incoming(msg, id, &network, &mut write_half).await {
                             break;
                         }
                     }
@@ -211,8 +209,7 @@ async fn read_loop<R: AsyncRead + Unpin>(mut read: R, out: mpsc::Sender<Message>
 /// Handle one message from a peer. Returns false only on a fatal write error.
 async fn handle_incoming<W: AsyncWrite + Unpin>(
     msg: Message,
-    peer_id: PeerId,
-    node: &mpsc::Sender<NodeRequest>,
+    peer_id: super::network::PeerId,
     network: &Network,
     write_half: &mut W,
 ) -> bool {
@@ -221,7 +218,8 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
         Message::Pong(_) => true,
         Message::NewTransaction(tx) => {
             let (reply_tx, reply_rx) = oneshot::channel();
-            if node
+            if network
+                .node()
                 .send(NodeRequest::SubmitTransaction {
                     tx: tx.clone(),
                     reply: reply_tx,
@@ -234,6 +232,16 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
             if let Ok(SubmitResult::Accepted { is_new: true, .. }) = reply_rx.await {
                 network.broadcast_transaction(&tx, Some(peer_id));
             }
+            true
+        }
+        // Reply to an address request with what we know.
+        Message::GetAddr => write_message(write_half, &Message::Addr(network.known_addrs()))
+            .await
+            .is_ok(),
+        // Learn new addresses and try to connect to fresh direct ones.
+        Message::Addr(endpoints) => {
+            let fresh = network.learn(endpoints);
+            network.maybe_dial(fresh);
             true
         }
         // A HELLO or HELLO_ACK after the handshake is unexpected; ignore it.
@@ -343,8 +351,8 @@ mod gossip_tests {
     async fn gossip_propagates_between_two_nodes() {
         let core_a = spawn_core();
         let core_b = spawn_core();
-        let net_a = Network::new();
-        let net_b = Network::new();
+        let net_a = Network::new(core_a.clone(), 1, Vec::new(), 8);
+        let net_b = Network::new(core_b.clone(), 2, Vec::new(), 8);
 
         // A real loopback TCP connection between the two nodes.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -353,8 +361,8 @@ mod gossip_tests {
         let (server_stream, _) = listener.accept().await.unwrap();
         let client_stream = connect.await.unwrap();
 
-        tokio::spawn(run_peer(server_stream, 1, core_a.clone(), net_a.clone(), "A".into()));
-        tokio::spawn(run_peer(client_stream, 2, core_b.clone(), net_b.clone(), "B".into()));
+        tokio::spawn(run_peer(server_stream, net_a.clone(), "A".into()));
+        tokio::spawn(run_peer(client_stream, net_b.clone(), "B".into()));
 
         assert!(
             wait_until(|| net_a.peer_count() == 1 && net_b.peer_count() == 1).await,

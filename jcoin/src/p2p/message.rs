@@ -7,6 +7,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::Transaction;
 
+use super::addr::{decode_addrs, encode_addrs, Endpoint};
 use super::frame::{read_frame, write_frame, FrameError, RawFrame};
 
 /// Message type codes, matching `docs/p2p-protocol.md`.
@@ -16,6 +17,8 @@ pub mod type_code {
     pub const PING: u16 = 0x0003;
     pub const PONG: u16 = 0x0004;
     pub const NEW_TRANSACTION: u16 = 0x0010;
+    pub const GET_ADDR: u16 = 0x0020;
+    pub const ADDR: u16 = 0x0021;
 }
 
 /// Payload of a `HELLO`. Carries no persistent node identifier: the `nonce` is
@@ -65,6 +68,10 @@ pub enum Message {
     Ping(u64),
     Pong(u64),
     NewTransaction(Transaction),
+    /// Request the peer's known addresses.
+    GetAddr,
+    /// A list of peer addresses.
+    Addr(Vec<Endpoint>),
 }
 
 /// Errors from reading or decoding a message.
@@ -76,6 +83,7 @@ pub enum MessageError {
     UnknownType(u16),
     BadLength { msg_type: u16, len: usize },
     BadTransaction,
+    BadAddrs,
 }
 
 impl std::fmt::Display for MessageError {
@@ -87,6 +95,7 @@ impl std::fmt::Display for MessageError {
                 write!(f, "wrong payload length {len} for message type {msg_type:#06x}")
             }
             MessageError::BadTransaction => write!(f, "payload was not a valid transaction"),
+            MessageError::BadAddrs => write!(f, "payload was not a valid address list"),
         }
     }
 }
@@ -108,6 +117,8 @@ impl Message {
             Message::Ping(_) => type_code::PING,
             Message::Pong(_) => type_code::PONG,
             Message::NewTransaction(_) => type_code::NEW_TRANSACTION,
+            Message::GetAddr => type_code::GET_ADDR,
+            Message::Addr(_) => type_code::ADDR,
         }
     }
 
@@ -118,6 +129,8 @@ impl Message {
             Message::HelloAck => Vec::new(),
             Message::Ping(nonce) | Message::Pong(nonce) => nonce.to_be_bytes().to_vec(),
             Message::NewTransaction(tx) => tx.serialize_to_bytes(),
+            Message::GetAddr => Vec::new(),
+            Message::Addr(endpoints) => encode_addrs(endpoints),
         }
     }
 
@@ -160,6 +173,19 @@ impl Message {
             type_code::NEW_TRANSACTION => Transaction::from_bytes(&raw.payload)
                 .map(Message::NewTransaction)
                 .ok_or(MessageError::BadTransaction),
+            type_code::GET_ADDR => {
+                if len == 0 {
+                    Ok(Message::GetAddr)
+                } else {
+                    Err(MessageError::BadLength {
+                        msg_type: raw.msg_type,
+                        len,
+                    })
+                }
+            }
+            type_code::ADDR => decode_addrs(&raw.payload)
+                .map(Message::Addr)
+                .ok_or(MessageError::BadAddrs),
             other => Err(MessageError::UnknownType(other)),
         }
     }
