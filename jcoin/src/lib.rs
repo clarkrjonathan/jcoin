@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub mod node;
+pub mod p2p;
 
 /// A JeffyCoin transaction.
 ///
@@ -54,6 +55,22 @@ impl Transaction {
         bytes.extend_from_slice(&self.signing_bytes());
         bytes.extend_from_slice(&self.signature);
         bytes
+    }
+
+    /// Parse a transaction from its canonical serialization. Returns `None` if
+    /// the slice is not exactly `SERIALIZED_LEN` bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Transaction> {
+        if bytes.len() != Self::SERIALIZED_LEN {
+            return None;
+        }
+        Some(Transaction {
+            sender: bytes[0..32].try_into().ok()?,
+            recipient: bytes[32..64].try_into().ok()?,
+            input: u64::from_be_bytes(bytes[64..72].try_into().ok()?),
+            output: u64::from_be_bytes(bytes[72..80].try_into().ok()?),
+            nonce: u32::from_be_bytes(bytes[80..84].try_into().ok()?),
+            signature: bytes[84..148].try_into().ok()?,
+        })
     }
 
     /// Everything except the signature. This is what you hash and sign, since a
