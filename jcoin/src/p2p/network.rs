@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use crate::block::Block;
 use crate::node::NodeRequest;
 use crate::Transaction;
 
@@ -132,6 +133,17 @@ impl Network {
                 continue;
             }
             let _ = sender.try_send(Message::NewTransaction(tx.clone()));
+        }
+    }
+
+    /// Send a block to every peer except `except`.
+    pub fn broadcast_block(&self, block: &Block, except: Option<PeerId>) {
+        let peers = self.inner.peers.lock().unwrap();
+        for (id, sender) in peers.iter() {
+            if Some(*id) == except {
+                continue;
+            }
+            let _ = sender.try_send(Message::NewBlock(block.clone()));
         }
     }
 

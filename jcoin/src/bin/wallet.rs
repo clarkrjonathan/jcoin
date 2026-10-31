@@ -162,14 +162,32 @@ async fn send_transaction(
 ) -> Result<()> {
     let key = load_key(key_dir, key_name)?;
     let recipient = decode_address(recipient)?;
+    let sender = key.verifying_key().to_bytes();
+
+    let client = reqwest::Client::new();
+
+    // Fetch the sender's balance and next nonce from the node.
+    let account = client
+        .get(format!("{node}/balance/{}", hex::encode(sender)))
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+    let balance = account["balance"].as_u64().unwrap_or(0);
+    let nonce = account["nonce"].as_u64().unwrap_or(0);
+
+    let needed = amount + fee;
+    if balance < needed {
+        return Err(format!("balance too low: need {needed}, have {balance}").into());
+    }
 
     let mut tx = Transaction {
         tx_type: jcoin::tx_type::NORMAL,
-        sender: key.verifying_key().to_bytes(),
+        sender,
         recipient,
         amount,
         fee,
-        nonce: 0, // dummy until the wallet tracks per-key nonces
+        nonce,
         signature: [0u8; 64],
     };
 
@@ -180,7 +198,6 @@ async fn send_transaction(
     let tx_id = tx.tx_id_hex();
     let url = format!("{node}/wallet/transaction");
 
-    let client = reqwest::Client::new();
     let response = client.post(&url).json(&tx).send().await?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();

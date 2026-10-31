@@ -167,6 +167,40 @@ impl Block {
         self.header.block_hash()
     }
 
+    /// Wire serialization: header (156) | tx count (u16) | transactions (153 each).
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut bytes = self.header.serialize();
+        let count = self.transactions.len().min(u16::MAX as usize) as u16;
+        bytes.extend_from_slice(&count.to_be_bytes());
+        for tx in self.transactions.iter().take(count as usize) {
+            bytes.extend_from_slice(&tx.serialize_to_bytes());
+        }
+        bytes
+    }
+
+    /// Parse a block from its wire serialization.
+    pub fn from_bytes(buf: &[u8]) -> Option<Block> {
+        if buf.len() < HEADER_LEN + 2 {
+            return None;
+        }
+        let header = BlockHeader::from_bytes(&buf[0..HEADER_LEN])?;
+        let count = u16::from_be_bytes(buf[HEADER_LEN..HEADER_LEN + 2].try_into().ok()?) as usize;
+        let mut pos = HEADER_LEN + 2;
+        let mut transactions = Vec::with_capacity(count);
+        for _ in 0..count {
+            let end = pos.checked_add(Transaction::SERIALIZED_LEN)?;
+            transactions.push(Transaction::from_bytes(buf.get(pos..end)?)?);
+            pos = end;
+        }
+        if pos != buf.len() {
+            return None; // trailing bytes or a lying count
+        }
+        Some(Block {
+            header,
+            transactions,
+        })
+    }
+
     /// Split the body into the coinbase and the normal transactions, enforcing
     /// the v1 shape: first is a coinbase, the rest are normal, at most one extra.
     fn split_body(&self) -> Result<(&Transaction, &[Transaction]), BlockError> {
@@ -313,6 +347,18 @@ mod tests {
     fn header_round_trips() {
         let h = Block::genesis().header;
         assert_eq!(BlockHeader::from_bytes(&h.serialize()), Some(h));
+    }
+
+    #[test]
+    fn block_round_trips() {
+        let genesis = Block::genesis();
+        let state = State::new();
+        let (block, _) =
+            build_and_mine(&genesis.header, &state, BLOCK_REWARD, [3u8; 32], None, STATIC_TARGET, 1)
+                .unwrap();
+        let decoded = Block::from_bytes(&block.serialize()).unwrap();
+        assert_eq!(decoded.header, block.header);
+        assert_eq!(decoded.transactions.len(), block.transactions.len());
     }
 
     #[test]

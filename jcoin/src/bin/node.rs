@@ -6,7 +6,7 @@
 //! are validated by the core and, when new, relayed to the other peers.
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Path, State},
@@ -20,7 +20,10 @@ use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
-use jcoin::node::{run_node, NodeRequest, StatusResult, SubmitResult};
+use jcoin::block::{build_and_mine, BLOCK_REWARD, STATIC_TARGET};
+use jcoin::node::{
+    run_node, BlockOutcome, ChainInfo, MiningJob, NodeRequest, StatusResult, SubmitResult,
+};
 use jcoin::p2p::{run_peer, run_relay_client, Endpoint, Network};
 
 #[derive(Parser)]
@@ -49,6 +52,12 @@ struct Cli {
     /// used to bootstrap before handles are learned via gossip. Repeatable.
     #[arg(long = "relay-open")]
     relay_open: Vec<String>,
+    /// Mine blocks. Requires --miner.
+    #[arg(long)]
+    mine: bool,
+    /// Address (hex public key, 32 bytes) that receives coinbase rewards.
+    #[arg(long)]
+    miner: Option<String>,
 }
 
 /// Shared state for REST handlers: a channel into the node core and the peer set.
@@ -121,6 +130,16 @@ async fn main() {
         eprintln!("--relay-open requires --relay");
     }
 
+    // Optional miner.
+    if cli.mine {
+        let miner_hex = cli.miner.expect("--mine requires --miner <hex address>");
+        let bytes = hex::decode(&miner_hex).expect("--miner must be hex");
+        let miner: [u8; 32] = bytes.try_into().expect("--miner must be 32 bytes");
+        tokio::spawn(mine_loop(network.clone(), miner));
+    } else if cli.miner.is_some() {
+        eprintln!("--miner has no effect without --mine");
+    }
+
     let state = AppState {
         node: node_tx,
         network,
@@ -130,6 +149,7 @@ async fn main() {
         .route("/wallet/transaction", post(submit_transaction))
         .route("/wallet/transaction/{tx_id}", get(transaction_status))
         .route("/balance/{address}", get(balance))
+        .route("/chain", get(chain_info))
         .with_state(state);
 
     let listener = TcpListener::bind(&cli.rest_addr)
@@ -165,6 +185,70 @@ async fn p2p_listen(addr: SocketAddr, network: Network) {
             }
             Err(e) => eprintln!("[p2p] accept error: {e}"),
         }
+    }
+}
+
+/// Mine blocks continuously, crediting `miner`. Each round asks the core for a
+/// job (tip + state + an applicable mempool transaction), mines off the runtime
+/// with `spawn_blocking`, submits the result, and gossips it when accepted. A
+/// short pace between rounds keeps a fast static target from flooding blocks.
+async fn mine_loop(network: Network, miner: [u8; 32]) {
+    loop {
+        let (job_tx, job_rx) = oneshot::channel();
+        if network
+            .node()
+            .send(NodeRequest::GetMiningJob { reply: job_tx })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let Ok(MiningJob {
+            parent,
+            parent_state,
+            normal,
+        }) = job_rx.await
+        else {
+            return;
+        };
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mined = tokio::task::spawn_blocking(move || {
+            build_and_mine(
+                &parent,
+                &parent_state,
+                BLOCK_REWARD,
+                miner,
+                normal,
+                STATIC_TARGET,
+                timestamp,
+            )
+        })
+        .await;
+
+        if let Ok(Ok((block, _))) = mined {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if network
+                .node()
+                .send(NodeRequest::SubmitBlock {
+                    block: Box::new(block.clone()),
+                    reply: ack_tx,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if let Ok(BlockOutcome::Accepted { is_new: true, height }) = ack_rx.await {
+                println!("[mine] block {height} {}", hex::encode(block.hash()));
+                network.broadcast_block(&block, None);
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -266,24 +350,61 @@ async fn transaction_status(
     }
 }
 
-/// GET /balance/{address} — dummy for the vertical: always 0.
+/// GET /balance/{address} — the account's balance and next nonce from the tip.
 async fn balance(State(state): State<AppState>, Path(address): Path<String>) -> impl IntoResponse {
+    let parsed: Option<[u8; 32]> = hex::decode(&address)
+        .ok()
+        .and_then(|b| b.try_into().ok());
+    let Some(addr) = parsed else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "address must be 32 hex bytes" })),
+        );
+    };
+
     let (reply_tx, reply_rx) = oneshot::channel();
-    let _ = state
+    if state
         .node
-        .send(NodeRequest::GetBalance {
-            address: address.clone(),
+        .send(NodeRequest::GetAccount {
+            address: addr,
             reply: reply_tx,
         })
-        .await;
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "node core unavailable" })),
+        );
+    }
 
-    let bal = reply_rx.await.unwrap_or(0);
+    let (balance, nonce) = reply_rx.await.unwrap_or((0, 0));
     (
         StatusCode::OK,
-        Json(json!({
-            "address": address,
-            "balance": bal,
-            "note": "dummy value for the initial vertical"
-        })),
+        Json(json!({ "address": address, "balance": balance, "nonce": nonce })),
+    )
+}
+
+/// GET /chain — chain height and tip hash.
+async fn chain_info(State(state): State<AppState>) -> impl IntoResponse {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .node
+        .send(NodeRequest::GetChainInfo { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "node core unavailable" })),
+        );
+    }
+    let ChainInfo { height, tip_hash } = reply_rx.await.unwrap_or(ChainInfo {
+        height: 0,
+        tip_hash: [0u8; 32],
+    });
+    (
+        StatusCode::OK,
+        Json(json!({ "height": height, "tip": hex::encode(tip_hash) })),
     )
 }

@@ -4,7 +4,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 
-use crate::node::{NodeRequest, SubmitResult};
+use crate::node::{BlockOutcome, NodeRequest, SubmitResult};
 
 use super::frame::PROTOCOL_VERSION;
 use super::link::PeerLink;
@@ -244,6 +244,25 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
             network.maybe_dial(fresh);
             true
         }
+        // Submit a received block; relay it onward only if newly accepted.
+        Message::NewBlock(block) => {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if network
+                .node()
+                .send(NodeRequest::SubmitBlock {
+                    block: Box::new(block.clone()),
+                    reply: reply_tx,
+                })
+                .await
+                .is_err()
+            {
+                return true;
+            }
+            if let Ok(BlockOutcome::Accepted { is_new: true, .. }) = reply_rx.await {
+                network.broadcast_block(&block, Some(peer_id));
+            }
+            true
+        }
         // A HELLO or HELLO_ACK after the handshake is unexpected; ignore it.
         Message::Hello(_) | Message::HelloAck => true,
     }
@@ -302,18 +321,40 @@ mod gossip_tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{mpsc, oneshot};
 
+    use crate::block::{build_and_mine, Block, BLOCK_REWARD, STATIC_TARGET};
     use crate::node::{run_node, NodeRequest, StatusResult, SubmitResult};
     use crate::p2p::Network;
+    use crate::state::State;
     use crate::Transaction;
 
-    fn signed_tx(nonce: u64) -> Transaction {
-        let key = SigningKey::generate(&mut OsRng);
+    /// A mined block 1 whose coinbase credits `addr` with the block reward.
+    fn coinbase_block(addr: [u8; 32]) -> Block {
+        let genesis = Block::genesis();
+        build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, addr, None, STATIC_TARGET, 1)
+            .unwrap()
+            .0
+    }
+
+    /// Apply a block directly to one core (not via gossip).
+    async fn submit_block(core: &mpsc::Sender<NodeRequest>, block: Block) {
+        let (reply, rx) = oneshot::channel();
+        core.send(NodeRequest::SubmitBlock {
+            block: Box::new(block),
+            reply,
+        })
+        .await
+        .unwrap();
+        let _ = rx.await;
+    }
+
+    /// A signed normal transfer from `key` at `nonce`.
+    fn signed_from(key: &SigningKey, nonce: u64) -> Transaction {
         let mut tx = Transaction {
             tx_type: crate::tx_type::NORMAL,
             sender: key.verifying_key().to_bytes(),
             recipient: [5u8; 32],
-            amount: 100,
-            fee: 10,
+            amount: 10,
+            fee: 0,
             nonce,
             signature: [0u8; 64],
         };
@@ -370,8 +411,15 @@ mod gossip_tests {
             "handshake did not complete"
         );
 
+        // Fund a sender on both nodes with a coinbase block, so the transaction
+        // passes nonce and balance validation on each.
+        let key = SigningKey::generate(&mut OsRng);
+        let block1 = coinbase_block(key.verifying_key().to_bytes());
+        submit_block(&core_a, block1.clone()).await;
+        submit_block(&core_b, block1).await;
+
         // Submit to A on the same path the REST layer uses: accept, then relay.
-        let tx = signed_tx(1);
+        let tx = signed_from(&key, 0);
         let tx_id = tx.tx_id_hex();
         let (reply, rx) = oneshot::channel();
         core_a
@@ -444,8 +492,14 @@ mod gossip_tests {
             "relay channel did not establish"
         );
 
+        // Fund a sender on both nodes.
+        let key = SigningKey::generate(&mut OsRng);
+        let block1 = coinbase_block(key.verifying_key().to_bytes());
+        submit_block(&core_a, block1.clone()).await;
+        submit_block(&core_b, block1).await;
+
         // A transaction submitted to A must reach B through the relay.
-        let tx = signed_tx(2);
+        let tx = signed_from(&key, 0);
         let tx_id = tx.tx_id_hex();
         let (reply, rx) = oneshot::channel();
         core_a

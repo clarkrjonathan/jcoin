@@ -5,6 +5,7 @@
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::block::Block;
 use crate::Transaction;
 
 use super::addr::{decode_addrs, encode_addrs, Endpoint};
@@ -19,6 +20,7 @@ pub mod type_code {
     pub const NEW_TRANSACTION: u16 = 0x0010;
     pub const GET_ADDR: u16 = 0x0020;
     pub const ADDR: u16 = 0x0021;
+    pub const NEW_BLOCK: u16 = 0x0030;
 }
 
 /// Payload of a `HELLO`. Carries no persistent node identifier: the `nonce` is
@@ -72,6 +74,8 @@ pub enum Message {
     GetAddr,
     /// A list of peer addresses.
     Addr(Vec<Endpoint>),
+    /// A newly mined or relayed block.
+    NewBlock(Block),
 }
 
 /// Errors from reading or decoding a message.
@@ -84,6 +88,7 @@ pub enum MessageError {
     BadLength { msg_type: u16, len: usize },
     BadTransaction,
     BadAddrs,
+    BadBlock,
 }
 
 impl std::fmt::Display for MessageError {
@@ -96,6 +101,7 @@ impl std::fmt::Display for MessageError {
             }
             MessageError::BadTransaction => write!(f, "payload was not a valid transaction"),
             MessageError::BadAddrs => write!(f, "payload was not a valid address list"),
+            MessageError::BadBlock => write!(f, "payload was not a valid block"),
         }
     }
 }
@@ -119,6 +125,7 @@ impl Message {
             Message::NewTransaction(_) => type_code::NEW_TRANSACTION,
             Message::GetAddr => type_code::GET_ADDR,
             Message::Addr(_) => type_code::ADDR,
+            Message::NewBlock(_) => type_code::NEW_BLOCK,
         }
     }
 
@@ -131,6 +138,7 @@ impl Message {
             Message::NewTransaction(tx) => tx.serialize_to_bytes(),
             Message::GetAddr => Vec::new(),
             Message::Addr(endpoints) => encode_addrs(endpoints),
+            Message::NewBlock(block) => block.serialize(),
         }
     }
 
@@ -186,6 +194,9 @@ impl Message {
             type_code::ADDR => decode_addrs(&raw.payload)
                 .map(Message::Addr)
                 .ok_or(MessageError::BadAddrs),
+            type_code::NEW_BLOCK => Block::from_bytes(&raw.payload)
+                .map(Message::NewBlock)
+                .ok_or(MessageError::BadBlock),
             other => Err(MessageError::UnknownType(other)),
         }
     }
