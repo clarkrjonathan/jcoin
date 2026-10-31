@@ -306,13 +306,14 @@ mod gossip_tests {
     use crate::p2p::Network;
     use crate::Transaction;
 
-    fn signed_tx(nonce: u32) -> Transaction {
+    fn signed_tx(nonce: u64) -> Transaction {
         let key = SigningKey::generate(&mut OsRng);
         let mut tx = Transaction {
+            tx_type: crate::tx_type::NORMAL,
             sender: key.verifying_key().to_bytes(),
             recipient: [5u8; 32],
-            input: 100,
-            output: 90,
+            amount: 100,
+            fee: 10,
             nonce,
             signature: [0u8; 64],
         };

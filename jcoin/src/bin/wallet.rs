@@ -160,19 +160,16 @@ async fn send_transaction(
     amount: u64,
     fee: u64,
 ) -> Result<()> {
-    if fee > amount {
-        return Err(format!("fee ({fee}) cannot exceed amount ({amount})").into());
-    }
-
     let key = load_key(key_dir, key_name)?;
     let recipient = decode_address(recipient)?;
 
     let mut tx = Transaction {
+        tx_type: jcoin::tx_type::NORMAL,
         sender: key.verifying_key().to_bytes(),
         recipient,
-        input: amount,
-        output: amount - fee,
-        nonce: 0, // dummy for the vertical; the node does not check it yet
+        amount,
+        fee,
+        nonce: 0, // dummy until the wallet tracks per-key nonces
         signature: [0u8; 64],
     };
 

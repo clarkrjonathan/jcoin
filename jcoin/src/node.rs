@@ -59,7 +59,13 @@ pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>) {
         match request {
             NodeRequest::SubmitTransaction { tx, reply } => {
                 let tx_id = tx.tx_id_hex();
-                let result = if tx.verify_signature() {
+                let result = if tx.is_coinbase() {
+                    // A coinbase only exists inside a block; it cannot be
+                    // submitted or gossiped on its own.
+                    SubmitResult::Rejected {
+                        reason: "coinbase cannot be submitted directly".to_string(),
+                    }
+                } else if tx.verify_signature() {
                     let is_new = seen.insert(tx_id.clone());
                     SubmitResult::Accepted { tx_id, is_new }
                 } else {

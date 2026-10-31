@@ -1,8 +1,9 @@
-//! JeffyCoin core types for the initial vertical.
+//! JeffyCoin core types.
 //!
-//! Scope for this slice: a single transaction type with fixed-width canonical
-//! serialization, Ed25519 signing bytes, and signature verification. No blocks,
-//! no proof of work, no state/balance validation yet. See `CLAUDE.md`.
+//! The transaction is a single type-tagged format: a normal transfer or an
+//! unsigned coinbase. Fields are fixed-width and serialize to raw hex (no `0x`
+//! prefix) so the wire format matches the canonical byte layout used for hashing
+//! and signing. See `docs/p2p-protocol.md` and the vault design notes.
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -11,16 +12,22 @@ use sha2::{Digest, Sha256};
 pub mod node;
 pub mod p2p;
 
-/// A JeffyCoin transaction.
-///
-/// Fields are fixed-width and serialize to raw hex (no `0x` prefix) so the wire
-/// format matches the canonical byte layout used for hashing and signing. This
-/// is the prototype field set (`sender, recipient, input, output, nonce,
-/// signature`) from the "Initial vertical" design note; the newer
-/// `type/amount/fee` model is a later spec freeze.
+/// Transaction type codes.
+pub mod tx_type {
+    /// A normal, signed transfer.
+    pub const NORMAL: u8 = 0;
+    /// An unsigned coinbase that mints the block reward.
+    pub const COINBASE: u8 = 1;
+}
+
+/// A JeffyCoin transaction (normal transfer or coinbase).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Transaction {
-    /// Sender public key (Ed25519), 32 bytes.
+    /// Transaction type: `0` normal, `1` coinbase (see `tx_type`).
+    #[serde(rename = "type")]
+    pub tx_type: u8,
+
+    /// Sender public key (Ed25519), 32 bytes. Zeroed for a coinbase.
     #[serde(with = "hex::serde")]
     pub sender: [u8; 32],
 
@@ -28,26 +35,44 @@ pub struct Transaction {
     #[serde(with = "hex::serde")]
     pub recipient: [u8; 32],
 
-    /// Amount debited from the sender (base units).
-    pub input: u64,
+    /// Amount credited to the recipient (base units).
+    pub amount: u64,
 
-    /// Amount credited to the recipient (base units). `input - output` is the fee.
-    pub output: u64,
+    /// Fee to the miner (base units). Zero for a coinbase.
+    pub fee: u64,
 
-    /// Per-sender sequence number for replay protection. Not validated in this slice.
-    pub nonce: u32,
+    /// Per-sender sequence number for replay protection.
+    pub nonce: u64,
 
-    /// Ed25519 signature over `signing_bytes()`, 64 bytes.
+    /// Ed25519 signature over `signing_bytes()`, 64 bytes. Zeroed for a coinbase.
     #[serde(with = "hex::serde")]
     pub signature: [u8; 64],
 }
 
 impl Transaction {
-    /// Total serialized size: 32 + 32 + 8 + 8 + 4 + 64 = 148 bytes.
-    pub const SERIALIZED_LEN: usize = 148;
+    /// Total serialized size: 1 + 32 + 32 + 8 + 8 + 8 + 64 = 153 bytes.
+    pub const SERIALIZED_LEN: usize = 153;
 
     /// Length of the signed portion: everything except the signature.
-    pub const SIGNING_LEN: usize = 84;
+    pub const SIGNING_LEN: usize = 89;
+
+    /// Build an unsigned coinbase crediting `recipient` with `amount`.
+    pub fn coinbase(recipient: [u8; 32], amount: u64) -> Transaction {
+        Transaction {
+            tx_type: tx_type::COINBASE,
+            sender: [0u8; 32],
+            recipient,
+            amount,
+            fee: 0,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+    }
+
+    /// True if this is a coinbase.
+    pub fn is_coinbase(&self) -> bool {
+        self.tx_type == tx_type::COINBASE
+    }
 
     /// Full canonical byte serialization, including the signature.
     pub fn serialize_to_bytes(&self) -> Vec<u8> {
@@ -64,12 +89,13 @@ impl Transaction {
             return None;
         }
         Some(Transaction {
-            sender: bytes[0..32].try_into().ok()?,
-            recipient: bytes[32..64].try_into().ok()?,
-            input: u64::from_be_bytes(bytes[64..72].try_into().ok()?),
-            output: u64::from_be_bytes(bytes[72..80].try_into().ok()?),
-            nonce: u32::from_be_bytes(bytes[80..84].try_into().ok()?),
-            signature: bytes[84..148].try_into().ok()?,
+            tx_type: bytes[0],
+            sender: bytes[1..33].try_into().ok()?,
+            recipient: bytes[33..65].try_into().ok()?,
+            amount: u64::from_be_bytes(bytes[65..73].try_into().ok()?),
+            fee: u64::from_be_bytes(bytes[73..81].try_into().ok()?),
+            nonce: u64::from_be_bytes(bytes[81..89].try_into().ok()?),
+            signature: bytes[89..153].try_into().ok()?,
         })
     }
 
@@ -77,10 +103,11 @@ impl Transaction {
     /// signature cannot cover itself.
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(Self::SIGNING_LEN);
+        bytes.push(self.tx_type);
         bytes.extend_from_slice(&self.sender);
         bytes.extend_from_slice(&self.recipient);
-        bytes.extend_from_slice(&self.input.to_be_bytes());
-        bytes.extend_from_slice(&self.output.to_be_bytes());
+        bytes.extend_from_slice(&self.amount.to_be_bytes());
+        bytes.extend_from_slice(&self.fee.to_be_bytes());
         bytes.extend_from_slice(&self.nonce.to_be_bytes());
         bytes
     }
@@ -98,7 +125,7 @@ impl Transaction {
     }
 
     /// Returns true only if `signature` is a valid Ed25519 signature by `sender`
-    /// over `signing_bytes()`.
+    /// over `signing_bytes()`. A coinbase is unsigned, so this is not used for it.
     pub fn verify_signature(&self) -> bool {
         let Ok(public_key) = VerifyingKey::from_bytes(&self.sender) else {
             return false; // sender is not a valid curve point

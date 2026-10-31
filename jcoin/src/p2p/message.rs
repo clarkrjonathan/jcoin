@@ -220,10 +220,11 @@ mod tests {
 
     fn sample_tx() -> Transaction {
         Transaction {
+            tx_type: crate::tx_type::NORMAL,
             sender: [1u8; 32],
             recipient: [2u8; 32],
-            input: 1000,
-            output: 950,
+            amount: 1000,
+            fee: 50,
             nonce: 7,
             signature: [9u8; 64],
         }
