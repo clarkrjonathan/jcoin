@@ -24,9 +24,23 @@ pub const GENESIS_MARKER: &[u8; 32] = b"I am 20 years old, I love Jeffy!";
 /// Fixed genesis timestamp.
 pub const GENESIS_TIMESTAMP: u64 = 0;
 
-/// Static proof-of-work target for v1 (no retargeting yet): the top 16 bits must
-/// be zero, so a block takes on the order of 2^16 hashes to find. Kept easy so
-/// local mining is fast; a real difficulty schedule is a later step.
+/// Static proof-of-work target for v1 (no retargeting yet).
+///
+/// Calibrated from a measured debug-build hash rate (~1.1e5 H/s per miner) to
+/// average about 5 minutes between blocks across 3 racing miners: roughly
+/// 2^256 / (3 * 1.1e5 * 300), about 26.6 leading zero bits. Machine- and
+/// build-specific by design; a real difficulty schedule is a later step.
+///
+/// Under `cfg(test)` an easy target (top 16 bits zero) is used instead, so the
+/// unit tests mine in milliseconds rather than minutes.
+#[cfg(not(test))]
+pub const STATIC_TARGET: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x2b, 0xb5, 0xf1, 0xbc, 0xb7, 0x2f, 0x36, 0x7b, 0x49, 0x8a, 0xcc, 0x3f, 0xf4,
+    0x71, 0x1e, 0x01, 0xfc, 0x24, 0xcf, 0x4d, 0x42, 0xe4, 0x01, 0x31, 0x57, 0xbe, 0x65, 0xd3, 0x74,
+];
+
+/// Easy target for tests (see the `cfg(not(test))` constant above).
+#[cfg(test)]
 pub const STATIC_TARGET: [u8; 32] = [
     0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -271,13 +285,14 @@ impl Block {
     }
 }
 
-/// Assemble and mine the next block on top of `parent`.
+/// Assemble the next block on top of `parent` without searching for a nonce.
 ///
 /// Builds the coinbase (reward plus the normal transaction's fee) to `miner`,
-/// applies the body to the parent state to get the state root, then searches
-/// nonces until the header meets `target`. Returns the mined block and its
-/// resulting state.
-pub fn build_and_mine(
+/// applies the body to the parent state, and returns a header with `nonce = 0`
+/// plus the body and resulting state. The caller searches nonces (all at once
+/// with `build_and_mine`, or in chunks with `mine_chunk` so mining can be
+/// abandoned when the chain moves).
+pub fn assemble_block(
     parent: &BlockHeader,
     parent_state: &State,
     reward: u64,
@@ -285,7 +300,7 @@ pub fn build_and_mine(
     normal: Option<Transaction>,
     target: [u8; 32],
     timestamp: u64,
-) -> Result<(Block, State), BlockError> {
+) -> Result<(BlockHeader, Vec<Transaction>, State), BlockError> {
     let fees = normal.as_ref().map(|t| t.fee).unwrap_or(0);
     let coinbase_amount = reward.checked_add(fees).ok_or(BlockError::CoinbaseTooLarge)?;
     let coinbase = Transaction::coinbase(miner, coinbase_amount);
@@ -305,7 +320,7 @@ pub fn build_and_mine(
     }
     state.apply(&transactions[0]).map_err(BlockError::Apply)?;
 
-    let mut header = BlockHeader {
+    let header = BlockHeader {
         version: BLOCK_VERSION,
         height: parent.height + 1,
         previous_block_hash: parent.block_hash(),
@@ -316,20 +331,39 @@ pub fn build_and_mine(
         nonce: 0,
     };
 
-    loop {
+    Ok((header, transactions, state))
+}
+
+/// Try `attempts` nonces on `header`, advancing `header.nonce`. Returns true and
+/// leaves `header.nonce` at the winning value if one meets the target, else
+/// false with the nonce advanced past the tried range. Lets a caller mine in
+/// bounded chunks and check between them whether to keep going.
+pub fn mine_chunk(header: &mut BlockHeader, attempts: u64) -> bool {
+    for _ in 0..attempts {
         if header.meets_target() {
-            break;
+            return true;
         }
         header.nonce = header.nonce.wrapping_add(1);
     }
+    false
+}
 
-    Ok((
-        Block {
-            header,
-            transactions,
-        },
-        state,
-    ))
+/// Assemble and fully mine the next block on top of `parent`.
+pub fn build_and_mine(
+    parent: &BlockHeader,
+    parent_state: &State,
+    reward: u64,
+    miner: [u8; 32],
+    normal: Option<Transaction>,
+    target: [u8; 32],
+    timestamp: u64,
+) -> Result<(Block, State), BlockError> {
+    let (mut header, transactions, state) =
+        assemble_block(parent, parent_state, reward, miner, normal, target, timestamp)?;
+    while !header.meets_target() {
+        header.nonce = header.nonce.wrapping_add(1);
+    }
+    Ok((Block { header, transactions }, state))
 }
 
 #[cfg(test)]

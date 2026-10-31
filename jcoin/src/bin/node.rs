@@ -20,7 +20,7 @@ use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
-use jcoin::block::{build_and_mine, BLOCK_REWARD, STATIC_TARGET};
+use jcoin::block::{assemble_block, mine_chunk, Block, BLOCK_REWARD, STATIC_TARGET};
 use jcoin::node::{
     run_node, BlockOutcome, ChainInfo, MiningJob, NodeRequest, StatusResult, SubmitResult,
 };
@@ -197,12 +197,11 @@ async fn p2p_listen(addr: SocketAddr, network: Network) {
 /// with `spawn_blocking`, submits the result, and gossips it when accepted. A
 /// short pace between rounds keeps a fast static target from flooding blocks.
 async fn mine_loop(network: Network, miner: [u8; 32]) {
-    loop {
-        // Pace at the start of the round: a short grace before the first block
-        // lets peers connect and follow live, and keeps the fast static target
-        // from flooding blocks thereafter.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    // Nonces tried per blocking burst before checking whether to keep mining.
+    const CHUNK: u64 = 200_000;
 
+    loop {
+        // Fetch a fresh job: the current tip, its state, and a mempool tx if any.
         let (job_tx, job_rx) = oneshot::channel();
         if network
             .node()
@@ -220,40 +219,79 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
         else {
             return;
         };
+        let target_height = parent.height + 1;
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mined = tokio::task::spawn_blocking(move || {
-            build_and_mine(
-                &parent,
-                &parent_state,
-                BLOCK_REWARD,
-                miner,
-                normal,
-                STATIC_TARGET,
-                timestamp,
-            )
-        })
-        .await;
+        let (mut header, transactions, _state) = match assemble_block(
+            &parent,
+            &parent_state,
+            BLOCK_REWARD,
+            miner,
+            normal,
+            STATIC_TARGET,
+            timestamp,
+        ) {
+            Ok(parts) => parts,
+            Err(e) => {
+                eprintln!("[mine] assemble failed: {e}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
 
-        if let Ok(Ok((block, _))) = mined {
-            let (ack_tx, ack_rx) = oneshot::channel();
+        // Mine in chunks off the runtime; between chunks, give up if someone
+        // else already extended the chain to our target height.
+        loop {
+            let (returned, found) = tokio::task::spawn_blocking(move || {
+                let hit = mine_chunk(&mut header, CHUNK);
+                (header, hit)
+            })
+            .await
+            .expect("mining task panicked");
+            header = returned;
+
+            if found {
+                let block = Block {
+                    header: header.clone(),
+                    transactions: transactions.clone(),
+                };
+                let (ack_tx, ack_rx) = oneshot::channel();
+                if network
+                    .node()
+                    .send(NodeRequest::SubmitBlock {
+                        block: Box::new(block.clone()),
+                        reply: ack_tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if let Ok(BlockOutcome::Accepted { is_new: true, height, .. }) = ack_rx.await {
+                    println!("[mine] won block {height} {}", hex::encode(block.hash()));
+                    network.broadcast_block(&block, None);
+                }
+                break;
+            }
+
+            // Someone else may have found this height while we hashed.
+            let (info_tx, info_rx) = oneshot::channel();
             if network
                 .node()
-                .send(NodeRequest::SubmitBlock {
-                    block: Box::new(block.clone()),
-                    reply: ack_tx,
-                })
+                .send(NodeRequest::GetChainInfo { reply: info_tx })
                 .await
                 .is_err()
             {
                 return;
             }
-            if let Ok(BlockOutcome::Accepted { is_new: true, height, .. }) = ack_rx.await {
-                println!("[mine] block {height} {}", hex::encode(block.hash()));
-                network.broadcast_block(&block, None);
+            if let Ok(ChainInfo { height, .. }) = info_rx.await {
+                if height >= target_height {
+                    // Lost the race for this height; abandon and get a new job.
+                    break;
+                }
             }
         }
     }
