@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 pub mod node;
 pub mod p2p;
+pub mod state;
 
 /// Transaction type codes.
 pub mod tx_type {
