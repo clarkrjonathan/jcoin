@@ -466,4 +466,153 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, BlockError::CoinbaseTooLarge);
     }
+
+    // --- Adversarial battery: each malformed block must be rejected. ---
+
+    fn mine_header(header: &mut BlockHeader) {
+        while !header.meets_target() {
+            header.nonce = header.nonce.wrapping_add(1);
+        }
+    }
+
+    #[test]
+    fn unmined_block_is_rejected() {
+        let genesis = Block::genesis();
+        let (mut block, _) =
+            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [7u8; 32], None, STATIC_TARGET, 1)
+                .unwrap();
+        // Break the proof of work.
+        while block.header.meets_target() {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        let err = block
+            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &STATIC_TARGET)
+            .unwrap_err();
+        assert_eq!(err, BlockError::PowNotMet);
+    }
+
+    #[test]
+    fn wrong_target_is_rejected() {
+        let genesis = Block::genesis();
+        let (mut block, _) =
+            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [7u8; 32], None, STATIC_TARGET, 1)
+                .unwrap();
+        block.header.target = [0xff; 32]; // claim a trivial target
+        let err = block
+            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &STATIC_TARGET)
+            .unwrap_err();
+        assert_eq!(err, BlockError::WrongTarget);
+    }
+
+    #[test]
+    fn bad_transactions_hash_is_rejected() {
+        let genesis = Block::genesis();
+        let (mut block, _) =
+            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [7u8; 32], None, STATIC_TARGET, 1)
+                .unwrap();
+        block.header.transactions_hash = [0u8; 32];
+        mine_header(&mut block.header);
+        let err = block
+            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &STATIC_TARGET)
+            .unwrap_err();
+        assert_eq!(err, BlockError::BadTransactionsHash);
+    }
+
+    #[test]
+    fn body_without_a_coinbase_is_rejected() {
+        let genesis = Block::genesis();
+        let normal = Transaction {
+            tx_type: crate::tx_type::NORMAL,
+            sender: [1u8; 32],
+            recipient: [2u8; 32],
+            amount: 1,
+            fee: 0,
+            nonce: 0,
+            signature: [0u8; 64],
+        };
+        let transactions = vec![normal];
+        let mut header = BlockHeader {
+            version: BLOCK_VERSION,
+            height: 1,
+            previous_block_hash: genesis.header.block_hash(),
+            transactions_hash: transactions_hash(&transactions),
+            state_root: State::new().state_root(),
+            timestamp: 1,
+            target: STATIC_TARGET,
+            nonce: 0,
+        };
+        mine_header(&mut header);
+        let block = Block { header, transactions };
+        let err = block
+            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &STATIC_TARGET)
+            .unwrap_err();
+        assert_eq!(err, BlockError::BadBody);
+    }
+
+    #[test]
+    fn bad_signature_in_block_is_rejected() {
+        let genesis = Block::genesis();
+        let key = SigningKey::generate(&mut OsRng);
+        let coinbase = Transaction::coinbase([7u8; 32], BLOCK_REWARD);
+        let normal = Transaction {
+            tx_type: crate::tx_type::NORMAL,
+            sender: key.verifying_key().to_bytes(),
+            recipient: [2u8; 32],
+            amount: 1,
+            fee: 0,
+            nonce: 0,
+            signature: [0u8; 64], // never signed
+        };
+        let transactions = vec![coinbase, normal];
+        let mut header = BlockHeader {
+            version: BLOCK_VERSION,
+            height: 1,
+            previous_block_hash: genesis.header.block_hash(),
+            transactions_hash: transactions_hash(&transactions),
+            state_root: State::new().state_root(),
+            timestamp: 1,
+            target: STATIC_TARGET,
+            nonce: 0,
+        };
+        mine_header(&mut header);
+        let block = Block { header, transactions };
+        let err = block
+            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &STATIC_TARGET)
+            .unwrap_err();
+        assert_eq!(err, BlockError::BadSignature);
+    }
+
+    #[test]
+    fn overspend_in_block_is_rejected() {
+        let genesis = Block::genesis();
+        let key = SigningKey::generate(&mut OsRng);
+        let coinbase = Transaction::coinbase([7u8; 32], BLOCK_REWARD);
+        let mut normal = Transaction {
+            tx_type: crate::tx_type::NORMAL,
+            sender: key.verifying_key().to_bytes(),
+            recipient: [2u8; 32],
+            amount: 10, // sender has no funds
+            fee: 0,
+            nonce: 0,
+            signature: [0u8; 64],
+        };
+        normal.signature = key.sign(&normal.signing_bytes()).to_bytes(); // valid signature
+        let transactions = vec![coinbase, normal];
+        let mut header = BlockHeader {
+            version: BLOCK_VERSION,
+            height: 1,
+            previous_block_hash: genesis.header.block_hash(),
+            transactions_hash: transactions_hash(&transactions),
+            state_root: State::new().state_root(),
+            timestamp: 1,
+            target: STATIC_TARGET,
+            nonce: 0,
+        };
+        mine_header(&mut header);
+        let block = Block { header, transactions };
+        let err = block
+            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &STATIC_TARGET)
+            .unwrap_err();
+        assert!(matches!(err, BlockError::Apply(_)));
+    }
 }
