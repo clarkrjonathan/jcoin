@@ -16,6 +16,9 @@ use super::relay::{kind, read_relay_frame, write_relay_frame, RelayFrame};
 
 type ConnId = u64;
 
+/// Most live channels a single connection may hold (abuse limit).
+const MAX_CHANNELS_PER_CONN: usize = 64;
+
 struct Conn {
     out: mpsc::Sender<RelayFrame>,
     next_odd: u32,
@@ -108,6 +111,11 @@ async fn router(mut events: mpsc::Receiver<Event>) {
 
             Event::Frame { from, frame } => match frame.kind {
                 kind::REGISTER => {
+                    // One handle per connection: ignore repeat registrations so a
+                    // single peer cannot flood the directory.
+                    if directory.values().any(|&owner| owner == from) {
+                        continue;
+                    }
                     let handle: [u8; HANDLE_LEN] = rand::random();
                     directory.insert(handle.to_vec(), from);
                     if let Some(conn) = conns.get(&from) {
@@ -118,6 +126,25 @@ async fn router(mut events: mpsc::Receiver<Event>) {
                         });
                     }
                     println!("[relay] conn {from} registered handle {}", hex::encode(handle));
+                }
+
+                kind::LIST => {
+                    // Return the handles of every other registered node, so a
+                    // node can discover peers to open channels to without knowing
+                    // handles out of band.
+                    let mut payload = Vec::new();
+                    for (handle, &owner) in &directory {
+                        if owner != from {
+                            payload.extend_from_slice(handle);
+                        }
+                    }
+                    if let Some(conn) = conns.get(&from) {
+                        let _ = conn.out.try_send(RelayFrame {
+                            channel: 0,
+                            kind: kind::HANDLES,
+                            payload,
+                        });
+                    }
                 }
 
                 kind::OPEN => {
@@ -139,6 +166,15 @@ async fn router(mut events: mpsc::Receiver<Event>) {
                     };
                     if conn_b == from {
                         fail(&conns, "cannot open a channel to self");
+                        continue;
+                    }
+                    // Abuse limit: cap live channels on either side.
+                    let over_cap = conns.get(&from).map(|c| c.channels.len()).unwrap_or(0)
+                        >= MAX_CHANNELS_PER_CONN
+                        || conns.get(&conn_b).map(|c| c.channels.len()).unwrap_or(0)
+                            >= MAX_CHANNELS_PER_CONN;
+                    if over_cap {
+                        fail(&conns, "channel limit reached");
                         continue;
                     }
 

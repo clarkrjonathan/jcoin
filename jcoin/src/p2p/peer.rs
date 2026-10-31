@@ -701,4 +701,29 @@ mod gossip_tests {
         }
         assert!(synced, "late joiner did not sync to height 5");
     }
+
+    #[tokio::test]
+    async fn relay_directory_bootstraps_peers_without_seeding() {
+        use crate::p2p::relay_client::run_relay_client;
+        use crate::p2p::relay_server::serve;
+
+        // One relay, two nodes that know only the relay (no --relay-open, no
+        // shared handles). They must find each other via the relay directory.
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        tokio::spawn(serve(relay_listener));
+
+        let core_a = spawn_core();
+        let net_a = Network::new(core_a.clone(), 8333, Vec::new(), 8);
+        tokio::spawn(run_relay_client(relay_addr, net_a.clone()));
+
+        let core_b = spawn_core();
+        let net_b = Network::new(core_b.clone(), 8334, Vec::new(), 8);
+        tokio::spawn(run_relay_client(relay_addr, net_b.clone()));
+
+        assert!(
+            wait_until(|| net_a.peer_count() >= 1 && net_b.peer_count() >= 1).await,
+            "relay directory did not connect the two peers"
+        );
+    }
 }

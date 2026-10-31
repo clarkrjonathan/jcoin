@@ -107,6 +107,24 @@ async fn serve(relay_addr: SocketAddr, stream: TcpStream, network: Network) {
                             for peer_handle in network.relay_handles(relay_addr) {
                                 let _ = open_tx.try_send(peer_handle);
                             }
+                            // Ask the relay directory for the other registered
+                            // peers, so an all-CGNAT network bootstraps itself.
+                            let _ = relay_tx
+                                .send(RelayFrame {
+                                    channel: 0,
+                                    kind: kind::LIST,
+                                    payload: Vec::new(),
+                                })
+                                .await;
+                        }
+                    }
+                    kind::HANDLES => {
+                        // Directory reply: open a channel to each advertised peer
+                        // handle (dedup and self are handled by `opened`).
+                        for chunk in frame.payload.chunks_exact(std::mem::size_of::<Handle>()) {
+                            if let Ok(handle) = <Handle>::try_from(chunk) {
+                                let _ = open_tx.try_send(handle);
+                            }
                         }
                     }
                     kind::PAIRED => {

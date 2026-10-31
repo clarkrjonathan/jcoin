@@ -13,10 +13,18 @@ path = "src/bin/node.rs"
 [[bin]]
 name = "wallet"
 path = "src/bin/wallet.rs"
+required-features = ["wallet"]
 
 [[bin]]
 name = "relay"
 path = "src/bin/relay.rs"
+
+[features]
+# `wallet` pulls in reqwest (and thus a TLS stack). It is on by default so a
+# plain `cargo build` builds everything; build the relay lean and static with
+# `cargo build --release --no-default-features --bin relay` (no reqwest/OpenSSL).
+default = ["wallet"]
+wallet = ["dep:reqwest"]
 
 [dependencies]
 # Web + async runtime
@@ -28,8 +36,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = { version = "0.4", features = ["serde"] }
 
-# HTTP client (wallet)
-reqwest = { version = "0.12", features = ["json"] }
+# HTTP client (wallet only; optional so the relay/node build without a TLS stack)
+reqwest = { version = "0.12", features = ["json"], optional = true }
 
 # Crypto
 sha2 = "0.10"

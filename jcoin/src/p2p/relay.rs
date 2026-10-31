@@ -40,6 +40,13 @@ pub mod kind {
     pub const CLOSE: u8 = 0x07;
     /// relay -> node: an OPEN failed. `channel` = opener's id; payload = reason.
     pub const ERROR: u8 = 0x08;
+    /// node -> relay: ask for the handles of other registered nodes. Payload
+    /// empty. The relay answers with `HANDLES`, which lets an all-CGNAT network
+    /// bootstrap without knowing peer handles out of band.
+    pub const LIST: u8 = 0x09;
+    /// relay -> node: the directory, as concatenated fixed-width handles (all
+    /// registered handles except the requester's own).
+    pub const HANDLES: u8 = 0x0a;
 }
 
 /// One relay frame.
