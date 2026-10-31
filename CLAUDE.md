@@ -70,8 +70,12 @@ Starting from the initial vertical (wallet → REST → node core over an
   nonce(u64)/signature`, 153 bytes; normal (signed) and coinbase (unsigned).
 - **State** (`src/state.rs`): account balances + nonce, canonical `state_root`.
 - **Blocks** (`src/block.rs`): 156-byte header, coinbase + ≤1 transfer, PoW
-  `SHA256(header) < target` with a **static** target, genesis, mining,
-  validation. Flat block reward (no halving yet).
+  `SHA256(header) < target`, genesis, mining, validation. Flat reward (no halving).
+- **Difficulty + timestamps**: per-block retarget toward `TARGET_BLOCK_TIME`
+  (5 min) over a `RETARGET_WINDOW`-interval span, clamped to 4x/step, never
+  easier than `POW_LIMIT` (the easy start/cap). Median-time-past is a consensus
+  lower bound on timestamps (in `chain.accept`); a 2-hour future bound is a local
+  admission rule (in the node core, not in deterministic validation).
 - **Chain + fork choice** (`src/chain.rs`): hash-keyed block store, canonical tip
   by **greatest cumulative work** (U256), reorg as a pointer move.
 - **Chain sync**: `NEW_BLOCK` gossip, and `GET_BLOCKS` (block locator) → `BLOCKS`
@@ -85,11 +89,11 @@ sync, work-based reorg), plus live multi-node runs.
 
 ### Not yet built / open
 
-Difficulty adjustment and consensus timestamp rules (the header already carries
-a 256-bit `target` and fork choice is work-based, so these drop in without a
-format change), persistence (chain is in memory), reorg mempool re-add, relay
-handle rotation and per-channel flow control, block/consensus-version signaling,
-and halving. A `type/amount/fee` freeze beyond v1 is also future.
+Reorg mempool re-add (txs dropped by a reorg are not re-queued), relay handle
+rotation and per-channel flow control, block/consensus-version signaling, halving,
+and misbehaviour scoring/banning. Persistence stores blocks only (state is
+replayed) and the log is never compacted. `POW_LIMIT` is machine/build-specific
+(calibrated from a debug-build hash rate).
 
 ## Build and run
 
