@@ -194,6 +194,11 @@ async fn p2p_listen(addr: SocketAddr, network: Network) {
 /// short pace between rounds keeps a fast static target from flooding blocks.
 async fn mine_loop(network: Network, miner: [u8; 32]) {
     loop {
+        // Pace at the start of the round: a short grace before the first block
+        // lets peers connect and follow live, and keeps the fast static target
+        // from flooding blocks thereafter.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
         let (job_tx, job_rx) = oneshot::channel();
         if network
             .node()
@@ -247,8 +252,6 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
                 network.broadcast_block(&block, None);
             }
         }
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 

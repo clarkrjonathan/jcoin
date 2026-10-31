@@ -322,7 +322,7 @@ mod gossip_tests {
     use tokio::sync::{mpsc, oneshot};
 
     use crate::block::{build_and_mine, Block, BLOCK_REWARD, STATIC_TARGET};
-    use crate::node::{run_node, NodeRequest, StatusResult, SubmitResult};
+    use crate::node::{run_node, BlockOutcome, NodeRequest, StatusResult, SubmitResult};
     use crate::p2p::Network;
     use crate::state::State;
     use crate::Transaction;
@@ -387,6 +387,12 @@ mod gossip_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         check()
+    }
+
+    async fn chain_height(core: &mpsc::Sender<NodeRequest>) -> u64 {
+        let (reply, rx) = oneshot::channel();
+        core.send(NodeRequest::GetChainInfo { reply }).await.unwrap();
+        rx.await.unwrap().height
     }
 
     #[tokio::test]
@@ -524,5 +530,61 @@ mod gossip_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(reached_b, "transaction did not gossip through the relay to B");
+    }
+
+    #[tokio::test]
+    async fn mined_block_propagates_to_a_connected_peer() {
+        // Both nodes start at genesis and are connected, so a block that extends
+        // the tip applies on the peer. (A follower that joins mid-chain and
+        // misses a block cannot catch up without chain sync, which is the next
+        // milestone.)
+        let core_a = spawn_core();
+        let core_b = spawn_core();
+        let net_a = Network::new(core_a.clone(), 1, Vec::new(), 8);
+        let net_b = Network::new(core_b.clone(), 2, Vec::new(), 8);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client_stream = connect.await.unwrap();
+        tokio::spawn(run_peer(server_stream, net_a.clone(), "A".into()));
+        tokio::spawn(run_peer(client_stream, net_b.clone(), "B".into()));
+        assert!(wait_until(|| net_a.peer_count() == 1 && net_b.peer_count() == 1).await);
+
+        // Mine block 1 and submit it to A; A gossips NEW_BLOCK to B.
+        let (block, _) = build_and_mine(
+            &Block::genesis().header,
+            &State::new(),
+            BLOCK_REWARD,
+            [7u8; 32],
+            None,
+            STATIC_TARGET,
+            1,
+        )
+        .unwrap();
+        let (reply, rx) = oneshot::channel();
+        core_a
+            .send(NodeRequest::SubmitBlock {
+                block: Box::new(block.clone()),
+                reply,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.await.unwrap(),
+            BlockOutcome::Accepted { is_new: true, .. }
+        ));
+        net_a.broadcast_block(&block, None);
+
+        let mut reached = false;
+        for _ in 0..150 {
+            if chain_height(&core_b).await == 1 {
+                reached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(reached, "mined block did not propagate to node B");
     }
 }
