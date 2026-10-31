@@ -1,4 +1,4 @@
-//! Measure this machine's block-hashing rate and print a STATIC_TARGET that
+//! Measure this machine's block-hashing rate and print a POW_LIMIT that
 //! should average a chosen block time across a chosen number of racing miners.
 //! Run in the same build profile the nodes run in (debug here).
 
@@ -42,7 +42,7 @@ fn main() {
     println!("target for {miners} miners, {seconds}s/block: ~{denom:.3e} hashes/block");
     println!("leading-zero bits ~= {:.1}", denom.log2());
     println!("hex: {}", hex::encode(bytes));
-    print!("STATIC_TARGET = [");
+    print!("POW_LIMIT = [");
     for (i, b) in bytes.iter().enumerate() {
         if i % 16 == 0 {
             print!("\n    ");

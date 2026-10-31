@@ -7,10 +7,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::block::{Block, BlockHeader};
+use crate::block::{Block, BlockHeader, MAX_FUTURE_DRIFT};
 use crate::chain::{Accept, Chain};
 use crate::state::State;
 use crate::store::{load_blocks, BlockLog};
@@ -78,11 +79,15 @@ pub struct MiningJob {
     pub parent: BlockHeader,
     pub parent_state: State,
     pub normal: Option<Transaction>,
+    /// The difficulty target this block must use (from the retarget schedule).
+    pub target: [u8; 32],
 }
 
 pub struct ChainInfo {
     pub height: u64,
     pub tip_hash: [u8; 32],
+    /// The difficulty target of the current tip (lets clients see retargeting).
+    pub tip_target: [u8; 32],
 }
 
 /// The node core task.
@@ -150,6 +155,20 @@ pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>, data_dir: Option<Path
             }
 
             NodeRequest::SubmitBlock { block, reply } => {
+                // Local future-time bound (not consensus): reject a block more
+                // than MAX_FUTURE_DRIFT ahead of our clock. Enforced here on
+                // receipt, never inside chain.accept, so replay stays deterministic.
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if block.header.timestamp > now.saturating_add(MAX_FUTURE_DRIFT) {
+                    let _ = reply.send(BlockOutcome::Rejected {
+                        reason: "timestamp too far in the future".to_string(),
+                    });
+                    continue;
+                }
+
                 // Clone for the log only when persisting.
                 let for_log = log.as_ref().map(|_| (*block).clone());
                 let outcome = match chain.accept(*block) {
@@ -187,6 +206,7 @@ pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>, data_dir: Option<Path
                     parent,
                     parent_state: chain.tip_state().clone(),
                     normal,
+                    target: chain.next_target(),
                 });
             }
 
@@ -194,6 +214,7 @@ pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>, data_dir: Option<Path
                 let _ = reply.send(ChainInfo {
                     height: chain.tip_height(),
                     tip_hash: chain.tip_hash(),
+                    tip_target: chain.tip_header().target,
                 });
             }
 
@@ -261,7 +282,7 @@ fn prune_mempool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{build_and_mine, Block, BLOCK_REWARD, STATIC_TARGET};
+    use crate::block::{build_and_mine, Block, BLOCK_REWARD, POW_LIMIT};
     use crate::state::State;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -275,6 +296,93 @@ mod tests {
         let (reply, rx) = oneshot::channel();
         core.send(NodeRequest::GetChainInfo { reply }).await.unwrap();
         rx.await.unwrap().height
+    }
+
+    async fn get_job(core: &mpsc::Sender<NodeRequest>) -> MiningJob {
+        let (reply, rx) = oneshot::channel();
+        core.send(NodeRequest::GetMiningJob { reply }).await.unwrap();
+        rx.await.unwrap()
+    }
+
+    async fn submit_block(core: &mpsc::Sender<NodeRequest>, block: Block) -> BlockOutcome {
+        let (reply, rx) = oneshot::channel();
+        core.send(NodeRequest::SubmitBlock {
+            block: Box::new(block),
+            reply,
+        })
+        .await
+        .unwrap();
+        rx.await.unwrap()
+    }
+
+    // Reproduce the live miner path: mine block 1 (coinbase), submit a tx, then
+    // mine block 2 carrying that tx through the node core.
+    #[tokio::test]
+    async fn mines_past_block_1_with_a_mempool_transaction() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let (core, rx) = mpsc::channel(64);
+        tokio::spawn(run_node(rx, None));
+
+        let key = SigningKey::generate(&mut OsRng);
+        let miner = key.verifying_key().to_bytes();
+
+        // Block 1: coinbase to the miner.
+        let j1 = get_job(&core).await;
+        let (b1, _) = build_and_mine(
+            &j1.parent,
+            &j1.parent_state,
+            BLOCK_REWARD,
+            miner,
+            j1.normal,
+            POW_LIMIT,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            submit_block(&core, b1).await,
+            BlockOutcome::Accepted { is_new: true, .. }
+        ));
+        assert_eq!(height(&core).await, 1);
+
+        // A signed transfer from the miner, nonce 0.
+        let mut tx = Transaction {
+            tx_type: crate::tx_type::NORMAL,
+            sender: miner,
+            recipient: [2u8; 32],
+            amount: 10,
+            fee: 0,
+            nonce: 0,
+            signature: [0u8; 64],
+        };
+        tx.signature = key.sign(&tx.signing_bytes()).to_bytes();
+        let (reply, srx) = oneshot::channel();
+        core.send(NodeRequest::SubmitTransaction { tx, reply })
+            .await
+            .unwrap();
+        assert!(matches!(srx.await.unwrap(), SubmitResult::Accepted { is_new: true, .. }));
+
+        // Block 2: the job should now carry the mempool tx.
+        let j2 = get_job(&core).await;
+        assert!(j2.normal.is_some(), "mining job did not include the mempool tx");
+        let (b2, _) = build_and_mine(
+            &j2.parent,
+            &j2.parent_state,
+            BLOCK_REWARD,
+            miner,
+            j2.normal,
+            POW_LIMIT,
+            2,
+        )
+        .unwrap();
+        match submit_block(&core, b2).await {
+            BlockOutcome::Accepted { is_new: true, height, .. } => assert_eq!(height, 2),
+            BlockOutcome::Rejected { reason } => panic!("block 2 rejected: {reason}"),
+            BlockOutcome::Accepted { is_new: false, .. } => panic!("block 2 already known"),
+            BlockOutcome::Orphan => panic!("block 2 orphan"),
+        }
+        assert_eq!(height(&core).await, 2);
     }
 
     #[tokio::test]
@@ -291,7 +399,7 @@ mod tests {
             BLOCK_REWARD,
             [1u8; 32],
             None,
-            STATIC_TARGET,
+            POW_LIMIT,
             1,
         )
         .unwrap();

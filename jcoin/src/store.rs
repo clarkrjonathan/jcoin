@@ -76,7 +76,7 @@ pub fn load_blocks(path: &Path) -> io::Result<Vec<Block>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{build_and_mine, Block, BLOCK_REWARD, STATIC_TARGET};
+    use crate::block::{build_and_mine, Block, BLOCK_REWARD, POW_LIMIT};
     use crate::state::State;
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -91,10 +91,10 @@ mod tests {
         let path = temp_path("roundtrip");
         let genesis = Block::genesis();
         let (b1, s1) =
-            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [1u8; 32], None, STATIC_TARGET, 1)
+            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [1u8; 32], None, POW_LIMIT, 1)
                 .unwrap();
         let (b2, _) =
-            build_and_mine(&b1.header, &s1, BLOCK_REWARD, [1u8; 32], None, STATIC_TARGET, 2).unwrap();
+            build_and_mine(&b1.header, &s1, BLOCK_REWARD, [1u8; 32], None, POW_LIMIT, 2).unwrap();
 
         {
             let mut log = BlockLog::open(&path).unwrap();

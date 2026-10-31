@@ -24,24 +24,43 @@ pub const GENESIS_MARKER: &[u8; 32] = b"I am 20 years old, I love Jeffy!";
 /// Fixed genesis timestamp.
 pub const GENESIS_TIMESTAMP: u64 = 0;
 
-/// Static proof-of-work target for v1 (no retargeting yet).
-///
-/// Calibrated from a measured debug-build hash rate (~1.1e5 H/s per miner) to
-/// average about 5 minutes between blocks across 3 racing miners: roughly
-/// 2^256 / (3 * 1.1e5 * 300), about 26.6 leading zero bits. Machine- and
-/// build-specific by design; a real difficulty schedule is a later step.
-///
-/// Under `cfg(test)` an easy target (top 16 bits zero) is used instead, so the
-/// unit tests mine in milliseconds rather than minutes.
+/// Target average seconds between blocks. Difficulty retargets toward this.
+pub const TARGET_BLOCK_TIME: u64 = 300;
+
+/// Number of block intervals averaged by the retarget algorithm. A block at
+/// height H retargets from the span of the `RETARGET_WINDOW` intervals ending at
+/// its parent. Small enough to adapt within the hour, large enough to damp the
+/// large per-block variance of proof of work.
+pub const RETARGET_WINDOW: u64 = 12;
+
+/// Largest per-step difficulty change factor (clamps the measured span to
+/// `[expected/4, expected*4]`), so difficulty cannot swing more than 4x at once.
+pub const MAX_ADJUST_FACTOR: u64 = 4;
+
+/// Number of recent blocks whose median timestamp a new block must exceed
+/// (median-time-past, the consensus lower bound on timestamps).
+pub const MEDIAN_TIME_SPAN: usize = 11;
+
+/// A block timestamp may not be more than this many seconds ahead of the
+/// receiving node's clock. This is a local admission rule, not consensus: a
+/// block briefly in the future is accepted once the clock catches up, so it is
+/// enforced on receipt, never during deterministic validation or replay.
+pub const MAX_FUTURE_DRIFT: u64 = 2 * 60 * 60;
+
+/// The easiest allowed target, and the genesis / starting target. Difficulty
+/// retargets harder than this as needed but never easier. Under `cfg(test)` it
+/// is very easy (top 16 bits zero) so tests mine instantly; otherwise it is the
+/// easy starting point (top 20 bits zero) from which the chain hardens toward
+/// `TARGET_BLOCK_TIME`.
 #[cfg(not(test))]
-pub const STATIC_TARGET: [u8; 32] = [
-    0x00, 0x00, 0x00, 0x2b, 0xb5, 0xf1, 0xbc, 0xb7, 0x2f, 0x36, 0x7b, 0x49, 0x8a, 0xcc, 0x3f, 0xf4,
-    0x71, 0x1e, 0x01, 0xfc, 0x24, 0xcf, 0x4d, 0x42, 0xe4, 0x01, 0x31, 0x57, 0xbe, 0x65, 0xd3, 0x74,
+pub const POW_LIMIT: [u8; 32] = [
+    0x00, 0x00, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 ];
 
 /// Easy target for tests (see the `cfg(not(test))` constant above).
 #[cfg(test)]
-pub const STATIC_TARGET: [u8; 32] = [
+pub const POW_LIMIT: [u8; 32] = [
     0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 ];
@@ -134,6 +153,8 @@ pub enum BlockError {
     BadStateRoot,
     CoinbaseTooLarge,
     BadSignature,
+    /// Timestamp is not strictly greater than the median of recent blocks.
+    TimestampTooOld,
     Apply(StateError),
 }
 
@@ -149,6 +170,9 @@ impl std::fmt::Display for BlockError {
             BlockError::BadStateRoot => write!(f, "state_root mismatch"),
             BlockError::CoinbaseTooLarge => write!(f, "coinbase exceeds reward plus fees"),
             BlockError::BadSignature => write!(f, "a normal transaction has an invalid signature"),
+            BlockError::TimestampTooOld => {
+                write!(f, "timestamp is not greater than the median of recent blocks")
+            }
             BlockError::Apply(e) => write!(f, "state apply failed: {e}"),
         }
     }
@@ -168,7 +192,7 @@ impl Block {
             transactions_hash: transactions_hash(&transactions),
             state_root: State::new().state_root(),
             timestamp: GENESIS_TIMESTAMP,
-            target: STATIC_TARGET,
+            target: POW_LIMIT,
             nonce: 0,
         };
         Block {
@@ -388,7 +412,7 @@ mod tests {
         let genesis = Block::genesis();
         let state = State::new();
         let (block, _) =
-            build_and_mine(&genesis.header, &state, BLOCK_REWARD, [3u8; 32], None, STATIC_TARGET, 1)
+            build_and_mine(&genesis.header, &state, BLOCK_REWARD, [3u8; 32], None, POW_LIMIT, 1)
                 .unwrap();
         let decoded = Block::from_bytes(&block.serialize()).unwrap();
         assert_eq!(decoded.header, block.header);
@@ -401,12 +425,12 @@ mod tests {
         let state = State::new();
         let miner = [7u8; 32];
         let (block, new_state) =
-            build_and_mine(&genesis.header, &state, BLOCK_REWARD, miner, None, STATIC_TARGET, 1)
+            build_and_mine(&genesis.header, &state, BLOCK_REWARD, miner, None, POW_LIMIT, 1)
                 .unwrap();
 
         assert!(block.header.meets_target());
         let applied = block
-            .validate_and_apply(&genesis.header, &state, BLOCK_REWARD, &STATIC_TARGET)
+            .validate_and_apply(&genesis.header, &state, BLOCK_REWARD, &POW_LIMIT)
             .unwrap();
         assert_eq!(applied.balance(&miner), BLOCK_REWARD);
         assert_eq!(new_state.balance(&miner), BLOCK_REWARD);
@@ -421,7 +445,7 @@ mod tests {
         let sender = key.verifying_key().to_bytes();
 
         let (b1, s1) =
-            build_and_mine(&genesis.header, &s0, BLOCK_REWARD, sender, None, STATIC_TARGET, 1)
+            build_and_mine(&genesis.header, &s0, BLOCK_REWARD, sender, None, POW_LIMIT, 1)
                 .unwrap();
 
         let mut tx = Transaction {
@@ -441,12 +465,12 @@ mod tests {
             BLOCK_REWARD,
             [8u8; 32],
             Some(tx),
-            STATIC_TARGET,
+            POW_LIMIT,
             2,
         )
         .unwrap();
 
-        b2.validate_and_apply(&b1.header, &s1, BLOCK_REWARD, &STATIC_TARGET)
+        b2.validate_and_apply(&b1.header, &s1, BLOCK_REWARD, &POW_LIMIT)
             .unwrap();
         assert_eq!(s2.balance(&[9u8; 32]), 10);
         // Miner of block 2 gets reward + fee.
@@ -460,7 +484,7 @@ mod tests {
         let genesis = Block::genesis();
         let state = State::new();
         let (mut block, _) =
-            build_and_mine(&genesis.header, &state, BLOCK_REWARD, [1u8; 32], None, STATIC_TARGET, 1)
+            build_and_mine(&genesis.header, &state, BLOCK_REWARD, [1u8; 32], None, POW_LIMIT, 1)
                 .unwrap();
         block.header.state_root = [0u8; 32];
         // Re-mine so the PoW still holds on the tampered header.
@@ -468,7 +492,7 @@ mod tests {
             block.header.nonce = block.header.nonce.wrapping_add(1);
         }
         let err = block
-            .validate_and_apply(&genesis.header, &state, BLOCK_REWARD, &STATIC_TARGET)
+            .validate_and_apply(&genesis.header, &state, BLOCK_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::BadStateRoot);
     }
@@ -488,7 +512,7 @@ mod tests {
             transactions_hash: transactions_hash(&transactions),
             state_root: applied.state_root(),
             timestamp: 1,
-            target: STATIC_TARGET,
+            target: POW_LIMIT,
             nonce: 0,
         };
         while header.block_hash() >= header.target {
@@ -496,7 +520,7 @@ mod tests {
         }
         let block = Block { header, transactions };
         let err = block
-            .validate_and_apply(&genesis.header, &state, BLOCK_REWARD, &STATIC_TARGET)
+            .validate_and_apply(&genesis.header, &state, BLOCK_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::CoinbaseTooLarge);
     }
@@ -513,14 +537,14 @@ mod tests {
     fn unmined_block_is_rejected() {
         let genesis = Block::genesis();
         let (mut block, _) =
-            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [7u8; 32], None, STATIC_TARGET, 1)
+            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [7u8; 32], None, POW_LIMIT, 1)
                 .unwrap();
         // Break the proof of work.
         while block.header.meets_target() {
             block.header.nonce = block.header.nonce.wrapping_add(1);
         }
         let err = block
-            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &STATIC_TARGET)
+            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::PowNotMet);
     }
@@ -529,11 +553,11 @@ mod tests {
     fn wrong_target_is_rejected() {
         let genesis = Block::genesis();
         let (mut block, _) =
-            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [7u8; 32], None, STATIC_TARGET, 1)
+            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [7u8; 32], None, POW_LIMIT, 1)
                 .unwrap();
         block.header.target = [0xff; 32]; // claim a trivial target
         let err = block
-            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &STATIC_TARGET)
+            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::WrongTarget);
     }
@@ -542,12 +566,12 @@ mod tests {
     fn bad_transactions_hash_is_rejected() {
         let genesis = Block::genesis();
         let (mut block, _) =
-            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [7u8; 32], None, STATIC_TARGET, 1)
+            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [7u8; 32], None, POW_LIMIT, 1)
                 .unwrap();
         block.header.transactions_hash = [0u8; 32];
         mine_header(&mut block.header);
         let err = block
-            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &STATIC_TARGET)
+            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::BadTransactionsHash);
     }
@@ -572,13 +596,13 @@ mod tests {
             transactions_hash: transactions_hash(&transactions),
             state_root: State::new().state_root(),
             timestamp: 1,
-            target: STATIC_TARGET,
+            target: POW_LIMIT,
             nonce: 0,
         };
         mine_header(&mut header);
         let block = Block { header, transactions };
         let err = block
-            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &STATIC_TARGET)
+            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::BadBody);
     }
@@ -605,13 +629,13 @@ mod tests {
             transactions_hash: transactions_hash(&transactions),
             state_root: State::new().state_root(),
             timestamp: 1,
-            target: STATIC_TARGET,
+            target: POW_LIMIT,
             nonce: 0,
         };
         mine_header(&mut header);
         let block = Block { header, transactions };
         let err = block
-            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &STATIC_TARGET)
+            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::BadSignature);
     }
@@ -639,13 +663,13 @@ mod tests {
             transactions_hash: transactions_hash(&transactions),
             state_root: State::new().state_root(),
             timestamp: 1,
-            target: STATIC_TARGET,
+            target: POW_LIMIT,
             nonce: 0,
         };
         mine_header(&mut header);
         let block = Block { header, transactions };
         let err = block
-            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &STATIC_TARGET)
+            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert!(matches!(err, BlockError::Apply(_)));
     }

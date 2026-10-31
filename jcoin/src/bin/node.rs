@@ -20,7 +20,7 @@ use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
-use jcoin::block::{assemble_block, mine_chunk, Block, BLOCK_REWARD, STATIC_TARGET};
+use jcoin::block::{assemble_block, mine_chunk, Block, BLOCK_REWARD};
 use jcoin::node::{
     run_node, BlockOutcome, ChainInfo, MiningJob, NodeRequest, StatusResult, SubmitResult,
 };
@@ -215,6 +215,7 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
             parent,
             parent_state,
             normal,
+            target,
         }) = job_rx.await
         else {
             return;
@@ -231,7 +232,7 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
             BLOCK_REWARD,
             miner,
             normal,
-            STATIC_TARGET,
+            target,
             timestamp,
         ) {
             Ok(parts) => parts,
@@ -258,6 +259,12 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
                     header: header.clone(),
                     transactions: transactions.clone(),
                 };
+                println!(
+                    "[mine] found candidate height {} ({} txs) {}",
+                    block.header.height,
+                    block.transactions.len(),
+                    hex::encode(block.hash())
+                );
                 let (ack_tx, ack_rx) = oneshot::channel();
                 if network
                     .node()
@@ -270,9 +277,21 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
                 {
                     return;
                 }
-                if let Ok(BlockOutcome::Accepted { is_new: true, height, .. }) = ack_rx.await {
-                    println!("[mine] won block {height} {}", hex::encode(block.hash()));
-                    network.broadcast_block(&block, None);
+                match ack_rx.await {
+                    Ok(BlockOutcome::Accepted { is_new: true, height, .. }) => {
+                        println!("[mine] won block {height} {}", hex::encode(block.hash()));
+                        network.broadcast_block(&block, None);
+                    }
+                    Ok(BlockOutcome::Accepted { is_new: false, height, .. }) => {
+                        println!("[mine] candidate at height {height} already known");
+                    }
+                    Ok(BlockOutcome::Rejected { reason }) => {
+                        println!("[mine] candidate REJECTED: {reason}");
+                    }
+                    Ok(BlockOutcome::Orphan) => {
+                        println!("[mine] candidate ORPHAN (parent unknown)");
+                    }
+                    Err(_) => return,
                 }
                 break;
             }
@@ -444,12 +463,24 @@ async fn chain_info(State(state): State<AppState>) -> impl IntoResponse {
             Json(json!({ "error": "node core unavailable" })),
         );
     }
-    let ChainInfo { height, tip_hash } = reply_rx.await.unwrap_or(ChainInfo {
+    let ChainInfo {
+        height,
+        tip_hash,
+        tip_target,
+    } = reply_rx.await.unwrap_or(ChainInfo {
         height: 0,
         tip_hash: [0u8; 32],
+        tip_target: [0u8; 32],
     });
+    // Leading zero bytes of the target are a rough difficulty gauge.
+    let difficulty_zero_bytes = tip_target.iter().take_while(|b| **b == 0).count();
     (
         StatusCode::OK,
-        Json(json!({ "height": height, "tip": hex::encode(tip_hash) })),
+        Json(json!({
+            "height": height,
+            "tip": hex::encode(tip_hash),
+            "target": hex::encode(tip_target),
+            "target_leading_zero_bytes": difficulty_zero_bytes,
+        })),
     )
 }
