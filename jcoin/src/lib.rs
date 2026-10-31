@@ -14,6 +14,7 @@ pub mod chain;
 pub mod node;
 pub mod p2p;
 pub mod state;
+pub mod store;
 
 /// Transaction type codes.
 pub mod tx_type {

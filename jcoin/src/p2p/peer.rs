@@ -438,7 +438,7 @@ mod gossip_tests {
 
     fn spawn_core() -> mpsc::Sender<NodeRequest> {
         let (tx, rx) = mpsc::channel(32);
-        tokio::spawn(run_node(rx));
+        tokio::spawn(run_node(rx, None));
         tx
     }
 

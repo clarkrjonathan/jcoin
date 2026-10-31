@@ -58,6 +58,10 @@ struct Cli {
     /// Address (hex public key, 32 bytes) that receives coinbase rewards.
     #[arg(long)]
     miner: Option<String>,
+    /// Directory to persist the chain in (an append-only block log). Omit to run
+    /// in memory only. Each node needs its own directory.
+    #[arg(long)]
+    data_dir: Option<std::path::PathBuf>,
 }
 
 /// Shared state for REST handlers: a channel into the node core and the peer set.
@@ -78,7 +82,7 @@ async fn main() {
 
     // Node core.
     let (node_tx, node_rx) = mpsc::channel::<NodeRequest>(100);
-    tokio::spawn(run_node(node_rx));
+    tokio::spawn(run_node(node_rx, cli.data_dir.clone()));
 
     // Addresses this node advertises: the configured ones, plus a concrete
     // --p2p-addr.

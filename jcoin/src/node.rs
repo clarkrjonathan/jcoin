@@ -6,12 +6,14 @@
 //! transaction-seen set, so there are no locks.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use tokio::sync::{mpsc, oneshot};
 
 use crate::block::{Block, BlockHeader};
 use crate::chain::{Accept, Chain};
 use crate::state::State;
+use crate::store::{load_blocks, BlockLog};
 use crate::Transaction;
 
 /// Most blocks to return in one `BLOCKS` reply.
@@ -84,10 +86,37 @@ pub struct ChainInfo {
 }
 
 /// The node core task.
-pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>) {
+///
+/// If `data_dir` is set, the chain is persisted to an append-only block log
+/// there (`blocks.dat`): the log is replayed on startup to rebuild the chain and
+/// state, and each newly accepted block is appended. With `None`, the node is
+/// in-memory only.
+pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>, data_dir: Option<PathBuf>) {
     let mut chain = Chain::new();
     let mut mempool: HashMap<String, Transaction> = HashMap::new();
     let mut seen_tx: HashSet<String> = HashSet::new();
+
+    // Replay persisted blocks (if any) and open the log for appending.
+    let mut log: Option<BlockLog> = None;
+    if let Some(dir) = data_dir {
+        let path = dir.join("blocks.dat");
+        match load_blocks(&path) {
+            Ok(blocks) => {
+                let count = blocks.len();
+                for block in blocks {
+                    chain.accept(block);
+                }
+                if count > 0 {
+                    println!("[store] replayed {count} blocks; tip height {}", chain.tip_height());
+                }
+            }
+            Err(e) => eprintln!("[store] failed to read {}: {e}", path.display()),
+        }
+        match BlockLog::open(&path) {
+            Ok(l) => log = Some(l),
+            Err(e) => eprintln!("[store] failed to open {} for append: {e}", path.display()),
+        }
+    }
 
     while let Some(request) = rx.recv().await {
         match request {
@@ -121,8 +150,15 @@ pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>) {
             }
 
             NodeRequest::SubmitBlock { block, reply } => {
+                // Clone for the log only when persisting.
+                let for_log = log.as_ref().map(|_| (*block).clone());
                 let outcome = match chain.accept(*block) {
                     Accept::Stored { new_tip, height } => {
+                        if let (Some(log), Some(block)) = (log.as_mut(), for_log.as_ref()) {
+                            if let Err(e) = log.append(block) {
+                                eprintln!("[store] append failed: {e}");
+                            }
+                        }
                         // Drop transactions no longer applicable on the new tip.
                         prune_mempool(&chain, &mut mempool, &mut seen_tx);
                         BlockOutcome::Accepted {
@@ -220,4 +256,67 @@ fn prune_mempool(
         tx.nonce == state.nonce(&tx.sender)
             && state.balance(&tx.sender) >= tx.amount.saturating_add(tx.fee)
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::{build_and_mine, Block, BLOCK_REWARD, STATIC_TARGET};
+    use crate::state::State;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("jcoin-node-test-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    async fn height(core: &mpsc::Sender<NodeRequest>) -> u64 {
+        let (reply, rx) = oneshot::channel();
+        core.send(NodeRequest::GetChainInfo { reply }).await.unwrap();
+        rx.await.unwrap().height
+    }
+
+    #[tokio::test]
+    async fn chain_persists_across_restart() {
+        let dir = temp_dir("persist");
+
+        // First run: submit a mined block, then shut the node down.
+        let (tx1, rx1) = mpsc::channel(16);
+        let run1 = tokio::spawn(run_node(rx1, Some(dir.clone())));
+        let genesis = Block::genesis();
+        let (block, _) = build_and_mine(
+            &genesis.header,
+            &State::new(),
+            BLOCK_REWARD,
+            [1u8; 32],
+            None,
+            STATIC_TARGET,
+            1,
+        )
+        .unwrap();
+        let (reply, rx) = oneshot::channel();
+        tx1.send(NodeRequest::SubmitBlock {
+            block: Box::new(block),
+            reply,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            rx.await.unwrap(),
+            BlockOutcome::Accepted { is_new: true, .. }
+        ));
+        assert_eq!(height(&tx1).await, 1);
+        drop(tx1);
+        run1.await.unwrap();
+
+        // Second run on the same directory: the block is replayed from disk.
+        let (tx2, rx2) = mpsc::channel(16);
+        let run2 = tokio::spawn(run_node(rx2, Some(dir.clone())));
+        assert_eq!(height(&tx2).await, 1);
+        drop(tx2);
+        run2.await.unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
