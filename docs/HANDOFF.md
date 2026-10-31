@@ -45,7 +45,10 @@ propagates, and balances settle consistently on a node that never saw the wallet
   (`peer`), peer registry / address book / dialer (`network`), peer discovery
   (`GET_ADDR` / `ADDR`), and the relay transport — a multiplexing router
   (`relay_server`, the `relay` binary) that pairs node channels by ephemeral
-  handle and forwards opaque `DATA`, with the node-side client in `relay_client`.
+  handle, serves a handle directory (`LIST`/`HANDLES`) so an all-CGNAT network
+  self-bootstraps, and forwards opaque `DATA`, with the node-side client in
+  `relay_client`. Deployment: `docs/DEPLOY-RELAY.md` + `deploy/` (systemd unit,
+  Dockerfile); build lean with `--no-default-features --bin relay`.
 - **Persistence** (`src/store.rs`): append-only block log; state is replayed on
   startup, so blocks are the single source of truth. Enable with `--data-dir`.
 - **Node** (`src/bin/node.rs`): node-core task + axum REST + P2P listener/dialers

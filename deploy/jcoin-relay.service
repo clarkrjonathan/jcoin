@@ -1,0 +1,26 @@
+[Unit]
+Description=JeffyCoin relay (multiplexing router)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Expects the lean static binary at this path. Port 9000 is unprivileged, so no
+# extra capabilities are needed. Override the port with: --addr 0.0.0.0:PORT
+ExecStart=/usr/local/bin/jcoin-relay --addr 0.0.0.0:9000
+Restart=always
+RestartSec=3
+
+# The relay is stateless (in-memory directory only); a restart just drops live
+# pairings and nodes reconnect within a few seconds.
+
+# Hardening: run as an ephemeral unprivileged user with a locked-down view.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

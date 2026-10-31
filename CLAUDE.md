@@ -65,7 +65,13 @@ Starting from the initial vertical (wallet → REST → node core over an
   `NEW_TRANSACTION`); peer discovery (`GET_ADDR`/`ADDR`, address book, auto-dial;
   `--advertise`, `--max-peers`); and the relay transport (`relay` binary, a
   multiplexing router pairing channels by ephemeral handle; `--relay`,
-  `--relay-open`). A relay channel is a `PeerLink` like any other.
+  `--relay-open`). The relay also serves a handle directory (`LIST`/`HANDLES`)
+  so an all-CGNAT network self-bootstraps without out-of-band handles, and has
+  basic abuse caps (one handle per connection, a per-connection channel limit).
+  A relay channel is a `PeerLink` like any other. Deploying the relay cheaply:
+  see `docs/DEPLOY-RELAY.md` and `deploy/`; build it lean with
+  `cargo build --release --no-default-features --bin relay` (drops the wallet's
+  TLS stack).
 - **Transactions** (`src/lib.rs`): type-tagged `type/sender/recipient/amount/fee/
   nonce(u64)/signature`, 153 bytes; normal (signed) and coinbase (unsigned).
 - **State** (`src/state.rs`): account balances + nonce, canonical `state_root`.

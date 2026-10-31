@@ -44,7 +44,11 @@ P2P and relay streams are plaintext and unauthenticated. The relay sees routing
 tokens (ephemeral handles) and could drop or misroute traffic; peers are not
 identified, so a man-in-the-middle on an unencrypted link could tamper. The
 design intentionally keeps the relay chain-blind, but there is no transport
-encryption or peer authentication yet.
+encryption or peer authentication yet. The relay now has basic abuse caps (one
+handle per connection, a per-connection channel limit) and a directory (`LIST`)
+that returns all handles to any connector — fine inside a restricted security
+group, not for an open internet relay. Access control for a deployed relay is
+the security group; see `DEPLOY-RELAY.md`.
 
 ## Operational limitations (correctness-safe, but rough edges)
 
