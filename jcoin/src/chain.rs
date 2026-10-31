@@ -142,21 +142,34 @@ impl Chain {
         times[times.len() / 2]
     }
 
-    /// The required difficulty target for the child of `parent_hash`, derived
-    /// from the span of the last `RETARGET_WINDOW` intervals ending at the
-    /// parent. Steers the block rate toward `TARGET_BLOCK_TIME`, clamps the
-    /// per-step change to `MAX_ADJUST_FACTOR`, and never goes easier than
-    /// `POW_LIMIT`. The first `RETARGET_WINDOW` blocks use `POW_LIMIT`.
+    /// The required difficulty target for the child of `parent_hash`.
+    ///
+    /// Epoch-based: difficulty is constant within an epoch of `RETARGET_WINDOW`
+    /// blocks and is recomputed only at an epoch boundary, from the span of the
+    /// epoch just completed. Adjusting only after observing a full epoch at the
+    /// current difficulty (rather than every block off a trailing window) is
+    /// what keeps it from overshooting. Steered toward `TARGET_BLOCK_TIME`,
+    /// clamped per step, never easier than `POW_LIMIT`.
     fn target_for_child(&self, parent_hash: [u8; 32]) -> [u8; 32] {
         let parent = &self.blocks[&parent_hash];
-        if parent.height + 1 <= RETARGET_WINDOW {
+        let height = parent.height + 1;
+
+        // First epoch mines at the easy limit.
+        if height < RETARGET_WINDOW {
             return POW_LIMIT;
         }
-        let Some(first) = self.ancestor(parent_hash, RETARGET_WINDOW) else {
+        // Mid-epoch: keep the epoch's difficulty (inherit the parent's target).
+        if height % RETARGET_WINDOW != 0 {
+            return parent.block.header.target;
+        }
+
+        // Epoch boundary: retarget from the span of the just-completed epoch,
+        // blocks [height - RETARGET_WINDOW, height - 1].
+        let intervals = RETARGET_WINDOW - 1;
+        let Some(first) = self.ancestor(parent_hash, intervals) else {
             return POW_LIMIT;
         };
-
-        let expected = RETARGET_WINDOW * TARGET_BLOCK_TIME;
+        let expected = intervals * TARGET_BLOCK_TIME;
         let actual = parent
             .block
             .header

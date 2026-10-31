@@ -21,7 +21,12 @@ pub const BLOCK_REWARD: u64 = 50;
 /// The 32-byte plaintext marker placed in the genesis `previous_block_hash`.
 pub const GENESIS_MARKER: &[u8; 32] = b"I am 20 years old, I love Jeffy!";
 
-/// Fixed genesis timestamp.
+/// Fixed genesis timestamp (a real Unix time, so the first retarget epoch
+/// measures a realistic span rather than one anchored at 0). Zero under
+/// `cfg(test)` so tests can use small increasing timestamps.
+#[cfg(not(test))]
+pub const GENESIS_TIMESTAMP: u64 = 1_700_000_000;
+#[cfg(test)]
 pub const GENESIS_TIMESTAMP: u64 = 0;
 
 /// Target average seconds between blocks. Difficulty retargets toward this.
