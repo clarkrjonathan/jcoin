@@ -103,6 +103,10 @@ difficulty is ramping correctly toward ~5-minute blocks (it steps ~4x per
 
 ## Known limitations / not built
 
+See `KNOWN-ISSUES.md` for the full list with severities, including the
+security-relevant vulnerabilities (unbounded fork storage, no peer banning,
+time-warp, no finality). Summary:
+
 - **Reorg mempool re-add**: transactions dropped by a reorg are not re-queued.
 - **Relay**: one TCP connection per node multiplexes all channels, so a stalled
   channel head-of-line-blocks the rest; handle rotation is not implemented.
