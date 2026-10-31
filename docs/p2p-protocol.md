@@ -4,10 +4,15 @@ Status: implemented and verified by unit and integration tests. Gossip v1 runs
 over direct TCP (frame codec, handshake, heartbeat, `NEW_TRANSACTION`), peer
 discovery (`GET_ADDR` / `ADDR` with auto-dial) grows the mesh, and the outer
 relay transport (multiplexing router, ephemeral handles, `Relay` addressing)
-carries gossip for nodes with no direct path. A few tuning values (handle
-rotation cadence, per-channel flow control) remain open and are noted below.
-This document records decisions; the design discussion lives in the Obsidian
-vault note `Design/Network Communication.md`.
+carries gossip for nodes with no direct path. Blocks are gossiped with
+`NEW_BLOCK`, and a node catches up with `GET_BLOCKS` (a block locator) →
+`BLOCKS`; fork choice is greatest cumulative work (`chain.rs`). Difficulty is
+still a static target, but the header carries a per-block 256-bit target and
+fork choice is already work-based, so a retarget schedule drops in without a
+format change. Open tuning: relay handle rotation, per-channel flow control,
+difficulty adjustment, timestamp rules, and reorg mempool re-add. This document
+records decisions; the design discussion lives in the Obsidian vault note
+`Design/Network Communication.md`.
 
 ## Design principles
 
@@ -68,7 +73,9 @@ bytes). The cap prevents a peer from forcing a huge allocation.
 | `0x0010` | `NEW_TRANSACTION` | yes |
 | `0x0020` | `GET_ADDR` | yes |
 | `0x0021` | `ADDR` | yes |
-| `0x0030`+ | blocks and chain sync (`INV`, `GETDATA`, `NEW_BLOCK`, `GET_HEADERS`, `HEADERS`, `GET_BLOCKS`, `BLOCKS`) | reserved, later |
+| `0x0030` | `NEW_BLOCK` (gossip a block) | yes |
+| `0x0031` | `GET_BLOCKS` (sync request carrying a block locator) | yes |
+| `0x0032` | `BLOCKS` (a batch of blocks, ascending height) | yes |
 
 ## 3. Handshake: `HELLO` / `HELLO_ACK` (symmetric)
 

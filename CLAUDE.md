@@ -29,10 +29,13 @@ not in this repo:
 ## Repo layout
 
 - `jcoin/` — the real package (current work). Cargo package `jcoin`.
-  - `src/lib.rs` — core `Transaction` (fixed-width serialization, Ed25519
-    signing bytes + verification, SHA-256 tx id).
-  - `src/node.rs` — node core: `NodeRequest`/`SubmitResult`/`StatusResult` and
-    the `run_node` task.
+  - `src/lib.rs` — core `Transaction` (type-tagged, fixed-width, Ed25519
+    signing + verification, SHA-256 tx id, coinbase constructor).
+  - `src/state.rs` — account state table (balance + nonce) and `state_root`.
+  - `src/block.rs` — header, block, PoW, genesis, mining, validation.
+  - `src/chain.rs` — block store and canonical-chain selection by cumulative work.
+  - `src/node.rs` — node core: the `NodeRequest` set and the `run_node` task
+    owning the chain, mempool, and seen set.
   - `src/p2p/` — peer-to-peer layer: `frame` (JEFY codec), `message` (gossip-v1
     messages), `addr` (Endpoint/handle encoding), `link` (the `PeerLink` seam),
     `peer` (handshake, run loop, `run_peer`), `network` (peer registry, address
@@ -52,39 +55,41 @@ not in this repo:
   ephemeral directory handles, `Direct`/`Relay` addressing) are settled at the
   architecture level; byte encodings and tuning values remain.
 
-## Current scope: the Initial Vertical
+## What is built
 
-A clearly-defined proof-of-concept slice (from `Design/Initial vertical.md`):
+Starting from the initial vertical (wallet → REST → node core over an
+`mpsc`/`oneshot` channel), the following now works:
 
-- Wallet CLI builds and signs a transaction and POSTs it to a node.
-- Node parses it, hands it to the node core over an `mpsc` channel, and awaits a
-  `oneshot` reply. The core owns all state (no locks).
-- Validation is **signature only**. Nonce and balance checks are intentionally
-  not performed yet. Balance and status endpoints return dummy values.
+- **P2P network layer** (`src/p2p/`, see `docs/p2p-protocol.md`): transaction
+  gossip over direct TCP (`JEFY` frame codec, symmetric `HELLO`, `PING`/`PONG`,
+  `NEW_TRANSACTION`); peer discovery (`GET_ADDR`/`ADDR`, address book, auto-dial;
+  `--advertise`, `--max-peers`); and the relay transport (`relay` binary, a
+  multiplexing router pairing channels by ephemeral handle; `--relay`,
+  `--relay-open`). A relay channel is a `PeerLink` like any other.
+- **Transactions** (`src/lib.rs`): type-tagged `type/sender/recipient/amount/fee/
+  nonce(u64)/signature`, 153 bytes; normal (signed) and coinbase (unsigned).
+- **State** (`src/state.rs`): account balances + nonce, canonical `state_root`.
+- **Blocks** (`src/block.rs`): 156-byte header, coinbase + ≤1 transfer, PoW
+  `SHA256(header) < target` with a **static** target, genesis, mining,
+  validation. Flat block reward (no halving yet).
+- **Chain + fork choice** (`src/chain.rs`): hash-keyed block store, canonical tip
+  by **greatest cumulative work** (U256), reorg as a pointer move.
+- **Chain sync**: `NEW_BLOCK` gossip, and `GET_BLOCKS` (block locator) → `BLOCKS`
+  for initial download and orphan catch-up.
+- **Node** (`src/bin/node.rs`): full nonce/balance validation on submit (ADR
+  000), `--mine`/`--miner`, `/chain` and real `/balance`; the wallet fetches the
+  nonce and refuses to overspend.
 
-### Built since the vertical
+Verified by unit tests and integration tests (direct + relay gossip, late-joiner
+sync, work-based reorg), plus live multi-node runs.
 
-A working P2P network layer (`src/p2p/`, see `docs/p2p-protocol.md`):
+### Not yet built / open
 
-- Transaction gossip over **direct TCP**: `JEFY` frame codec, symmetric `HELLO`
-  handshake, `PING`/`PONG` heartbeat, `NEW_TRANSACTION` relayed to peers except
-  the source.
-- **Peer discovery**: `GET_ADDR` / `ADDR` with an address book and auto-dial of
-  learned direct peers (`--advertise`, `--max-peers`).
-- **Relay transport**: a multiplexing router (`relay` binary) pairs node
-  channels by ephemeral directory handle and forwards opaque `DATA`; nodes
-  connect with `--relay` and bootstrap with `--relay-open <handle>`. A relayed
-  channel is a `PeerLink` like any other, so gossip and discovery work through
-  it unchanged.
-
-Verified by unit tests plus two-node direct and relay gossip integration tests.
-
-### Explicitly out of scope (later phases)
-
-Proof of work / mining, balance and nonce validation, persistence / database,
-blocks and the chain, difficulty, and the `type/amount/fee` transaction freeze.
-Open tuning within the P2P layer: relay handle rotation cadence and per-channel
-flow control (head-of-line blocking is noted in `docs/p2p-protocol.md`).
+Difficulty adjustment and consensus timestamp rules (the header already carries
+a 256-bit `target` and fork choice is work-based, so these drop in without a
+format change), persistence (chain is in memory), reorg mempool re-add, relay
+handle rotation and per-channel flow control, block/consensus-version signaling,
+and halving. A `type/amount/fee` freeze beyond v1 is also future.
 
 ## Build and run
 
