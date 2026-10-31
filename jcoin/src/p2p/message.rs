@@ -21,6 +21,8 @@ pub mod type_code {
     pub const GET_ADDR: u16 = 0x0020;
     pub const ADDR: u16 = 0x0021;
     pub const NEW_BLOCK: u16 = 0x0030;
+    pub const GET_BLOCKS: u16 = 0x0031;
+    pub const BLOCKS: u16 = 0x0032;
 }
 
 /// Payload of a `HELLO`. Carries no persistent node identifier: the `nonce` is
@@ -76,6 +78,10 @@ pub enum Message {
     Addr(Vec<Endpoint>),
     /// A newly mined or relayed block.
     NewBlock(Block),
+    /// Request canonical blocks after the most recent locator hash the peer has.
+    GetBlocks(Vec<[u8; 32]>),
+    /// A batch of blocks in ascending height order.
+    Blocks(Vec<Block>),
 }
 
 /// Errors from reading or decoding a message.
@@ -89,6 +95,8 @@ pub enum MessageError {
     BadTransaction,
     BadAddrs,
     BadBlock,
+    BadBlocks,
+    BadLocator,
 }
 
 impl std::fmt::Display for MessageError {
@@ -102,6 +110,8 @@ impl std::fmt::Display for MessageError {
             MessageError::BadTransaction => write!(f, "payload was not a valid transaction"),
             MessageError::BadAddrs => write!(f, "payload was not a valid address list"),
             MessageError::BadBlock => write!(f, "payload was not a valid block"),
+            MessageError::BadBlocks => write!(f, "payload was not a valid block batch"),
+            MessageError::BadLocator => write!(f, "payload was not a valid block locator"),
         }
     }
 }
@@ -126,6 +136,8 @@ impl Message {
             Message::GetAddr => type_code::GET_ADDR,
             Message::Addr(_) => type_code::ADDR,
             Message::NewBlock(_) => type_code::NEW_BLOCK,
+            Message::GetBlocks(_) => type_code::GET_BLOCKS,
+            Message::Blocks(_) => type_code::BLOCKS,
         }
     }
 
@@ -139,6 +151,26 @@ impl Message {
             Message::GetAddr => Vec::new(),
             Message::Addr(endpoints) => encode_addrs(endpoints),
             Message::NewBlock(block) => block.serialize(),
+            Message::GetBlocks(locator) => {
+                let mut bytes = Vec::with_capacity(2 + locator.len() * 32);
+                let count = locator.len().min(u16::MAX as usize) as u16;
+                bytes.extend_from_slice(&count.to_be_bytes());
+                for hash in locator.iter().take(count as usize) {
+                    bytes.extend_from_slice(hash);
+                }
+                bytes
+            }
+            Message::Blocks(blocks) => {
+                let mut bytes = Vec::new();
+                let count = blocks.len().min(u16::MAX as usize) as u16;
+                bytes.extend_from_slice(&count.to_be_bytes());
+                for block in blocks.iter().take(count as usize) {
+                    let serialized = block.serialize();
+                    bytes.extend_from_slice(&(serialized.len() as u32).to_be_bytes());
+                    bytes.extend_from_slice(&serialized);
+                }
+                bytes
+            }
         }
     }
 
@@ -197,6 +229,12 @@ impl Message {
             type_code::NEW_BLOCK => Block::from_bytes(&raw.payload)
                 .map(Message::NewBlock)
                 .ok_or(MessageError::BadBlock),
+            type_code::GET_BLOCKS => decode_locator(&raw.payload)
+                .map(Message::GetBlocks)
+                .ok_or(MessageError::BadLocator),
+            type_code::BLOCKS => decode_blocks(&raw.payload)
+                .map(Message::Blocks)
+                .ok_or(MessageError::BadBlocks),
             other => Err(MessageError::UnknownType(other)),
         }
     }
@@ -223,6 +261,44 @@ pub async fn read_message<R: AsyncRead + Unpin>(
 ) -> Result<Message, MessageError> {
     let raw = read_frame(reader).await?;
     Message::decode(&raw)
+}
+
+fn decode_locator(payload: &[u8]) -> Option<Vec<[u8; 32]>> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let count = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+    let mut pos = 2;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let hash: [u8; 32] = payload.get(pos..pos + 32)?.try_into().ok()?;
+        out.push(hash);
+        pos += 32;
+    }
+    if pos != payload.len() {
+        return None;
+    }
+    Some(out)
+}
+
+fn decode_blocks(payload: &[u8]) -> Option<Vec<Block>> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let count = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+    let mut pos = 2;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = u32::from_be_bytes(payload.get(pos..pos + 4)?.try_into().ok()?) as usize;
+        pos += 4;
+        let end = pos.checked_add(len)?;
+        out.push(Block::from_bytes(payload.get(pos..end)?)?);
+        pos = end;
+    }
+    if pos != payload.len() {
+        return None;
+    }
+    Some(out)
 }
 
 #[cfg(test)]

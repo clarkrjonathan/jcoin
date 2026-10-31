@@ -4,7 +4,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 
-use crate::node::{BlockOutcome, NodeRequest, SubmitResult};
+use crate::node::{BlockOutcome, NodeRequest, SubmitResult, BLOCK_BATCH};
 
 use super::frame::PROTOCOL_VERSION;
 use super::link::PeerLink;
@@ -135,6 +135,9 @@ pub async fn run_peer<L: PeerLink + 'static>(mut link: L, network: Network, labe
     let _ = write_message(&mut write_half, &Message::Addr(network.known_addrs())).await;
     let _ = write_message(&mut write_half, &Message::GetAddr).await;
 
+    // Ask the peer for any blocks we are missing (initial block download).
+    let _ = start_sync(&network, &mut write_half).await;
+
     // A dedicated reader task keeps frame reads off the select loop, so an
     // in-progress read is never cancelled mid-frame (read_exact is not
     // cancellation-safe). It forwards decoded messages to the loop below.
@@ -244,7 +247,8 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
             network.maybe_dial(fresh);
             true
         }
-        // Submit a received block; relay it onward only if newly accepted.
+        // Submit a received block; relay it if newly stored, or sync the gap if
+        // its parent is missing.
         Message::NewBlock(block) => {
             let (reply_tx, reply_rx) = oneshot::channel();
             if network
@@ -258,14 +262,84 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
             {
                 return true;
             }
-            if let Ok(BlockOutcome::Accepted { is_new: true, .. }) = reply_rx.await {
-                network.broadcast_block(&block, Some(peer_id));
+            match reply_rx.await {
+                Ok(BlockOutcome::Accepted { is_new: true, .. }) => {
+                    network.broadcast_block(&block, Some(peer_id));
+                    true
+                }
+                Ok(BlockOutcome::Orphan) => start_sync(network, write_half).await,
+                _ => true,
+            }
+        }
+        // Answer a sync request with the canonical blocks after the locator.
+        Message::GetBlocks(locator) => {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if network
+                .node()
+                .send(NodeRequest::GetBlocksAfter {
+                    locator,
+                    reply: reply_tx,
+                })
+                .await
+                .is_err()
+            {
+                return true;
+            }
+            let Ok(blocks) = reply_rx.await else {
+                return true;
+            };
+            write_message(write_half, &Message::Blocks(blocks)).await.is_ok()
+        }
+        // Apply a batch of synced blocks in order; if it was full and advanced
+        // our chain, ask for the next batch.
+        Message::Blocks(blocks) => {
+            let count = blocks.len();
+            let mut advanced = false;
+            for block in blocks {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                if network
+                    .node()
+                    .send(NodeRequest::SubmitBlock {
+                        block: Box::new(block),
+                        reply: reply_tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return true;
+                }
+                if let Ok(BlockOutcome::Accepted { is_new: true, .. }) = reply_rx.await {
+                    advanced = true;
+                }
+            }
+            if advanced && count == BLOCK_BATCH {
+                return start_sync(network, write_half).await;
             }
             true
         }
         // A HELLO or HELLO_ACK after the handshake is unexpected; ignore it.
         Message::Hello(_) | Message::HelloAck => true,
     }
+}
+
+/// Ask a peer for the blocks we are missing by sending our block locator.
+/// Returns false only on a fatal write error.
+async fn start_sync<W: AsyncWrite + Unpin>(network: &Network, write_half: &mut W) -> bool {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if network
+        .node()
+        .send(NodeRequest::GetLocator { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        return true;
+    }
+    let Ok(locator) = reply_rx.await else {
+        return true;
+    };
+    write_message(write_half, &Message::GetBlocks(locator))
+        .await
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -586,5 +660,45 @@ mod gossip_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(reached, "mined block did not propagate to node B");
+    }
+
+    #[tokio::test]
+    async fn late_joiner_syncs_the_chain() {
+        // Node A builds a 5-block chain alone.
+        let core_a = spawn_core();
+        let net_a = Network::new(core_a.clone(), 1, Vec::new(), 8);
+        let mut header = Block::genesis().header;
+        let mut state = State::new();
+        for _ in 0..5 {
+            let (block, new_state) =
+                build_and_mine(&header, &state, BLOCK_REWARD, [1u8; 32], None, STATIC_TARGET, 1)
+                    .unwrap();
+            submit_block(&core_a, block.clone()).await;
+            header = block.header;
+            state = new_state;
+        }
+        assert_eq!(chain_height(&core_a).await, 5);
+
+        // Node B joins fresh and should catch up via initial block download.
+        let core_b = spawn_core();
+        let net_b = Network::new(core_b.clone(), 2, Vec::new(), 8);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client_stream = connect.await.unwrap();
+        tokio::spawn(run_peer(server_stream, net_a.clone(), "A".into()));
+        tokio::spawn(run_peer(client_stream, net_b.clone(), "B".into()));
+
+        let mut synced = false;
+        for _ in 0..200 {
+            if chain_height(&core_b).await == 5 {
+                synced = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(synced, "late joiner did not sync to height 5");
     }
 }

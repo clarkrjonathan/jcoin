@@ -233,6 +233,40 @@ mod tests {
         assert!(matches!(chain.accept(orphan), Accept::Orphan));
     }
 
+    /// Build `len` blocks on top of genesis, all crediting `miner`.
+    fn branch(len: u64, miner: [u8; 32]) -> Vec<Block> {
+        let mut header = Block::genesis().header;
+        let mut state = State::new();
+        let mut out = Vec::new();
+        for _ in 0..len {
+            let (block, new_state) =
+                build_and_mine(&header, &state, BLOCK_REWARD, miner, None, STATIC_TARGET, 1)
+                    .unwrap();
+            header = block.header.clone();
+            state = new_state;
+            out.push(block);
+        }
+        out
+    }
+
+    #[test]
+    fn longer_branch_wins_by_work() {
+        let mut chain = Chain::new();
+        // A short branch to one miner, then a longer competing branch to another.
+        for block in branch(2, [1u8; 32]) {
+            chain.accept(block);
+        }
+        assert_eq!(chain.tip_height(), 2);
+
+        for block in branch(3, [2u8; 32]) {
+            chain.accept(block);
+        }
+        // The 3-block branch has more cumulative work and becomes canonical.
+        assert_eq!(chain.tip_height(), 3);
+        assert_eq!(chain.tip_state().balance(&[2u8; 32]), 3 * BLOCK_REWARD);
+        assert_eq!(chain.tip_state().balance(&[1u8; 32]), 0);
+    }
+
     #[test]
     fn blocks_after_locator_returns_the_gap() {
         let mut chain = Chain::new();
