@@ -6,13 +6,12 @@ discovery (`GET_ADDR` / `ADDR` with auto-dial) grows the mesh, and the outer
 relay transport (multiplexing router, ephemeral handles, `Relay` addressing)
 carries gossip for nodes with no direct path. Blocks are gossiped with
 `NEW_BLOCK`, and a node catches up with `GET_BLOCKS` (a block locator) →
-`BLOCKS`; fork choice is greatest cumulative work (`chain.rs`). Difficulty is
-still a static target, but the header carries a per-block 256-bit target and
-fork choice is already work-based, so a retarget schedule drops in without a
-format change. Open tuning: relay handle rotation, per-channel flow control,
-difficulty adjustment, timestamp rules, and reorg mempool re-add. This document
-records decisions; the design discussion lives in the Obsidian vault note
-`Design/Network Communication.md`.
+`BLOCKS`; fork choice is greatest cumulative work (`chain.rs`). Difficulty
+retargets per epoch toward a 5-minute block time and timestamps are enforced
+(median-time-past plus a local future bound); see `chain.rs` and `block.rs`.
+Open tuning: relay handle rotation, per-channel flow control, and reorg mempool
+re-add. This document records decisions; the design discussion lives in the
+Obsidian vault note `Design/Network Communication.md`.
 
 ## Design principles
 

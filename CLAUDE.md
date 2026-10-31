@@ -71,11 +71,14 @@ Starting from the initial vertical (wallet → REST → node core over an
 - **State** (`src/state.rs`): account balances + nonce, canonical `state_root`.
 - **Blocks** (`src/block.rs`): 156-byte header, coinbase + ≤1 transfer, PoW
   `SHA256(header) < target`, genesis, mining, validation. Flat reward (no halving).
-- **Difficulty + timestamps**: per-block retarget toward `TARGET_BLOCK_TIME`
-  (5 min) over a `RETARGET_WINDOW`-interval span, clamped to 4x/step, never
-  easier than `POW_LIMIT` (the easy start/cap). Median-time-past is a consensus
+- **Difficulty + timestamps**: epoch-based retarget toward `TARGET_BLOCK_TIME`
+  (5 min). Difficulty is constant within a `RETARGET_WINDOW`-block epoch and
+  recomputed only at a boundary from the completed epoch's span, clamped to
+  4x/step, never easier than `POW_LIMIT` (the easy start/cap). Adjusting only
+  after a full epoch converges without overshoot. Median-time-past is a consensus
   lower bound on timestamps (in `chain.accept`); a 2-hour future bound is a local
-  admission rule (in the node core, not in deterministic validation).
+  admission rule (in the node core, not in deterministic validation). Genesis
+  carries a realistic timestamp so the first epoch measures a real span.
 - **Chain + fork choice** (`src/chain.rs`): hash-keyed block store, canonical tip
   by **greatest cumulative work** (U256), reorg as a pointer move.
 - **Chain sync**: `NEW_BLOCK` gossip, and `GET_BLOCKS` (block locator) → `BLOCKS`
