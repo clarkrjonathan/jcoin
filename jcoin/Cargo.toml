@@ -36,5 +36,8 @@ sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 
+# 256-bit integers for cumulative chain work (and, later, difficulty math)
+primitive-types = "0.12"
+
 # CLI (wallet)
 clap = { version = "4", features = ["derive"] }

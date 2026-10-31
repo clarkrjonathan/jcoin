@@ -247,7 +247,7 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
             {
                 return;
             }
-            if let Ok(BlockOutcome::Accepted { is_new: true, height }) = ack_rx.await {
+            if let Ok(BlockOutcome::Accepted { is_new: true, height, .. }) = ack_rx.await {
                 println!("[mine] block {height} {}", hex::encode(block.hash()));
                 network.broadcast_block(&block, None);
             }
