@@ -19,7 +19,7 @@ pub const BLOCK_VERSION: u32 = 1;
 pub const BLOCK_REWARD: u64 = 50;
 
 /// The 32-byte plaintext marker placed in the genesis `previous_block_hash`.
-pub const GENESIS_MARKER: &[u8; 32] = b"I am 20 years old, I love jeffy!";
+pub const GENESIS_MARKER: &[u8; 32] = b"I am 20 years old, I love Jeffy!";
 
 /// Fixed genesis timestamp.
 pub const GENESIS_TIMESTAMP: u64 = 0;
