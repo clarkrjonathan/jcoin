@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use primitive_types::U256;
 
 use crate::block::{
-    Block, BlockError, BLOCK_REWARD, MAX_ADJUST_FACTOR, MEDIAN_TIME_SPAN, POW_LIMIT,
+    Block, BlockError, block_reward, MAX_ADJUST_FACTOR, MEDIAN_TIME_SPAN, POW_LIMIT,
     RETARGET_WINDOW, TARGET_BLOCK_TIME,
 };
 use crate::state::State;
@@ -202,10 +202,12 @@ impl Chain {
         let expected_target = self.target_for_child(parent_hash);
 
         let parent = &self.blocks[&parent_hash];
+        // Consensus reward rule: the subsidy follows the halving schedule at the
+        // block's height (validate_and_apply checks height == parent + 1).
         let new_state = match block.validate_and_apply(
             &parent.block.header,
             &parent.state,
-            BLOCK_REWARD,
+            block_reward(parent.height + 1),
             &expected_target,
         ) {
             Ok(s) => s,
@@ -299,11 +301,11 @@ impl Default for Chain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{build_and_mine, Block, BLOCK_REWARD, POW_LIMIT};
+    use crate::block::{build_and_mine, Block, INITIAL_REWARD, POW_LIMIT};
     use crate::state::State;
 
     fn mine_on(parent: &crate::block::BlockHeader, parent_state: &State, miner: [u8; 32]) -> Block {
-        build_and_mine(parent, parent_state, BLOCK_REWARD, miner, None, POW_LIMIT, 1)
+        build_and_mine(parent, parent_state, INITIAL_REWARD, miner, None, POW_LIMIT, 1)
             .unwrap()
             .0
     }
@@ -318,7 +320,7 @@ mod tests {
             _ => panic!("block 1 should extend the tip"),
         }
         assert_eq!(chain.tip_height(), 1);
-        assert_eq!(chain.tip_state().balance(&[1u8; 32]), BLOCK_REWARD);
+        assert_eq!(chain.tip_state().balance(&[1u8; 32]), INITIAL_REWARD);
     }
 
     #[test]
@@ -339,7 +341,7 @@ mod tests {
         let mut out = Vec::new();
         for h in 1..=len {
             let (block, new_state) =
-                build_and_mine(&header, &state, BLOCK_REWARD, miner, None, POW_LIMIT, h)
+                build_and_mine(&header, &state, INITIAL_REWARD, miner, None, POW_LIMIT, h)
                     .unwrap();
             header = block.header.clone();
             state = new_state;
@@ -361,7 +363,7 @@ mod tests {
         let (b1, _) = build_and_mine(
             &Block::genesis().header,
             &State::new(),
-            BLOCK_REWARD,
+            INITIAL_REWARD,
             sender,
             None,
             POW_LIMIT,
@@ -386,7 +388,7 @@ mod tests {
         let (b2, _) = build_and_mine(
             &chain.tip_header(),
             chain.tip_state(),
-            BLOCK_REWARD,
+            INITIAL_REWARD,
             sender,
             Some(tx),
             POW_LIMIT,
@@ -418,7 +420,7 @@ mod tests {
         }
         // The 3-block branch has more cumulative work and becomes canonical.
         assert_eq!(chain.tip_height(), 3);
-        assert_eq!(chain.tip_state().balance(&[2u8; 32]), 3 * BLOCK_REWARD);
+        assert_eq!(chain.tip_state().balance(&[2u8; 32]), 3 * INITIAL_REWARD);
         assert_eq!(chain.tip_state().balance(&[1u8; 32]), 0);
     }
 
@@ -447,7 +449,7 @@ mod tests {
         let (b1, _) = build_and_mine(
             &Block::genesis().header,
             &State::new(),
-            BLOCK_REWARD,
+            INITIAL_REWARD,
             [1u8; 32],
             None,
             POW_LIMIT,
@@ -461,7 +463,7 @@ mod tests {
         let (b2, _) = build_and_mine(
             &chain.tip_header(),
             chain.tip_state(),
-            BLOCK_REWARD,
+            INITIAL_REWARD,
             [1u8; 32],
             None,
             chain.next_target(),
@@ -481,7 +483,7 @@ mod tests {
         let mut state = State::new();
         for h in 1..=3 {
             let (block, new_state) =
-                build_and_mine(&header, &state, BLOCK_REWARD, [1u8; 32], None, POW_LIMIT, h)
+                build_and_mine(&header, &state, INITIAL_REWARD, [1u8; 32], None, POW_LIMIT, h)
                     .unwrap();
             chain.accept(block.clone());
             header = block.header;

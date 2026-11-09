@@ -6,6 +6,7 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::amount::COIN;
 use crate::state::{State, StateError};
 use crate::Transaction;
 
@@ -15,8 +16,29 @@ pub const HEADER_LEN: usize = 156;
 /// Current block/consensus version.
 pub const BLOCK_VERSION: u32 = 1;
 
-/// Flat block reward for v1 (no halving yet).
-pub const BLOCK_REWARD: u64 = 50;
+/// Block reward at height 1, before any halving: 50 JEF.
+pub const INITIAL_REWARD: u64 = 50 * COIN;
+
+/// Blocks between reward halvings. At `TARGET_BLOCK_TIME` (5 min, 288
+/// blocks/day) this is about 111 days, chosen so that the 33rd halving, where
+/// the reward reaches zero, falls at about 10 years.
+pub const HALVING_INTERVAL: u64 = 32_000;
+
+/// The block subsidy (excluding fees) a coinbase at `height` may claim:
+/// `INITIAL_REWARD >> (height / HALVING_INTERVAL)`. It reaches zero after 33
+/// halvings (about 10 years); after that miners are paid by fees only. Total
+/// supply converges to just under `2 * INITIAL_REWARD * HALVING_INTERVAL`
+/// (3,200,000 JEF). Issuance is front-loaded: about 89% is minted in year 1
+/// and 99% by the end of year 2.
+pub fn block_reward(height: u64) -> u64 {
+    let halvings = height / HALVING_INTERVAL;
+    // A shift by 64 or more is undefined for u64, and the result is 0 anyway.
+    if halvings >= 64 {
+        0
+    } else {
+        INITIAL_REWARD >> halvings
+    }
+}
 
 /// The 32-byte plaintext marker placed in the genesis `previous_block_hash`.
 pub const GENESIS_MARKER: &[u8; 32] = b"I am 20 years old, I love Jeffy!";
@@ -417,7 +439,7 @@ mod tests {
         let genesis = Block::genesis();
         let state = State::new();
         let (block, _) =
-            build_and_mine(&genesis.header, &state, BLOCK_REWARD, [3u8; 32], None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &state, INITIAL_REWARD, [3u8; 32], None, POW_LIMIT, 1)
                 .unwrap();
         let decoded = Block::from_bytes(&block.serialize()).unwrap();
         assert_eq!(decoded.header, block.header);
@@ -430,15 +452,15 @@ mod tests {
         let state = State::new();
         let miner = [7u8; 32];
         let (block, new_state) =
-            build_and_mine(&genesis.header, &state, BLOCK_REWARD, miner, None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &state, INITIAL_REWARD, miner, None, POW_LIMIT, 1)
                 .unwrap();
 
         assert!(block.header.meets_target());
         let applied = block
-            .validate_and_apply(&genesis.header, &state, BLOCK_REWARD, &POW_LIMIT)
+            .validate_and_apply(&genesis.header, &state, INITIAL_REWARD, &POW_LIMIT)
             .unwrap();
-        assert_eq!(applied.balance(&miner), BLOCK_REWARD);
-        assert_eq!(new_state.balance(&miner), BLOCK_REWARD);
+        assert_eq!(applied.balance(&miner), INITIAL_REWARD);
+        assert_eq!(new_state.balance(&miner), INITIAL_REWARD);
     }
 
     #[test]
@@ -450,7 +472,7 @@ mod tests {
         let sender = key.verifying_key().to_bytes();
 
         let (b1, s1) =
-            build_and_mine(&genesis.header, &s0, BLOCK_REWARD, sender, None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &s0, INITIAL_REWARD, sender, None, POW_LIMIT, 1)
                 .unwrap();
 
         let mut tx = Transaction {
@@ -467,7 +489,7 @@ mod tests {
         let (b2, s2) = build_and_mine(
             &b1.header,
             &s1,
-            BLOCK_REWARD,
+            INITIAL_REWARD,
             [8u8; 32],
             Some(tx),
             POW_LIMIT,
@@ -475,13 +497,13 @@ mod tests {
         )
         .unwrap();
 
-        b2.validate_and_apply(&b1.header, &s1, BLOCK_REWARD, &POW_LIMIT)
+        b2.validate_and_apply(&b1.header, &s1, INITIAL_REWARD, &POW_LIMIT)
             .unwrap();
         assert_eq!(s2.balance(&[9u8; 32]), 10);
         // Miner of block 2 gets reward + fee.
-        assert_eq!(s2.balance(&[8u8; 32]), BLOCK_REWARD + 2);
+        assert_eq!(s2.balance(&[8u8; 32]), INITIAL_REWARD + 2);
         // Sender spent amount + fee.
-        assert_eq!(s2.balance(&sender), BLOCK_REWARD - 12);
+        assert_eq!(s2.balance(&sender), INITIAL_REWARD - 12);
     }
 
     #[test]
@@ -489,7 +511,7 @@ mod tests {
         let genesis = Block::genesis();
         let state = State::new();
         let (mut block, _) =
-            build_and_mine(&genesis.header, &state, BLOCK_REWARD, [1u8; 32], None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &state, INITIAL_REWARD, [1u8; 32], None, POW_LIMIT, 1)
                 .unwrap();
         block.header.state_root = [0u8; 32];
         // Re-mine so the PoW still holds on the tampered header.
@@ -497,7 +519,7 @@ mod tests {
             block.header.nonce = block.header.nonce.wrapping_add(1);
         }
         let err = block
-            .validate_and_apply(&genesis.header, &state, BLOCK_REWARD, &POW_LIMIT)
+            .validate_and_apply(&genesis.header, &state, INITIAL_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::BadStateRoot);
     }
@@ -506,7 +528,7 @@ mod tests {
     fn oversized_coinbase_is_rejected() {
         let genesis = Block::genesis();
         let state = State::new();
-        let coinbase = Transaction::coinbase([1u8; 32], BLOCK_REWARD + 1);
+        let coinbase = Transaction::coinbase([1u8; 32], INITIAL_REWARD + 1);
         let transactions = vec![coinbase];
         let mut applied = state.clone();
         applied.apply(&transactions[0]).unwrap();
@@ -525,9 +547,68 @@ mod tests {
         }
         let block = Block { header, transactions };
         let err = block
-            .validate_and_apply(&genesis.header, &state, BLOCK_REWARD, &POW_LIMIT)
+            .validate_and_apply(&genesis.header, &state, INITIAL_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::CoinbaseTooLarge);
+    }
+
+    // --- Reward schedule (halving). ---
+
+    #[test]
+    fn reward_halves_every_interval() {
+        assert_eq!(INITIAL_REWARD, 50 * COIN);
+        assert_eq!(block_reward(1), INITIAL_REWARD);
+        assert_eq!(block_reward(HALVING_INTERVAL - 1), INITIAL_REWARD);
+        assert_eq!(block_reward(HALVING_INTERVAL), INITIAL_REWARD / 2);
+        assert_eq!(block_reward(2 * HALVING_INTERVAL - 1), INITIAL_REWARD / 2);
+        assert_eq!(block_reward(2 * HALVING_INTERVAL), INITIAL_REWARD / 4);
+        // 50 JEF = 5e9 base units: the 32nd halving is the last nonzero reward.
+        assert_eq!(block_reward(32 * HALVING_INTERVAL), 1);
+        assert_eq!(block_reward(33 * HALVING_INTERVAL), 0);
+        // No shift overflow at extreme heights.
+        assert_eq!(block_reward(64 * HALVING_INTERVAL), 0);
+        assert_eq!(block_reward(u64::MAX), 0);
+    }
+
+    #[test]
+    fn total_supply_is_bounded() {
+        // Height 0 is genesis (no coinbase), so start at height 1.
+        let mut supply: u64 = 0;
+        for era in 0..64 {
+            let first = (era * HALVING_INTERVAL).max(1);
+            let blocks = (era + 1) * HALVING_INTERVAL - first;
+            supply += blocks * block_reward(era * HALVING_INTERVAL);
+        }
+        assert!(supply < 3_200_000 * COIN);
+        assert!(supply > 3_199_000 * COIN);
+    }
+
+    #[test]
+    fn coinbase_is_capped_by_the_halved_reward() {
+        // A parent one block before the first halving, so the child is the
+        // first block of the halved era.
+        let mut parent = Block::genesis().header;
+        parent.height = HALVING_INTERVAL - 1;
+        let state = State::new();
+        let halved = block_reward(HALVING_INTERVAL);
+
+        // Claiming the old reward is rejected.
+        let (greedy, _) =
+            build_and_mine(&parent, &state, INITIAL_REWARD, [1u8; 32], None, POW_LIMIT, 1)
+                .unwrap();
+        assert_eq!(greedy.header.height, HALVING_INTERVAL);
+        let err = greedy
+            .validate_and_apply(&parent, &state, halved, &POW_LIMIT)
+            .unwrap_err();
+        assert_eq!(err, BlockError::CoinbaseTooLarge);
+
+        // Claiming the halved reward is accepted and pays exactly that.
+        let (honest, _) =
+            build_and_mine(&parent, &state, halved, [2u8; 32], None, POW_LIMIT, 1).unwrap();
+        let applied = honest
+            .validate_and_apply(&parent, &state, halved, &POW_LIMIT)
+            .unwrap();
+        assert_eq!(applied.balance(&[2u8; 32]), INITIAL_REWARD / 2);
     }
 
     // --- Adversarial battery: each malformed block must be rejected. ---
@@ -542,14 +623,14 @@ mod tests {
     fn unmined_block_is_rejected() {
         let genesis = Block::genesis();
         let (mut block, _) =
-            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [7u8; 32], None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, [7u8; 32], None, POW_LIMIT, 1)
                 .unwrap();
         // Break the proof of work.
         while block.header.meets_target() {
             block.header.nonce = block.header.nonce.wrapping_add(1);
         }
         let err = block
-            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &POW_LIMIT)
+            .validate_and_apply(&genesis.header, &State::new(), INITIAL_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::PowNotMet);
     }
@@ -558,11 +639,11 @@ mod tests {
     fn wrong_target_is_rejected() {
         let genesis = Block::genesis();
         let (mut block, _) =
-            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [7u8; 32], None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, [7u8; 32], None, POW_LIMIT, 1)
                 .unwrap();
         block.header.target = [0xff; 32]; // claim a trivial target
         let err = block
-            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &POW_LIMIT)
+            .validate_and_apply(&genesis.header, &State::new(), INITIAL_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::WrongTarget);
     }
@@ -571,12 +652,12 @@ mod tests {
     fn bad_transactions_hash_is_rejected() {
         let genesis = Block::genesis();
         let (mut block, _) =
-            build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [7u8; 32], None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, [7u8; 32], None, POW_LIMIT, 1)
                 .unwrap();
         block.header.transactions_hash = [0u8; 32];
         mine_header(&mut block.header);
         let err = block
-            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &POW_LIMIT)
+            .validate_and_apply(&genesis.header, &State::new(), INITIAL_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::BadTransactionsHash);
     }
@@ -607,7 +688,7 @@ mod tests {
         mine_header(&mut header);
         let block = Block { header, transactions };
         let err = block
-            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &POW_LIMIT)
+            .validate_and_apply(&genesis.header, &State::new(), INITIAL_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::BadBody);
     }
@@ -616,7 +697,7 @@ mod tests {
     fn bad_signature_in_block_is_rejected() {
         let genesis = Block::genesis();
         let key = SigningKey::generate(&mut OsRng);
-        let coinbase = Transaction::coinbase([7u8; 32], BLOCK_REWARD);
+        let coinbase = Transaction::coinbase([7u8; 32], INITIAL_REWARD);
         let normal = Transaction {
             tx_type: crate::tx_type::NORMAL,
             sender: key.verifying_key().to_bytes(),
@@ -640,7 +721,7 @@ mod tests {
         mine_header(&mut header);
         let block = Block { header, transactions };
         let err = block
-            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &POW_LIMIT)
+            .validate_and_apply(&genesis.header, &State::new(), INITIAL_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert_eq!(err, BlockError::BadSignature);
     }
@@ -649,7 +730,7 @@ mod tests {
     fn overspend_in_block_is_rejected() {
         let genesis = Block::genesis();
         let key = SigningKey::generate(&mut OsRng);
-        let coinbase = Transaction::coinbase([7u8; 32], BLOCK_REWARD);
+        let coinbase = Transaction::coinbase([7u8; 32], INITIAL_REWARD);
         let mut normal = Transaction {
             tx_type: crate::tx_type::NORMAL,
             sender: key.verifying_key().to_bytes(),
@@ -674,7 +755,7 @@ mod tests {
         mine_header(&mut header);
         let block = Block { header, transactions };
         let err = block
-            .validate_and_apply(&genesis.header, &State::new(), BLOCK_REWARD, &POW_LIMIT)
+            .validate_and_apply(&genesis.header, &State::new(), INITIAL_REWARD, &POW_LIMIT)
             .unwrap_err();
         assert!(matches!(err, BlockError::Apply(_)));
     }

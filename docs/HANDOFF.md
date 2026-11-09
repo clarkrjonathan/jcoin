@@ -7,7 +7,7 @@ vault at `Chudjacknostim-Reorganized/Projects/JeffyCoin/`.
 ## Status at a glance
 
 - Branch: `initial-vertical`. **Nothing is pushed to GitHub** — all local.
-- Build: `cd jcoin && cargo build` is clean. `cargo test --lib` = **49 passing**.
+- Build: `cd jcoin && cargo build` is clean. `cargo test --lib` = **58 passing**.
 - The working tree shows modifications under `spike/` — those predate this work
   and are not part of it. `spike/` is frozen scratchwork; ignore it.
 
@@ -29,6 +29,13 @@ propagates, and balances settle consistently on a node that never saw the wallet
   one transfer; PoW `SHA256(header) < target`; genesis with the marker
   "I am 20 years old, I love Jeffy!"; mining (`assemble_block` + `mine_chunk`,
   interruptible); full `validate_and_apply`.
+- **Amounts + reward halving** (`src/amount.rs`, `block_reward` in
+  `src/block.rs`): amounts are `u64` base units, 1 JEF = 100,000,000. The block
+  subsidy is 50 JEF at height 1 and halves every 32,000 blocks (about 111 days);
+  `chain.accept` passes `block_reward(height)` to validation, so a coinbase that
+  claims a pre-halving reward is rejected. Supply caps just under 3,200,000 JEF; the
+  reward reaches 0 at about 10 years, but ~89% is minted in year 1.
+  The wallet parses decimal JEF (`12.5`, max 8 decimal places).
 - **Difficulty + timestamps**: epoch-based retarget toward `TARGET_BLOCK_TIME`
   (300 s). Difficulty is constant within a `RETARGET_WINDOW` (12) epoch,
   recomputed only at a boundary from that epoch's span, clamped to 4x/step, never
@@ -114,7 +121,7 @@ time-warp, no finality). Summary:
 - **Relay**: one TCP connection per node multiplexes all channels, so a stalled
   channel head-of-line-blocks the rest; handle rotation is not implemented.
 - **No misbehaviour scoring/banning** (the notes mention a blacklist).
-- **No halving**, no block/consensus-version signaling.
+- No block/consensus-version signaling.
 - **Persistence** stores blocks only and never compacts the log.
 - `POW_LIMIT` is machine/build-specific (calibrated from a debug-build hash rate).
 

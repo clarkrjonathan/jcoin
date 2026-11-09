@@ -20,7 +20,7 @@ use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
-use jcoin::block::{assemble_block, mine_chunk, Block, BLOCK_REWARD};
+use jcoin::block::{assemble_block, block_reward, mine_chunk, Block};
 use jcoin::node::{
     run_node, BlockOutcome, ChainInfo, MiningJob, NodeRequest, StatusResult, SubmitResult,
 };
@@ -229,7 +229,7 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
         let (mut header, transactions, _state) = match assemble_block(
             &parent,
             &parent_state,
-            BLOCK_REWARD,
+            block_reward(target_height),
             miner,
             normal,
             target,

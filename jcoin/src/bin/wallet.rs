@@ -1,8 +1,11 @@
 //! JeffyCoin wallet CLI for the initial vertical.
 //!
 //! A thin client that holds Ed25519 keys, builds and signs a transaction, and
-//! sends it to a node's REST endpoint. Balance and nonce are dummy for this
-//! slice; the node only checks the signature.
+//! sends it to a node's REST endpoint. It fetches the sender's balance and next
+//! nonce from the node first and refuses to overspend.
+//!
+//! Amounts on the command line are decimal JEF ("12.5"); the wallet converts
+//! them to base units (1 JEF = 100,000,000) before signing.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,6 +15,7 @@ use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 
+use jcoin::amount::{format_jef, parse_jef};
 use jcoin::Transaction;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -61,10 +65,11 @@ enum TxAction {
         key: String,
         /// Recipient address as 64 hex characters.
         recipient: String,
-        /// Amount to debit from the sender (base units).
+        /// Amount the recipient receives, in JEF (for example 12.5).
+        #[arg(value_parser = parse_jef)]
         amount: u64,
-        /// Voluntary fee to the miner (base units). Credited amount is `amount - fee`.
-        #[arg(long, default_value_t = 0)]
+        /// Voluntary fee to the miner, in JEF. The sender pays `amount + fee`.
+        #[arg(long, default_value = "0", value_parser = parse_jef)]
         fee: u64,
     },
     /// Poll the node for a transaction's status.
@@ -176,9 +181,14 @@ async fn send_transaction(
     let balance = account["balance"].as_u64().unwrap_or(0);
     let nonce = account["nonce"].as_u64().unwrap_or(0);
 
-    let needed = amount + fee;
+    let needed = amount.checked_add(fee).ok_or("amount + fee is too large")?;
     if balance < needed {
-        return Err(format!("balance too low: need {needed}, have {balance}").into());
+        return Err(format!(
+            "balance too low: need {} JEF, have {} JEF",
+            format_jef(needed),
+            format_jef(balance)
+        )
+        .into());
     }
 
     let mut tx = Transaction {

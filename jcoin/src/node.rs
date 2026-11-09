@@ -282,7 +282,7 @@ fn prune_mempool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{build_and_mine, Block, BLOCK_REWARD, POW_LIMIT};
+    use crate::block::{build_and_mine, Block, INITIAL_REWARD, POW_LIMIT};
     use crate::state::State;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -333,7 +333,7 @@ mod tests {
         let (b1, _) = build_and_mine(
             &j1.parent,
             &j1.parent_state,
-            BLOCK_REWARD,
+            INITIAL_REWARD,
             miner,
             j1.normal,
             POW_LIMIT,
@@ -369,7 +369,7 @@ mod tests {
         let (b2, _) = build_and_mine(
             &j2.parent,
             &j2.parent_state,
-            BLOCK_REWARD,
+            INITIAL_REWARD,
             miner,
             j2.normal,
             POW_LIMIT,
@@ -396,7 +396,7 @@ mod tests {
         let (block, _) = build_and_mine(
             &genesis.header,
             &State::new(),
-            BLOCK_REWARD,
+            INITIAL_REWARD,
             [1u8; 32],
             None,
             POW_LIMIT,

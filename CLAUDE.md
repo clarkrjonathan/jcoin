@@ -76,7 +76,15 @@ Starting from the initial vertical (wallet → REST → node core over an
   nonce(u64)/signature`, 153 bytes; normal (signed) and coinbase (unsigned).
 - **State** (`src/state.rs`): account balances + nonce, canonical `state_root`.
 - **Blocks** (`src/block.rs`): 156-byte header, coinbase + ≤1 transfer, PoW
-  `SHA256(header) < target`, genesis, mining, validation. Flat reward (no halving).
+  `SHA256(header) < target`, genesis, mining, validation.
+- **Amounts + reward** (`src/amount.rs`, `block_reward` in `src/block.rs`): all
+  amounts are `u64` base units; 1 JEF = `COIN` = 100,000,000. The wallet takes
+  decimal JEF on the command line. The coinbase may claim
+  `block_reward(height) + fees`, where `block_reward = INITIAL_REWARD (50 JEF)
+  >> (height / HALVING_INTERVAL)` and `HALVING_INTERVAL` = 32,000 blocks (about
+  111 days at 5-minute blocks). The subsidy reaches 0 after 33 halvings (about
+  10 years); total supply is just under 3,200,000 JEF, about 89% of it minted
+  in year 1.
 - **Difficulty + timestamps**: epoch-based retarget toward `TARGET_BLOCK_TIME`
   (5 min). Difficulty is constant within a `RETARGET_WINDOW`-block epoch and
   recomputed only at a boundary from the completed epoch's span, clamped to
@@ -99,7 +107,7 @@ sync, work-based reorg), plus live multi-node runs.
 ### Not yet built / open
 
 Reorg mempool re-add (txs dropped by a reorg are not re-queued), relay handle
-rotation and per-channel flow control, block/consensus-version signaling, halving,
+rotation and per-channel flow control, block/consensus-version signaling,
 and misbehaviour scoring/banning. Persistence stores blocks only (state is
 replayed) and the log is never compacted. `POW_LIMIT` is machine/build-specific
 (calibrated from a debug-build hash rate).
@@ -120,7 +128,7 @@ cargo run --bin node -- --rest-addr 127.0.0.1:3001 --p2p-addr 127.0.0.1:8334 \
 # Terminal C: use the wallet against either node
 cargo run --bin wallet -- key new alice
 cargo run --bin wallet -- --node http://127.0.0.1:3000 \
-  transaction new alice <recipient-hex-64> 1000 --fee 50
+  transaction new alice <recipient-hex-64> 12.5 --fee 0.01
 cargo run --bin wallet -- --node http://127.0.0.1:3001 \
   transaction status <tx_id>   # a tx sent to A is visible from B
 ```

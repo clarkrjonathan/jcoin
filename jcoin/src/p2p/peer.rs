@@ -395,7 +395,7 @@ mod gossip_tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{mpsc, oneshot};
 
-    use crate::block::{build_and_mine, Block, BLOCK_REWARD, POW_LIMIT};
+    use crate::block::{build_and_mine, Block, INITIAL_REWARD, POW_LIMIT};
     use crate::node::{run_node, BlockOutcome, NodeRequest, StatusResult, SubmitResult};
     use crate::p2p::Network;
     use crate::state::State;
@@ -404,7 +404,7 @@ mod gossip_tests {
     /// A mined block 1 whose coinbase credits `addr` with the block reward.
     fn coinbase_block(addr: [u8; 32]) -> Block {
         let genesis = Block::genesis();
-        build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, addr, None, POW_LIMIT, 1)
+        build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, addr, None, POW_LIMIT, 1)
             .unwrap()
             .0
     }
@@ -630,7 +630,7 @@ mod gossip_tests {
         let (block, _) = build_and_mine(
             &Block::genesis().header,
             &State::new(),
-            BLOCK_REWARD,
+            INITIAL_REWARD,
             [7u8; 32],
             None,
             POW_LIMIT,
@@ -671,7 +671,7 @@ mod gossip_tests {
         let mut state = State::new();
         for h in 1..=5 {
             let (block, new_state) =
-                build_and_mine(&header, &state, BLOCK_REWARD, [1u8; 32], None, POW_LIMIT, h)
+                build_and_mine(&header, &state, INITIAL_REWARD, [1u8; 32], None, POW_LIMIT, h)
                     .unwrap();
             submit_block(&core_a, block.clone()).await;
             header = block.header;

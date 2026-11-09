@@ -13,7 +13,7 @@ use rand::rngs::OsRng;
 use tokio::net::TcpStream;
 
 use jcoin::block::{
-    build_and_mine, transactions_hash, Block, BlockHeader, BLOCK_REWARD, BLOCK_VERSION,
+    build_and_mine, transactions_hash, Block, BlockHeader, INITIAL_REWARD, BLOCK_VERSION,
     POW_LIMIT,
 };
 use jcoin::p2p::{handshake, local_hello, write_message, Message};
@@ -87,7 +87,7 @@ async fn main() {
 
         // A structurally valid block that was never mined (hash does not meet target).
         "block-badpow" => {
-            let coinbase = Transaction::coinbase([9u8; 32], BLOCK_REWARD);
+            let coinbase = Transaction::coinbase([9u8; 32], INITIAL_REWARD);
             let transactions = vec![coinbase];
             let mut state = State::new();
             state.apply(&transactions[0]).unwrap();
@@ -107,7 +107,7 @@ async fn main() {
         // A mined block with a tampered state_root (re-mined so PoW still holds).
         "block-badstate" => {
             let (mut block, _) =
-                build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [9u8; 32], None, POW_LIMIT, 1)
+                build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, [9u8; 32], None, POW_LIMIT, 1)
                     .unwrap();
             block.header.state_root = [0u8; 32];
             remine(&mut block.header);
@@ -117,7 +117,7 @@ async fn main() {
         // A mined block with a tampered transactions_hash.
         "block-badtxhash" => {
             let (mut block, _) =
-                build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [9u8; 32], None, POW_LIMIT, 1)
+                build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, [9u8; 32], None, POW_LIMIT, 1)
                     .unwrap();
             block.header.transactions_hash = [0u8; 32];
             remine(&mut block.header);
@@ -153,7 +153,7 @@ async fn main() {
         // A valid block on top of genesis: the control, which must be accepted.
         "block-good" => {
             let (block, _) =
-                build_and_mine(&genesis.header, &State::new(), BLOCK_REWARD, [9u8; 32], None, POW_LIMIT, 1)
+                build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, [9u8; 32], None, POW_LIMIT, 1)
                     .unwrap();
             Message::NewBlock(block)
         }
