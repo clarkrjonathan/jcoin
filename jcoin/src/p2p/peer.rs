@@ -395,7 +395,8 @@ mod gossip_tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{mpsc, oneshot};
 
-    use crate::block::{build_and_mine, Block, INITIAL_REWARD, POW_LIMIT};
+    use crate::block::{build_and_mine, Block};
+    use crate::consensus::REGTEST;
     use crate::node::{run_node, BlockOutcome, NodeRequest, StatusResult, SubmitResult};
     use crate::p2p::Network;
     use crate::state::State;
@@ -403,8 +404,8 @@ mod gossip_tests {
 
     /// A mined block 1 whose coinbase credits `addr` with the block reward.
     fn coinbase_block(addr: [u8; 32]) -> Block {
-        let genesis = Block::genesis();
-        build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, addr, None, POW_LIMIT, 1)
+        let genesis = Block::genesis(&REGTEST);
+        build_and_mine(&genesis.header, &State::new(), REGTEST.initial_reward, addr, None, REGTEST.pow_limit, 1)
             .unwrap()
             .0
     }
@@ -438,7 +439,7 @@ mod gossip_tests {
 
     fn spawn_core() -> mpsc::Sender<NodeRequest> {
         let (tx, rx) = mpsc::channel(32);
-        tokio::spawn(run_node(rx, None));
+        tokio::spawn(run_node(rx, None, REGTEST));
         tx
     }
 
@@ -450,7 +451,7 @@ mod gossip_tests {
         })
         .await
         .unwrap();
-        matches!(rx.await.unwrap(), StatusResult::Seen)
+        matches!(rx.await.unwrap(), StatusResult::Pending | StatusResult::Seen)
     }
 
     async fn wait_until<F: Fn() -> bool>(check: F) -> bool {
@@ -628,12 +629,12 @@ mod gossip_tests {
 
         // Mine block 1 and submit it to A; A gossips NEW_BLOCK to B.
         let (block, _) = build_and_mine(
-            &Block::genesis().header,
+            &Block::genesis(&REGTEST).header,
             &State::new(),
-            INITIAL_REWARD,
+            REGTEST.initial_reward,
             [7u8; 32],
             None,
-            POW_LIMIT,
+            REGTEST.pow_limit,
             1,
         )
         .unwrap();
@@ -667,11 +668,11 @@ mod gossip_tests {
         // Node A builds a 5-block chain alone.
         let core_a = spawn_core();
         let net_a = Network::new(core_a.clone(), 1, Vec::new(), 8);
-        let mut header = Block::genesis().header;
+        let mut header = Block::genesis(&REGTEST).header;
         let mut state = State::new();
         for h in 1..=5 {
             let (block, new_state) =
-                build_and_mine(&header, &state, INITIAL_REWARD, [1u8; 32], None, POW_LIMIT, h)
+                build_and_mine(&header, &state, REGTEST.initial_reward, [1u8; 32], None, REGTEST.pow_limit, h)
                     .unwrap();
             submit_block(&core_a, block.clone()).await;
             header = block.header;

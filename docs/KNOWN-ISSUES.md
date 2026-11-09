@@ -54,9 +54,11 @@ the security group; see `DEPLOY-RELAY.md`.
 
 ### O1. Reorg drops mempool transactions
 On a reorg the mempool is only pruned to the new tip. Transactions that were
-confirmed on the orphaned branch are not re-queued, so they silently disappear
-until the sender resubmits. The chain stays consistent; the transactions are
-lost.
+confirmed on the orphaned branch are not re-queued, so they disappear until
+the sender resubmits. The chain stays consistent. (Before the 2026-11-09
+mempool rework, resubmitting did not work either: the seen set blocked
+re-admission. Now the mempool alone decides admission, so a resubmit is
+admitted and relayed.)
 
 ### O2. Out-of-order blocks are re-synced, not buffered
 A block whose parent is missing is dropped and triggers a full block-locator
@@ -78,7 +80,7 @@ With no persistent node identity, two nodes can open several redundant links to
 each other. Harmless (gossip dedups) but wasteful.
 
 ### O6. Machine-specific difficulty floor
-`POW_LIMIT` (the easy start/cap and genesis target) was calibrated from one
+`MAINNET.pow_limit` (the easy start/cap and genesis target) was calibrated from one
 machine's debug-build hash rate. The retarget adapts from it, but the floor and
 genesis hash are environment-specific.
 

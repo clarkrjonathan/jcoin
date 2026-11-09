@@ -11,26 +11,28 @@ use std::collections::HashMap;
 
 use primitive_types::U256;
 
-use crate::block::{
-    Block, BlockError, block_reward, MAX_ADJUST_FACTOR, MEDIAN_TIME_SPAN, POW_LIMIT,
-    RETARGET_WINDOW, TARGET_BLOCK_TIME,
-};
+use crate::block::{Block, BlockError};
+use crate::consensus::{BlockContext, Params};
 use crate::state::State;
 
 /// New target from a parent target and the measured vs expected span of a
-/// retarget window. The span is clamped to `[expected/MAX_ADJUST_FACTOR,
-/// expected*MAX_ADJUST_FACTOR]` so difficulty moves at most that factor per
-/// step; the result is never easier than `POW_LIMIT` nor zero. A span shorter
+/// retarget window. The span is clamped to `[expected/max_adjust_factor,
+/// expected*max_adjust_factor]` so difficulty moves at most that factor per
+/// step; the result is never easier than `pow_limit` nor zero. A span shorter
 /// than expected (blocks too fast) shrinks the target (harder).
-fn retarget(parent_target: &[u8; 32], actual_span: u64, expected_span: u64) -> [u8; 32] {
+fn retarget(
+    params: &Params,
+    parent_target: &[u8; 32],
+    actual_span: u64,
+    expected_span: u64,
+) -> [u8; 32] {
     let expected = expected_span.max(1);
-    let clamped = actual_span
-        .clamp(expected / MAX_ADJUST_FACTOR, expected * MAX_ADJUST_FACTOR)
-        .max(1);
+    let factor = params.max_adjust_factor;
+    let clamped = actual_span.clamp(expected / factor, expected * factor).max(1);
     let parent = U256::from_big_endian(parent_target);
     let new_target = parent.saturating_mul(U256::from(clamped)) / U256::from(expected);
     let capped = new_target
-        .min(U256::from_big_endian(&POW_LIMIT))
+        .min(U256::from_big_endian(&params.pow_limit))
         .max(U256::one());
     let mut bytes = [0u8; 32];
     capped.to_big_endian(&mut bytes);
@@ -69,14 +71,15 @@ pub enum Accept {
 }
 
 pub struct Chain {
+    params: Params,
     blocks: HashMap<[u8; 32], StoredBlock>,
     tip: [u8; 32],
 }
 
 impl Chain {
-    /// A new chain holding only the genesis block.
-    pub fn new() -> Self {
-        let genesis = Block::genesis();
+    /// A new chain for `params`, holding only its genesis block.
+    pub fn new(params: Params) -> Self {
+        let genesis = Block::genesis(&params);
         let hash = genesis.hash();
         let mut blocks = HashMap::new();
         blocks.insert(
@@ -88,7 +91,16 @@ impl Chain {
                 state: State::new(),
             },
         );
-        Chain { blocks, tip: hash }
+        Chain {
+            params,
+            blocks,
+            tip: hash,
+        }
+    }
+
+    /// The consensus parameters this chain validates against.
+    pub fn params(&self) -> &Params {
+        &self.params
     }
 
     pub fn tip_hash(&self) -> [u8; 32] {
@@ -111,9 +123,26 @@ impl Chain {
         self.blocks.contains_key(hash)
     }
 
-    /// The target the next block (built on the current tip) must use.
-    pub fn next_target(&self) -> [u8; 32] {
-        self.target_for_child(self.tip)
+    /// The consensus context for the next block on the current tip.
+    pub fn next_context(&self) -> BlockContext {
+        self.context_for_child(self.tip)
+    }
+
+    /// Everything consensus requires of a child of `parent_hash`: its height,
+    /// the subsidy it may claim, the target it must carry, and its minimum
+    /// timestamp. This is the one place these inputs are derived; validation
+    /// (`accept`) and mining (`next_context`) both use it.
+    ///
+    /// Panics if `parent_hash` is not stored; callers check first.
+    pub fn context_for_child(&self, parent_hash: [u8; 32]) -> BlockContext {
+        let height = self.blocks[&parent_hash].height + 1;
+        BlockContext {
+            height,
+            reward: self.params.block_reward(height),
+            target: self.target_for_child(parent_hash),
+            // Strictly greater than median-time-past.
+            min_timestamp: self.median_time_past(parent_hash).saturating_add(1),
+        }
     }
 
     /// The `n`-th ancestor of the block at `start` (0 = that block itself).
@@ -126,14 +155,15 @@ impl Chain {
         Some(cur)
     }
 
-    /// Median timestamp of up to `MEDIAN_TIME_SPAN` blocks ending at `parent`.
+    /// Median timestamp of up to `median_time_span` blocks ending at `parent`.
     /// A new block's timestamp must be strictly greater than this.
     fn median_time_past(&self, parent_hash: [u8; 32]) -> u64 {
-        let mut times = Vec::with_capacity(MEDIAN_TIME_SPAN);
+        let span = self.params.median_time_span;
+        let mut times = Vec::with_capacity(span);
         let mut cur = self.blocks.get(&parent_hash);
         while let Some(b) = cur {
             times.push(b.block.header.timestamp);
-            if times.len() >= MEDIAN_TIME_SPAN {
+            if times.len() >= span {
                 break;
             }
             cur = self.blocks.get(&b.block.header.previous_block_hash);
@@ -151,31 +181,32 @@ impl Chain {
     /// what keeps it from overshooting. Steered toward `TARGET_BLOCK_TIME`,
     /// clamped per step, never easier than `POW_LIMIT`.
     fn target_for_child(&self, parent_hash: [u8; 32]) -> [u8; 32] {
+        let p = &self.params;
         let parent = &self.blocks[&parent_hash];
         let height = parent.height + 1;
 
         // First epoch mines at the easy limit.
-        if height < RETARGET_WINDOW {
-            return POW_LIMIT;
+        if height < p.retarget_window {
+            return p.pow_limit;
         }
         // Mid-epoch: keep the epoch's difficulty (inherit the parent's target).
-        if height % RETARGET_WINDOW != 0 {
+        if height % p.retarget_window != 0 {
             return parent.block.header.target;
         }
 
         // Epoch boundary: retarget from the span of the just-completed epoch,
-        // blocks [height - RETARGET_WINDOW, height - 1].
-        let intervals = RETARGET_WINDOW - 1;
+        // blocks [height - retarget_window, height - 1].
+        let intervals = p.retarget_window - 1;
         let Some(first) = self.ancestor(parent_hash, intervals) else {
-            return POW_LIMIT;
+            return p.pow_limit;
         };
-        let expected = intervals * TARGET_BLOCK_TIME;
+        let expected = intervals * p.target_block_time;
         let actual = parent
             .block
             .header
             .timestamp
             .saturating_sub(first.block.header.timestamp);
-        retarget(&parent.block.header.target, actual, expected)
+        retarget(p, &parent.block.header.target, actual, expected)
     }
 
     /// Offer a block to the store: validate against its parent, store it, and
@@ -193,23 +224,9 @@ impl Chain {
             return Accept::Orphan;
         }
 
-        // Consensus timestamp rule: strictly greater than median-time-past.
-        if block.header.timestamp <= self.median_time_past(parent_hash) {
-            return Accept::Invalid(BlockError::TimestampTooOld);
-        }
-
-        // Required difficulty target for this block, from the retarget schedule.
-        let expected_target = self.target_for_child(parent_hash);
-
+        let ctx = self.context_for_child(parent_hash);
         let parent = &self.blocks[&parent_hash];
-        // Consensus reward rule: the subsidy follows the halving schedule at the
-        // block's height (validate_and_apply checks height == parent + 1).
-        let new_state = match block.validate_and_apply(
-            &parent.block.header,
-            &parent.state,
-            block_reward(parent.height + 1),
-            &expected_target,
-        ) {
+        let new_state = match block.validate_and_apply(&parent.block.header, &parent.state, &ctx) {
             Ok(s) => s,
             Err(e) => return Accept::Invalid(e),
         };
@@ -292,42 +309,37 @@ impl Chain {
     }
 }
 
-impl Default for Chain {
-    fn default() -> Self {
-        Chain::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{build_and_mine, Block, INITIAL_REWARD, POW_LIMIT};
+    use crate::block::{build_and_mine, Block};
+    use crate::consensus::REGTEST;
     use crate::state::State;
 
     fn mine_on(parent: &crate::block::BlockHeader, parent_state: &State, miner: [u8; 32]) -> Block {
-        build_and_mine(parent, parent_state, INITIAL_REWARD, miner, None, POW_LIMIT, 1)
+        build_and_mine(parent, parent_state, REGTEST.initial_reward, miner, None, REGTEST.pow_limit, 1)
             .unwrap()
             .0
     }
 
     #[test]
     fn accepts_a_chain_and_advances_the_tip() {
-        let mut chain = Chain::new();
-        let genesis = Block::genesis();
+        let mut chain = Chain::new(REGTEST);
+        let genesis = Block::genesis(&REGTEST);
         let b1 = mine_on(&genesis.header, &State::new(), [1u8; 32]);
         match chain.accept(b1.clone()) {
             Accept::Stored { new_tip: true, height: 1 } => {}
             _ => panic!("block 1 should extend the tip"),
         }
         assert_eq!(chain.tip_height(), 1);
-        assert_eq!(chain.tip_state().balance(&[1u8; 32]), INITIAL_REWARD);
+        assert_eq!(chain.tip_state().balance(&[1u8; 32]), REGTEST.initial_reward);
     }
 
     #[test]
     fn unknown_parent_is_orphan() {
-        let mut chain = Chain::new();
+        let mut chain = Chain::new(REGTEST);
         // Mine on a fake parent the chain does not have.
-        let mut fake_parent = Block::genesis().header;
+        let mut fake_parent = Block::genesis(&REGTEST).header;
         fake_parent.state_root = [9u8; 32];
         let orphan = mine_on(&fake_parent, &State::new(), [1u8; 32]);
         assert!(matches!(chain.accept(orphan), Accept::Orphan));
@@ -336,12 +348,12 @@ mod tests {
     /// Build `len` blocks on top of genesis, all crediting `miner`. Timestamps
     /// increase by height so each block clears median-time-past.
     fn branch(len: u64, miner: [u8; 32]) -> Vec<Block> {
-        let mut header = Block::genesis().header;
+        let mut header = Block::genesis(&REGTEST).header;
         let mut state = State::new();
         let mut out = Vec::new();
         for h in 1..=len {
             let (block, new_state) =
-                build_and_mine(&header, &state, INITIAL_REWARD, miner, None, POW_LIMIT, h)
+                build_and_mine(&header, &state, REGTEST.initial_reward, miner, None, REGTEST.pow_limit, h)
                     .unwrap();
             header = block.header.clone();
             state = new_state;
@@ -355,18 +367,18 @@ mod tests {
         use ed25519_dalek::{Signer, SigningKey};
         use rand::rngs::OsRng;
 
-        let mut chain = Chain::new();
+        let mut chain = Chain::new(REGTEST);
         let key = SigningKey::generate(&mut OsRng);
         let sender = key.verifying_key().to_bytes();
 
         // Block 1: coinbase funds the sender.
         let (b1, _) = build_and_mine(
-            &Block::genesis().header,
+            &Block::genesis(&REGTEST).header,
             &State::new(),
-            INITIAL_REWARD,
+            REGTEST.initial_reward,
             sender,
             None,
-            POW_LIMIT,
+            REGTEST.pow_limit,
             1,
         )
         .unwrap();
@@ -388,10 +400,10 @@ mod tests {
         let (b2, _) = build_and_mine(
             &chain.tip_header(),
             chain.tip_state(),
-            INITIAL_REWARD,
+            REGTEST.initial_reward,
             sender,
             Some(tx),
-            POW_LIMIT,
+            REGTEST.pow_limit,
             2,
         )
         .unwrap();
@@ -408,7 +420,7 @@ mod tests {
 
     #[test]
     fn longer_branch_wins_by_work() {
-        let mut chain = Chain::new();
+        let mut chain = Chain::new(REGTEST);
         // A short branch to one miner, then a longer competing branch to another.
         for block in branch(2, [1u8; 32]) {
             chain.accept(block);
@@ -420,39 +432,39 @@ mod tests {
         }
         // The 3-block branch has more cumulative work and becomes canonical.
         assert_eq!(chain.tip_height(), 3);
-        assert_eq!(chain.tip_state().balance(&[2u8; 32]), 3 * INITIAL_REWARD);
+        assert_eq!(chain.tip_state().balance(&[2u8; 32]), 3 * REGTEST.initial_reward);
         assert_eq!(chain.tip_state().balance(&[1u8; 32]), 0);
     }
 
     #[test]
     fn retarget_hardens_when_fast_and_caps_when_slow() {
-        let expected = RETARGET_WINDOW * TARGET_BLOCK_TIME;
+        let expected = REGTEST.retarget_window * REGTEST.target_block_time;
 
         // Blocks far faster than target: the window span is tiny, so difficulty
         // tightens (target shrinks) relative to the limit.
-        let faster = retarget(&POW_LIMIT, 1, expected);
+        let faster = retarget(&REGTEST, &REGTEST.pow_limit, 1, expected);
         assert!(
-            U256::from_big_endian(&faster) < U256::from_big_endian(&POW_LIMIT),
+            U256::from_big_endian(&faster) < U256::from_big_endian(&REGTEST.pow_limit),
             "fast blocks should harden difficulty"
         );
 
         // Blocks far slower than target: difficulty eases, but never past the
         // easy limit.
-        let slower = retarget(&faster, expected * 100, expected);
+        let slower = retarget(&REGTEST, &faster, expected * 100, expected);
         assert!(U256::from_big_endian(&slower) > U256::from_big_endian(&faster));
-        assert!(U256::from_big_endian(&slower) <= U256::from_big_endian(&POW_LIMIT));
+        assert!(U256::from_big_endian(&slower) <= U256::from_big_endian(&REGTEST.pow_limit));
     }
 
     #[test]
     fn stale_timestamp_is_rejected() {
-        let mut chain = Chain::new();
+        let mut chain = Chain::new(REGTEST);
         let (b1, _) = build_and_mine(
-            &Block::genesis().header,
+            &Block::genesis(&REGTEST).header,
             &State::new(),
-            INITIAL_REWARD,
+            REGTEST.initial_reward,
             [1u8; 32],
             None,
-            POW_LIMIT,
+            REGTEST.pow_limit,
             100,
         )
         .unwrap();
@@ -463,10 +475,10 @@ mod tests {
         let (b2, _) = build_and_mine(
             &chain.tip_header(),
             chain.tip_state(),
-            INITIAL_REWARD,
+            REGTEST.initial_reward,
             [1u8; 32],
             None,
-            chain.next_target(),
+            chain.next_context().target,
             100,
         )
         .unwrap();
@@ -476,14 +488,81 @@ mod tests {
         ));
     }
 
+    /// Mine one block on the tip from the chain's own context, at `timestamp`
+    /// (raised to the context minimum, as the miner does), claiming `reward`.
+    fn mine_from_context(chain: &Chain, reward: u64, timestamp: u64) -> Block {
+        let ctx = chain.next_context();
+        build_and_mine(
+            &chain.tip_header(),
+            chain.tip_state(),
+            reward,
+            [1u8; 32],
+            None,
+            ctx.target,
+            timestamp.max(ctx.min_timestamp),
+        )
+        .unwrap()
+        .0
+    }
+
+    // S1: the halving is enforced by chain.accept itself, on a real chain.
+    #[test]
+    fn chain_enforces_the_halving_at_the_boundary() {
+        // Parameters are a value, so a test can shorten the halving interval
+        // and still run the real accept path.
+        let p = Params {
+            halving_interval: 4,
+            ..REGTEST
+        };
+        let mut chain = Chain::new(p);
+        // Space blocks at the target time so difficulty stays at the limit.
+        let mut t = 0;
+        for _ in 1..p.halving_interval {
+            t += p.target_block_time;
+            let reward = chain.next_context().reward;
+            assert_eq!(reward, p.initial_reward);
+            assert!(matches!(chain.accept(mine_from_context(&chain, reward, t)), Accept::Stored { .. }));
+        }
+        assert_eq!(chain.tip_height(), p.halving_interval - 1);
+
+        // The next block is the first of the halved era.
+        let ctx = chain.next_context();
+        assert_eq!(ctx.height, p.halving_interval);
+        assert_eq!(ctx.reward, p.initial_reward / 2);
+        t += p.target_block_time;
+        let greedy = mine_from_context(&chain, p.initial_reward, t);
+        assert!(matches!(
+            chain.accept(greedy),
+            Accept::Invalid(BlockError::CoinbaseTooLarge)
+        ));
+        let honest = mine_from_context(&chain, ctx.reward, t);
+        assert!(matches!(chain.accept(honest), Accept::Stored { new_tip: true, .. }));
+    }
+
+    // S1: a miner whose clock is behind median-time-past still builds a valid
+    // block, because it takes the minimum timestamp from the same context.
+    #[test]
+    fn block_from_context_is_accepted_with_a_stale_clock() {
+        let mut chain = Chain::new(REGTEST);
+        for t in [1000, 2000, 3000] {
+            let reward = chain.next_context().reward;
+            chain.accept(mine_from_context(&chain, reward, t));
+        }
+        // A clock reading of 5 is far behind median-time-past (2000).
+        let reward = chain.next_context().reward;
+        let block = mine_from_context(&chain, reward, 5);
+        assert!(block.header.timestamp > 2000);
+        assert!(matches!(chain.accept(block), Accept::Stored { .. }));
+    }
+
     #[test]
     fn blocks_after_locator_returns_the_gap() {
-        let mut chain = Chain::new();
-        let mut header = Block::genesis().header;
+        let mut chain = Chain::new(REGTEST);
+        let mut header = Block::genesis(&REGTEST).header;
         let mut state = State::new();
         for h in 1..=3 {
             let (block, new_state) =
-                build_and_mine(&header, &state, INITIAL_REWARD, [1u8; 32], None, POW_LIMIT, h)
+                build_and_mine(&header, &state, REGTEST.initial_reward, [1u8; 32], None, REGTEST.pow_limit, h)
                     .unwrap();
             chain.accept(block.clone());
             header = block.header;
@@ -491,7 +570,7 @@ mod tests {
         }
         assert_eq!(chain.tip_height(), 3);
         // A fresh node's locator is just genesis.
-        let genesis_only = vec![Block::genesis().hash()];
+        let genesis_only = vec![Block::genesis(&REGTEST).hash()];
         let blocks = chain.blocks_after(&genesis_only, 500);
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0].header.height, 1);

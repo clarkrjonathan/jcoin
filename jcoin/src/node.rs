@@ -3,9 +3,8 @@
 //! The REST and P2P layers never touch node state directly. They send a
 //! `NodeRequest` over an `mpsc` channel and wait on a per-request `oneshot`
 //! reply. A single task (`run_node`) owns the chain store, the mempool, and the
-//! transaction-seen set, so there are no locks.
+//! seen-transaction cache, so there are no locks.
 
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,8 +12,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::block::{Block, BlockHeader, MAX_FUTURE_DRIFT};
 use crate::chain::{Accept, Chain};
+use crate::consensus::{BlockContext, Params};
+use crate::mempool::{Admitted, Mempool, SeenCache, MAX_MEMPOOL, SEEN_CAPACITY};
 use crate::state::State;
-use crate::store::{load_blocks, BlockLog};
+use crate::store::{load_and_repair, BlockLog};
 use crate::Transaction;
 
 /// Most blocks to return in one `BLOCKS` reply.
@@ -61,6 +62,10 @@ pub enum SubmitResult {
 }
 
 pub enum StatusResult {
+    /// In this node's mempool now.
+    Pending,
+    /// Seen recently but no longer pending (for example, included in a block,
+    /// or dropped as no longer valid).
     Seen,
     Unknown,
 }
@@ -79,8 +84,9 @@ pub struct MiningJob {
     pub parent: BlockHeader,
     pub parent_state: State,
     pub normal: Option<Transaction>,
-    /// The difficulty target this block must use (from the retarget schedule).
-    pub target: [u8; 32],
+    /// What consensus requires of the block (height, reward, target, minimum
+    /// timestamp), from the same function that validates it.
+    pub context: BlockContext,
 }
 
 pub struct ChainInfo {
@@ -95,21 +101,48 @@ pub struct ChainInfo {
 /// If `data_dir` is set, the chain is persisted to an append-only block log
 /// there (`blocks.dat`): the log is replayed on startup to rebuild the chain and
 /// state, and each newly accepted block is appended. With `None`, the node is
-/// in-memory only.
-pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>, data_dir: Option<PathBuf>) {
-    let mut chain = Chain::new();
-    let mut mempool: HashMap<String, Transaction> = HashMap::new();
-    let mut seen_tx: HashSet<String> = HashSet::new();
+/// in-memory only. `params` selects the network (`MAINNET` or `REGTEST`).
+pub async fn run_node(
+    mut rx: mpsc::Receiver<NodeRequest>,
+    data_dir: Option<PathBuf>,
+    params: Params,
+) {
+    let mut chain = Chain::new(params);
+    let mut mempool = Mempool::new(MAX_MEMPOOL);
+    let mut seen_tx = SeenCache::new(SEEN_CAPACITY);
 
     // Replay persisted blocks (if any) and open the log for appending.
     let mut log: Option<BlockLog> = None;
     if let Some(dir) = data_dir {
         let path = dir.join("blocks.dat");
-        match load_blocks(&path) {
-            Ok(blocks) => {
-                let count = blocks.len();
-                for block in blocks {
-                    chain.accept(block);
+        match load_and_repair(&path) {
+            Ok(loaded) => {
+                if loaded.discarded > 0 {
+                    eprintln!(
+                        "[store] cut {} bytes of torn or corrupt tail from {}",
+                        loaded.discarded,
+                        path.display()
+                    );
+                }
+                let count = loaded.blocks.len();
+                let mut rejected = 0usize;
+                for block in loaded.blocks {
+                    match chain.accept(block) {
+                        Accept::Stored { .. } | Accept::AlreadyHave { .. } => {}
+                        Accept::Orphan => rejected += 1,
+                        Accept::Invalid(e) => {
+                            rejected += 1;
+                            if rejected == 1 {
+                                eprintln!("[store] replay rejected a block: {e}");
+                            }
+                        }
+                    }
+                }
+                if rejected > 0 {
+                    eprintln!(
+                        "[store] replay rejected {rejected} of {count} blocks \
+                         (consensus rules changed since they were written?)"
+                    );
                 }
                 if count > 0 {
                     println!("[store] replayed {count} blocks; tip height {}", chain.tip_height());
@@ -126,25 +159,36 @@ pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>, data_dir: Option<Path
     while let Some(request) = rx.recv().await {
         match request {
             NodeRequest::SubmitTransaction { tx, reply } => {
-                let tx_id = tx.tx_id_hex();
-                let result = validate_pending(&tx, chain.tip_state()).map_or_else(
-                    |reason| SubmitResult::Rejected { reason },
-                    |()| {
-                        let is_new = seen_tx.insert(tx_id.clone());
-                        if is_new {
-                            mempool.insert(tx_id.clone(), tx);
+                let id = tx.tx_id();
+                let tx_id = hex::encode(id);
+                // Mempool membership, not the seen cache, decides whether this
+                // is new: a transaction that left the mempool (for example after
+                // a reorg) is admitted and relayed again when resubmitted.
+                let result = match validate_pending(&tx, chain.tip_state()) {
+                    Err(reason) => SubmitResult::Rejected { reason },
+                    Ok(()) => match mempool.insert(tx) {
+                        Ok(admitted) => {
+                            seen_tx.insert(id);
+                            SubmitResult::Accepted {
+                                tx_id,
+                                is_new: admitted == Admitted::New,
+                            }
                         }
-                        SubmitResult::Accepted { tx_id, is_new }
+                        Err(e) => SubmitResult::Rejected {
+                            reason: e.to_string(),
+                        },
                     },
-                );
+                };
                 let _ = reply.send(result);
             }
 
             NodeRequest::GetStatus { tx_id, reply } => {
-                let status = if seen_tx.contains(&tx_id) {
-                    StatusResult::Seen
-                } else {
-                    StatusResult::Unknown
+                let parsed: Option<[u8; 32]> =
+                    hex::decode(&tx_id).ok().and_then(|b| b.try_into().ok());
+                let status = match parsed {
+                    Some(id) if mempool.contains(&id) => StatusResult::Pending,
+                    Some(id) if seen_tx.contains(&id) => StatusResult::Seen,
+                    _ => StatusResult::Unknown,
                 };
                 let _ = reply.send(status);
             }
@@ -179,7 +223,7 @@ pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>, data_dir: Option<Path
                             }
                         }
                         // Drop transactions no longer applicable on the new tip.
-                        prune_mempool(&chain, &mut mempool, &mut seen_tx);
+                        mempool.prune(chain.tip_state());
                         BlockOutcome::Accepted {
                             is_new: true,
                             new_tip,
@@ -201,12 +245,12 @@ pub async fn run_node(mut rx: mpsc::Receiver<NodeRequest>, data_dir: Option<Path
 
             NodeRequest::GetMiningJob { reply } => {
                 let parent = chain.tip_header();
-                let normal = applicable_tx(&mempool, chain.tip_state());
+                let normal = mempool.best_applicable(chain.tip_state());
                 let _ = reply.send(MiningJob {
                     parent,
                     parent_state: chain.tip_state().clone(),
                     normal,
-                    target: chain.next_target(),
+                    context: chain.next_context(),
                 });
             }
 
@@ -235,54 +279,20 @@ fn validate_pending(tx: &Transaction, state: &State) -> Result<(), String> {
     if tx.is_coinbase() {
         return Err("coinbase cannot be submitted directly".to_string());
     }
+    if !tx.is_normal() {
+        return Err(format!("unknown transaction type {}", tx.tx_type));
+    }
     if !tx.verify_signature() {
         return Err("invalid signature".to_string());
     }
-    let expected = state.nonce(&tx.sender);
-    if tx.nonce != expected {
-        return Err(format!("bad nonce: expected {expected}, got {}", tx.nonce));
-    }
-    let debit = tx
-        .amount
-        .checked_add(tx.fee)
-        .ok_or_else(|| "amount + fee overflows".to_string())?;
-    let balance = state.balance(&tx.sender);
-    if balance < debit {
-        return Err(format!("insufficient balance: need {debit}, have {balance}"));
-    }
-    Ok(())
-}
-
-/// Pick a mempool transaction that is currently applicable on top of the tip.
-fn applicable_tx(mempool: &HashMap<String, Transaction>, state: &State) -> Option<Transaction> {
-    mempool
-        .values()
-        .find(|tx| {
-            tx.nonce == state.nonce(&tx.sender)
-                && state.balance(&tx.sender) >= tx.amount.saturating_add(tx.fee)
-        })
-        .cloned()
-}
-
-/// Drop mempool transactions that are no longer applicable on the current tip
-/// (already included, or stale nonce). Abandoned-branch transactions are not
-/// re-added on a reorg yet; that is a later refinement.
-fn prune_mempool(
-    chain: &Chain,
-    mempool: &mut HashMap<String, Transaction>,
-    _seen_tx: &mut HashSet<String>,
-) {
-    let state = chain.tip_state();
-    mempool.retain(|_id, tx| {
-        tx.nonce == state.nonce(&tx.sender)
-            && state.balance(&tx.sender) >= tx.amount.saturating_add(tx.fee)
-    });
+    state.check(tx).map(|_| ()).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{build_and_mine, Block, INITIAL_REWARD, POW_LIMIT};
+    use crate::block::{build_and_mine, Block};
+    use crate::consensus::REGTEST;
     use crate::state::State;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -323,7 +333,7 @@ mod tests {
         use rand::rngs::OsRng;
 
         let (core, rx) = mpsc::channel(64);
-        tokio::spawn(run_node(rx, None));
+        tokio::spawn(run_node(rx, None, REGTEST));
 
         let key = SigningKey::generate(&mut OsRng);
         let miner = key.verifying_key().to_bytes();
@@ -333,10 +343,10 @@ mod tests {
         let (b1, _) = build_and_mine(
             &j1.parent,
             &j1.parent_state,
-            INITIAL_REWARD,
+            REGTEST.initial_reward,
             miner,
             j1.normal,
-            POW_LIMIT,
+            REGTEST.pow_limit,
             1,
         )
         .unwrap();
@@ -369,10 +379,10 @@ mod tests {
         let (b2, _) = build_and_mine(
             &j2.parent,
             &j2.parent_state,
-            INITIAL_REWARD,
+            REGTEST.initial_reward,
             miner,
             j2.normal,
-            POW_LIMIT,
+            REGTEST.pow_limit,
             2,
         )
         .unwrap();
@@ -385,21 +395,83 @@ mod tests {
         assert_eq!(height(&core).await, 2);
     }
 
+    async fn submit_tx(core: &mpsc::Sender<NodeRequest>, tx: Transaction) -> SubmitResult {
+        let (reply, rx) = oneshot::channel();
+        core.send(NodeRequest::SubmitTransaction { tx, reply })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    // S2 and S4 through the real submit path: a second transaction at the same
+    // sender and nonce is rejected (not relayed), and so is an unknown type.
+    #[tokio::test]
+    async fn conflicting_and_unknown_type_transactions_are_rejected() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let (core, rx) = mpsc::channel(64);
+        tokio::spawn(run_node(rx, None, REGTEST));
+        let key = SigningKey::generate(&mut OsRng);
+        let sender = key.verifying_key().to_bytes();
+
+        // Fund the sender with block 1.
+        let j1 = get_job(&core).await;
+        let (b1, _) =
+            build_and_mine(&j1.parent, &j1.parent_state, REGTEST.initial_reward, sender, None, REGTEST.pow_limit, 1)
+                .unwrap();
+        assert!(matches!(submit_block(&core, b1).await, BlockOutcome::Accepted { .. }));
+
+        let signed = |tx_type: u8, amount: u64| {
+            let mut tx = Transaction {
+                tx_type,
+                sender,
+                recipient: [2u8; 32],
+                amount,
+                fee: 0,
+                nonce: 0,
+                signature: [0u8; 64],
+            };
+            tx.signature = key.sign(&tx.signing_bytes()).to_bytes();
+            tx
+        };
+
+        assert!(matches!(
+            submit_tx(&core, signed(crate::tx_type::NORMAL, 10)).await,
+            SubmitResult::Accepted { is_new: true, .. }
+        ));
+        // Same transaction again: accepted but not new (not relayed again).
+        assert!(matches!(
+            submit_tx(&core, signed(crate::tx_type::NORMAL, 10)).await,
+            SubmitResult::Accepted { is_new: false, .. }
+        ));
+        // A different amount at the same nonce is a conflict.
+        match submit_tx(&core, signed(crate::tx_type::NORMAL, 11)).await {
+            SubmitResult::Rejected { reason } => assert!(reason.contains("conflicts"), "{reason}"),
+            SubmitResult::Accepted { .. } => panic!("conflicting transaction was accepted"),
+        }
+        // An unknown type code is rejected, not treated as a transfer.
+        match submit_tx(&core, signed(9, 10)).await {
+            SubmitResult::Rejected { reason } => assert!(reason.contains("unknown"), "{reason}"),
+            SubmitResult::Accepted { .. } => panic!("unknown transaction type was accepted"),
+        }
+    }
+
     #[tokio::test]
     async fn chain_persists_across_restart() {
         let dir = temp_dir("persist");
 
         // First run: submit a mined block, then shut the node down.
         let (tx1, rx1) = mpsc::channel(16);
-        let run1 = tokio::spawn(run_node(rx1, Some(dir.clone())));
-        let genesis = Block::genesis();
+        let run1 = tokio::spawn(run_node(rx1, Some(dir.clone()), REGTEST));
+        let genesis = Block::genesis(&REGTEST);
         let (block, _) = build_and_mine(
             &genesis.header,
             &State::new(),
-            INITIAL_REWARD,
+            REGTEST.initial_reward,
             [1u8; 32],
             None,
-            POW_LIMIT,
+            REGTEST.pow_limit,
             1,
         )
         .unwrap();
@@ -420,7 +492,7 @@ mod tests {
 
         // Second run on the same directory: the block is replayed from disk.
         let (tx2, rx2) = mpsc::channel(16);
-        let run2 = tokio::spawn(run_node(rx2, Some(dir.clone())));
+        let run2 = tokio::spawn(run_node(rx2, Some(dir.clone()), REGTEST));
         assert_eq!(height(&tx2).await, 1);
         drop(tx2);
         run2.await.unwrap();

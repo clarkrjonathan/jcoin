@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::net::TcpStream;
@@ -28,6 +28,16 @@ pub type PeerId = u64;
 /// Most addresses to return in one `ADDR` reply.
 const ADDR_SAMPLE: usize = 64;
 
+/// Most entries read from one received `ADDR` message; the rest are ignored.
+/// A legitimate reply holds at most `ADDR_SAMPLE` plus a few advertised
+/// endpoints, so this only limits abuse.
+pub const MAX_ADDR_PER_MESSAGE: usize = 256;
+
+/// Most endpoints kept in the address book. When it is full, a new endpoint
+/// replaces a random existing one, so a single peer cannot fill the book once
+/// and lock out every later address.
+pub const MAX_BOOK: usize = 1_000;
+
 struct Inner {
     peers: Mutex<HashMap<PeerId, mpsc::Sender<Message>>>,
     next_id: AtomicU64,
@@ -35,6 +45,9 @@ struct Inner {
     book: Mutex<HashSet<Endpoint>>,
     /// Direct addresses already dialed, to avoid hammering the same peer.
     attempted: Mutex<HashSet<SocketAddr>>,
+    /// Outbound dials started but not yet connected or failed. They count
+    /// toward `max_peers`, so one `ADDR` cannot start thousands of dials.
+    dialing: AtomicUsize,
     /// This node's own reachable endpoints, advertised to peers. Mutable so the
     /// relay client can add a `Relay` endpoint once it has a handle.
     advertised: Mutex<Vec<Endpoint>>,
@@ -67,6 +80,7 @@ impl Network {
                 next_id: AtomicU64::new(0),
                 book: Mutex::new(HashSet::new()),
                 attempted: Mutex::new(HashSet::new()),
+                dialing: AtomicUsize::new(0),
                 advertised: Mutex::new(advertised),
                 listen_port,
                 node,
@@ -174,20 +188,40 @@ impl Network {
     }
 
     /// Add endpoints to the book, returning the ones not already known. This
-    /// node's own advertised endpoints are never stored.
+    /// node's own advertised endpoints are never stored. At most
+    /// `MAX_ADDR_PER_MESSAGE` entries are read, and the book never grows past
+    /// `MAX_BOOK` (a random entry is evicted to make room).
     pub fn learn(&self, endpoints: Vec<Endpoint>) -> Vec<Endpoint> {
+        use rand::Rng;
+
         let advertised = self.inner.advertised.lock().unwrap().clone();
         let mut book = self.inner.book.lock().unwrap();
+        let mut rng = rand::thread_rng();
         let mut fresh = Vec::new();
-        for endpoint in endpoints {
-            if advertised.contains(&endpoint) {
+        for endpoint in endpoints.into_iter().take(MAX_ADDR_PER_MESSAGE) {
+            if advertised.contains(&endpoint) || book.contains(&endpoint) {
                 continue;
             }
-            if book.insert(endpoint.clone()) {
-                fresh.push(endpoint);
+            if book.len() >= MAX_BOOK {
+                let victim = book.iter().nth(rng.gen_range(0..book.len())).cloned();
+                if let Some(victim) = victim {
+                    book.remove(&victim);
+                }
             }
+            book.insert(endpoint.clone());
+            fresh.push(endpoint);
         }
         fresh
+    }
+
+    /// Number of endpoints in the address book.
+    pub fn book_len(&self) -> usize {
+        self.inner.book.lock().unwrap().len()
+    }
+
+    /// Number of outbound dials in progress.
+    pub fn dials_in_flight(&self) -> usize {
+        self.inner.dialing.load(Ordering::Relaxed)
     }
 
     /// Act on newly-learned endpoints. A `Direct` endpoint is dialed within the
@@ -198,7 +232,8 @@ impl Network {
         for endpoint in endpoints {
             match endpoint {
                 Endpoint::Direct(addr) => {
-                    if self.peer_count() >= self.inner.max_peers {
+                    let in_flight = self.inner.dialing.load(Ordering::Relaxed);
+                    if self.peer_count() + in_flight >= self.inner.max_peers {
                         continue;
                     }
                     if advertised.contains(&Endpoint::Direct(addr)) {
@@ -210,6 +245,7 @@ impl Network {
                             continue; // already tried
                         }
                     }
+                    self.inner.dialing.fetch_add(1, Ordering::Relaxed);
                     let this = self.clone();
                     tokio::spawn(this.dial(addr));
                 }
@@ -227,12 +263,64 @@ impl Network {
     /// disconnect the address is cleared from `attempted` so it can be redialed
     /// if learned again.
     async fn dial(self, addr: SocketAddr) {
-        match TcpStream::connect(addr).await {
+        let connected = TcpStream::connect(addr).await;
+        // The dial is no longer in flight; a connected peer is counted by the
+        // registry once its handshake completes.
+        self.inner.dialing.fetch_sub(1, Ordering::Relaxed);
+        match connected {
             Ok(stream) => {
                 super::peer::run_peer(stream, self.clone(), format!("{addr} (auto)")).await;
             }
             Err(e) => eprintln!("[p2p] auto-dial {addr} failed: {e}"),
         }
         self.inner.attempted.lock().unwrap().remove(&addr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn direct(i: u32) -> Endpoint {
+        let ip = std::net::Ipv4Addr::from(0x0a00_0000 + i); // 10.x.x.x
+        Endpoint::Direct(SocketAddr::from((ip, 8333)))
+    }
+
+    fn network(max_peers: usize) -> Network {
+        let (node, _rx) = mpsc::channel(1);
+        Network::new(node, 8333, Vec::new(), max_peers)
+    }
+
+    // S5: one oversized ADDR is read only up to MAX_ADDR_PER_MESSAGE, and the
+    // book never grows past MAX_BOOK however many messages arrive.
+    #[test]
+    fn address_book_is_bounded() {
+        let net = network(8);
+        let fresh = net.learn((0..60_000).map(direct).collect());
+        assert_eq!(fresh.len(), MAX_ADDR_PER_MESSAGE);
+        for batch in 1..20u32 {
+            let start = batch * 10_000;
+            net.learn((start..start + 1_000).map(direct).collect());
+        }
+        assert_eq!(net.book_len(), MAX_BOOK);
+    }
+
+    #[test]
+    fn known_and_own_endpoints_are_not_fresh() {
+        let (node, _rx) = mpsc::channel(1);
+        let net = Network::new(node, 8333, vec![direct(1)], 8);
+        let fresh = net.learn(vec![direct(1), direct(2), direct(2)]);
+        assert_eq!(fresh, vec![direct(2)]);
+        assert!(net.learn(vec![direct(2)]).is_empty());
+    }
+
+    // S5: in-flight dials count toward max_peers, so learning many endpoints
+    // starts at most max_peers dials.
+    #[tokio::test]
+    async fn dials_in_flight_are_capped_by_max_peers() {
+        let net = network(4);
+        let fresh = net.learn((0..200).map(direct).collect());
+        net.maybe_dial(fresh);
+        assert!(net.dials_in_flight() <= 4, "{} dials", net.dials_in_flight());
     }
 }

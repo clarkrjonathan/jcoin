@@ -20,7 +20,8 @@ use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
-use jcoin::block::{assemble_block, block_reward, mine_chunk, Block};
+use jcoin::block::{assemble_block, mine_chunk, Block};
+use jcoin::consensus::{MAINNET, REGTEST};
 use jcoin::node::{
     run_node, BlockOutcome, ChainInfo, MiningJob, NodeRequest, StatusResult, SubmitResult,
 };
@@ -62,6 +63,11 @@ struct Cli {
     /// in memory only. Each node needs its own directory.
     #[arg(long)]
     data_dir: Option<std::path::PathBuf>,
+    /// Run on the local test network (easy proof of work, its own genesis)
+    /// instead of the real one. Regtest and real nodes reject each other's
+    /// blocks.
+    #[arg(long)]
+    regtest: bool,
 }
 
 /// Shared state for REST handlers: a channel into the node core and the peer set.
@@ -82,7 +88,8 @@ async fn main() {
 
     // Node core.
     let (node_tx, node_rx) = mpsc::channel::<NodeRequest>(100);
-    tokio::spawn(run_node(node_rx, cli.data_dir.clone()));
+    let params = if cli.regtest { REGTEST } else { MAINNET };
+    tokio::spawn(run_node(node_rx, cli.data_dir.clone(), params));
 
     // Addresses this node advertises: the configured ones, plus a concrete
     // --p2p-addr.
@@ -215,24 +222,27 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
             parent,
             parent_state,
             normal,
-            target,
+            context,
         }) = job_rx.await
         else {
             return;
         };
-        let target_height = parent.height + 1;
+        let target_height = context.height;
 
-        let timestamp = SystemTime::now()
+        // Never below the consensus minimum: a clock behind median-time-past
+        // would otherwise build blocks the chain rejects, forever.
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let timestamp = now.max(context.min_timestamp);
         let (mut header, transactions, _state) = match assemble_block(
             &parent,
             &parent_state,
-            block_reward(target_height),
+            context.reward,
             miner,
             normal,
-            target,
+            context.target,
             timestamp,
         ) {
             Ok(parts) => parts,
@@ -376,7 +386,8 @@ async fn submit_transaction(
     }
 }
 
-/// GET /wallet/transaction/{tx_id} — dummy status: has the node seen the id.
+/// GET /wallet/transaction/{tx_id} — `pending` (in the mempool), `seen` (seen
+/// recently, no longer pending; usually included in a block), or `unknown`.
 async fn transaction_status(
     State(state): State<AppState>,
     Path(tx_id): Path<String>,
@@ -399,6 +410,10 @@ async fn transaction_status(
     }
 
     match reply_rx.await {
+        Ok(StatusResult::Pending) => (
+            StatusCode::OK,
+            Json(json!({ "tx_id": tx_id, "status": "pending" })),
+        ),
         Ok(StatusResult::Seen) => (
             StatusCode::OK,
             Json(json!({ "tx_id": tx_id, "status": "seen" })),

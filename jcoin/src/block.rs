@@ -6,7 +6,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::amount::COIN;
+use crate::consensus::{BlockContext, Params};
 use crate::state::{State, StateError};
 use crate::Transaction;
 
@@ -16,81 +16,14 @@ pub const HEADER_LEN: usize = 156;
 /// Current block/consensus version.
 pub const BLOCK_VERSION: u32 = 1;
 
-/// Block reward at height 1, before any halving: 50 JEF.
-pub const INITIAL_REWARD: u64 = 50 * COIN;
-
-/// Blocks between reward halvings. At `TARGET_BLOCK_TIME` (5 min, 288
-/// blocks/day) this is about 111 days, chosen so that the 33rd halving, where
-/// the reward reaches zero, falls at about 10 years.
-pub const HALVING_INTERVAL: u64 = 32_000;
-
-/// The block subsidy (excluding fees) a coinbase at `height` may claim:
-/// `INITIAL_REWARD >> (height / HALVING_INTERVAL)`. It reaches zero after 33
-/// halvings (about 10 years); after that miners are paid by fees only. Total
-/// supply converges to just under `2 * INITIAL_REWARD * HALVING_INTERVAL`
-/// (3,200,000 JEF). Issuance is front-loaded: about 89% is minted in year 1
-/// and 99% by the end of year 2.
-pub fn block_reward(height: u64) -> u64 {
-    let halvings = height / HALVING_INTERVAL;
-    // A shift by 64 or more is undefined for u64, and the result is 0 anyway.
-    if halvings >= 64 {
-        0
-    } else {
-        INITIAL_REWARD >> halvings
-    }
-}
-
 /// The 32-byte plaintext marker placed in the genesis `previous_block_hash`.
 pub const GENESIS_MARKER: &[u8; 32] = b"I am 20 years old, I love Jeffy!";
-
-/// Fixed genesis timestamp (a real Unix time, so the first retarget epoch
-/// measures a realistic span rather than one anchored at 0). Zero under
-/// `cfg(test)` so tests can use small increasing timestamps.
-#[cfg(not(test))]
-pub const GENESIS_TIMESTAMP: u64 = 1_700_000_000;
-#[cfg(test)]
-pub const GENESIS_TIMESTAMP: u64 = 0;
-
-/// Target average seconds between blocks. Difficulty retargets toward this.
-pub const TARGET_BLOCK_TIME: u64 = 300;
-
-/// Number of block intervals averaged by the retarget algorithm. A block at
-/// height H retargets from the span of the `RETARGET_WINDOW` intervals ending at
-/// its parent. Small enough to adapt within the hour, large enough to damp the
-/// large per-block variance of proof of work.
-pub const RETARGET_WINDOW: u64 = 12;
-
-/// Largest per-step difficulty change factor (clamps the measured span to
-/// `[expected/4, expected*4]`), so difficulty cannot swing more than 4x at once.
-pub const MAX_ADJUST_FACTOR: u64 = 4;
-
-/// Number of recent blocks whose median timestamp a new block must exceed
-/// (median-time-past, the consensus lower bound on timestamps).
-pub const MEDIAN_TIME_SPAN: usize = 11;
 
 /// A block timestamp may not be more than this many seconds ahead of the
 /// receiving node's clock. This is a local admission rule, not consensus: a
 /// block briefly in the future is accepted once the clock catches up, so it is
 /// enforced on receipt, never during deterministic validation or replay.
 pub const MAX_FUTURE_DRIFT: u64 = 2 * 60 * 60;
-
-/// The easiest allowed target, and the genesis / starting target. Difficulty
-/// retargets harder than this as needed but never easier. Under `cfg(test)` it
-/// is very easy (top 16 bits zero) so tests mine instantly; otherwise it is the
-/// easy starting point (top 20 bits zero) from which the chain hardens toward
-/// `TARGET_BLOCK_TIME`.
-#[cfg(not(test))]
-pub const POW_LIMIT: [u8; 32] = [
-    0x00, 0x00, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-];
-
-/// Easy target for tests (see the `cfg(not(test))` constant above).
-#[cfg(test)]
-pub const POW_LIMIT: [u8; 32] = [
-    0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-];
 
 /// A block header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,11 +104,15 @@ pub struct Block {
 /// Why a block is invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockError {
+    /// `header.version` is not a version this node implements.
+    BadVersion,
     BadHeight,
     BadParentHash,
     WrongTarget,
     PowNotMet,
     BadBody,
+    /// The coinbase has a nonzero sender, fee, nonce, or signature.
+    BadCoinbase,
     BadTransactionsHash,
     BadStateRoot,
     CoinbaseTooLarge,
@@ -188,11 +125,13 @@ pub enum BlockError {
 impl std::fmt::Display for BlockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            BlockError::BadVersion => write!(f, "unknown block version"),
             BlockError::BadHeight => write!(f, "height is not parent height + 1"),
             BlockError::BadParentHash => write!(f, "previous_block_hash does not match parent"),
             BlockError::WrongTarget => write!(f, "target does not match consensus"),
             BlockError::PowNotMet => write!(f, "block hash does not meet the target"),
             BlockError::BadBody => write!(f, "body is not a coinbase plus at most one normal tx"),
+            BlockError::BadCoinbase => write!(f, "coinbase is not in canonical form"),
             BlockError::BadTransactionsHash => write!(f, "transactions_hash mismatch"),
             BlockError::BadStateRoot => write!(f, "state_root mismatch"),
             BlockError::CoinbaseTooLarge => write!(f, "coinbase exceeds reward plus fees"),
@@ -208,9 +147,10 @@ impl std::fmt::Display for BlockError {
 impl std::error::Error for BlockError {}
 
 impl Block {
-    /// The fixed genesis block. All nodes trust the same genesis; it is not
-    /// proof-of-work validated. Height 0, empty body, empty state.
-    pub fn genesis() -> Block {
+    /// The genesis block of a parameter set. All nodes on one network trust the
+    /// same genesis; it is not proof-of-work validated. Height 0, empty body,
+    /// empty state.
+    pub fn genesis(params: &Params) -> Block {
         let transactions: Vec<Transaction> = Vec::new();
         let header = BlockHeader {
             version: BLOCK_VERSION,
@@ -218,8 +158,8 @@ impl Block {
             previous_block_hash: *GENESIS_MARKER,
             transactions_hash: transactions_hash(&transactions),
             state_root: State::new().state_root(),
-            timestamp: GENESIS_TIMESTAMP,
-            target: POW_LIMIT,
+            timestamp: params.genesis_timestamp,
+            target: params.pow_limit,
             nonce: 0,
         };
         Block {
@@ -273,32 +213,45 @@ impl Block {
         if !first.is_coinbase() {
             return Err(BlockError::BadBody);
         }
+        if !first.is_canonical_coinbase() {
+            return Err(BlockError::BadCoinbase);
+        }
         let rest = &self.transactions[1..];
-        if rest.len() > 1 || rest.iter().any(|t| t.is_coinbase()) {
+        // Every other transaction must be a known, normal type: an unknown type
+        // is rejected, never treated as a transfer.
+        if rest.len() > 1 || rest.iter().any(|t| !t.is_normal()) {
             return Err(BlockError::BadBody);
         }
         Ok((first, rest))
     }
 
-    /// Validate this block against its parent header and the parent's state, and
-    /// return the resulting state. The normal transactions are applied first,
-    /// then the coinbase, so a miner cannot spend the reward within the same
-    /// block.
+    /// Validate this block against its parent header, the parent's state, and
+    /// the consensus context for a child of that parent (see
+    /// `Chain::context_for_child`), and return the resulting state. This is the
+    /// whole deterministic rule set: version, height, parent link, target,
+    /// minimum timestamp, proof of work, body shape, signatures, reward, and
+    /// state root. The normal transactions are applied first, then the
+    /// coinbase, so a miner cannot spend the reward within the same block.
     pub fn validate_and_apply(
         &self,
         parent: &BlockHeader,
         parent_state: &State,
-        reward: u64,
-        expected_target: &[u8; 32],
+        ctx: &BlockContext,
     ) -> Result<State, BlockError> {
-        if self.header.height != parent.height + 1 {
+        if self.header.version != BLOCK_VERSION {
+            return Err(BlockError::BadVersion);
+        }
+        if self.header.height != parent.height + 1 || self.header.height != ctx.height {
             return Err(BlockError::BadHeight);
         }
         if self.header.previous_block_hash != parent.block_hash() {
             return Err(BlockError::BadParentHash);
         }
-        if &self.header.target != expected_target {
+        if self.header.target != ctx.target {
             return Err(BlockError::WrongTarget);
+        }
+        if self.header.timestamp < ctx.min_timestamp {
+            return Err(BlockError::TimestampTooOld);
         }
         if !self.header.meets_target() {
             return Err(BlockError::PowNotMet);
@@ -317,7 +270,7 @@ impl Block {
                 return Err(BlockError::BadSignature);
             }
         }
-        let max_coinbase = reward.checked_add(fees).ok_or(BlockError::CoinbaseTooLarge)?;
+        let max_coinbase = ctx.reward.checked_add(fees).ok_or(BlockError::CoinbaseTooLarge)?;
         if coinbase.amount > max_coinbase {
             return Err(BlockError::CoinbaseTooLarge);
         }
@@ -420,8 +373,28 @@ pub fn build_and_mine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consensus::REGTEST;
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
+
+    /// Validate `block` with a context built from explicit values: height
+    /// parent + 1, the given reward and target, and no timestamp floor. Lets
+    /// each test vary one input; the real context comes from `Chain`.
+    fn validate_with(
+        block: &Block,
+        parent: &BlockHeader,
+        state: &State,
+        reward: u64,
+        target: &[u8; 32],
+    ) -> Result<State, BlockError> {
+        let ctx = BlockContext {
+            height: parent.height + 1,
+            reward,
+            target: *target,
+            min_timestamp: 0,
+        };
+        block.validate_and_apply(parent, state, &ctx)
+    }
 
     #[test]
     fn genesis_marker_is_32_bytes() {
@@ -430,16 +403,16 @@ mod tests {
 
     #[test]
     fn header_round_trips() {
-        let h = Block::genesis().header;
+        let h = Block::genesis(&REGTEST).header;
         assert_eq!(BlockHeader::from_bytes(&h.serialize()), Some(h));
     }
 
     #[test]
     fn block_round_trips() {
-        let genesis = Block::genesis();
+        let genesis = Block::genesis(&REGTEST);
         let state = State::new();
         let (block, _) =
-            build_and_mine(&genesis.header, &state, INITIAL_REWARD, [3u8; 32], None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &state, REGTEST.initial_reward, [3u8; 32], None, REGTEST.pow_limit, 1)
                 .unwrap();
         let decoded = Block::from_bytes(&block.serialize()).unwrap();
         assert_eq!(decoded.header, block.header);
@@ -448,31 +421,30 @@ mod tests {
 
     #[test]
     fn mined_block_validates_and_pays_the_miner() {
-        let genesis = Block::genesis();
+        let genesis = Block::genesis(&REGTEST);
         let state = State::new();
         let miner = [7u8; 32];
         let (block, new_state) =
-            build_and_mine(&genesis.header, &state, INITIAL_REWARD, miner, None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &state, REGTEST.initial_reward, miner, None, REGTEST.pow_limit, 1)
                 .unwrap();
 
         assert!(block.header.meets_target());
-        let applied = block
-            .validate_and_apply(&genesis.header, &state, INITIAL_REWARD, &POW_LIMIT)
+        let applied = validate_with(&block, &genesis.header, &state, REGTEST.initial_reward, &REGTEST.pow_limit)
             .unwrap();
-        assert_eq!(applied.balance(&miner), INITIAL_REWARD);
-        assert_eq!(new_state.balance(&miner), INITIAL_REWARD);
+        assert_eq!(applied.balance(&miner), REGTEST.initial_reward);
+        assert_eq!(new_state.balance(&miner), REGTEST.initial_reward);
     }
 
     #[test]
     fn block_with_a_transfer_validates() {
         // Block 1 mints to a sender; block 2 includes a transfer from them.
-        let genesis = Block::genesis();
+        let genesis = Block::genesis(&REGTEST);
         let s0 = State::new();
         let key = SigningKey::generate(&mut OsRng);
         let sender = key.verifying_key().to_bytes();
 
         let (b1, s1) =
-            build_and_mine(&genesis.header, &s0, INITIAL_REWARD, sender, None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &s0, REGTEST.initial_reward, sender, None, REGTEST.pow_limit, 1)
                 .unwrap();
 
         let mut tx = Transaction {
@@ -489,46 +461,45 @@ mod tests {
         let (b2, s2) = build_and_mine(
             &b1.header,
             &s1,
-            INITIAL_REWARD,
+            REGTEST.initial_reward,
             [8u8; 32],
             Some(tx),
-            POW_LIMIT,
+            REGTEST.pow_limit,
             2,
         )
         .unwrap();
 
-        b2.validate_and_apply(&b1.header, &s1, INITIAL_REWARD, &POW_LIMIT)
+        validate_with(&b2, &b1.header, &s1, REGTEST.initial_reward, &REGTEST.pow_limit)
             .unwrap();
         assert_eq!(s2.balance(&[9u8; 32]), 10);
         // Miner of block 2 gets reward + fee.
-        assert_eq!(s2.balance(&[8u8; 32]), INITIAL_REWARD + 2);
+        assert_eq!(s2.balance(&[8u8; 32]), REGTEST.initial_reward + 2);
         // Sender spent amount + fee.
-        assert_eq!(s2.balance(&sender), INITIAL_REWARD - 12);
+        assert_eq!(s2.balance(&sender), REGTEST.initial_reward - 12);
     }
 
     #[test]
     fn tampered_state_root_is_rejected() {
-        let genesis = Block::genesis();
+        let genesis = Block::genesis(&REGTEST);
         let state = State::new();
         let (mut block, _) =
-            build_and_mine(&genesis.header, &state, INITIAL_REWARD, [1u8; 32], None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &state, REGTEST.initial_reward, [1u8; 32], None, REGTEST.pow_limit, 1)
                 .unwrap();
         block.header.state_root = [0u8; 32];
         // Re-mine so the PoW still holds on the tampered header.
         while !block.header.meets_target() {
             block.header.nonce = block.header.nonce.wrapping_add(1);
         }
-        let err = block
-            .validate_and_apply(&genesis.header, &state, INITIAL_REWARD, &POW_LIMIT)
+        let err = validate_with(&block, &genesis.header, &state, REGTEST.initial_reward, &REGTEST.pow_limit)
             .unwrap_err();
         assert_eq!(err, BlockError::BadStateRoot);
     }
 
     #[test]
     fn oversized_coinbase_is_rejected() {
-        let genesis = Block::genesis();
+        let genesis = Block::genesis(&REGTEST);
         let state = State::new();
-        let coinbase = Transaction::coinbase([1u8; 32], INITIAL_REWARD + 1);
+        let coinbase = Transaction::coinbase([1u8; 32], REGTEST.initial_reward + 1);
         let transactions = vec![coinbase];
         let mut applied = state.clone();
         applied.apply(&transactions[0]).unwrap();
@@ -539,15 +510,14 @@ mod tests {
             transactions_hash: transactions_hash(&transactions),
             state_root: applied.state_root(),
             timestamp: 1,
-            target: POW_LIMIT,
+            target: REGTEST.pow_limit,
             nonce: 0,
         };
         while header.block_hash() >= header.target {
             header.nonce += 1;
         }
         let block = Block { header, transactions };
-        let err = block
-            .validate_and_apply(&genesis.header, &state, INITIAL_REWARD, &POW_LIMIT)
+        let err = validate_with(&block, &genesis.header, &state, REGTEST.initial_reward, &REGTEST.pow_limit)
             .unwrap_err();
         assert_eq!(err, BlockError::CoinbaseTooLarge);
     }
@@ -555,60 +525,56 @@ mod tests {
     // --- Reward schedule (halving). ---
 
     #[test]
-    fn reward_halves_every_interval() {
-        assert_eq!(INITIAL_REWARD, 50 * COIN);
-        assert_eq!(block_reward(1), INITIAL_REWARD);
-        assert_eq!(block_reward(HALVING_INTERVAL - 1), INITIAL_REWARD);
-        assert_eq!(block_reward(HALVING_INTERVAL), INITIAL_REWARD / 2);
-        assert_eq!(block_reward(2 * HALVING_INTERVAL - 1), INITIAL_REWARD / 2);
-        assert_eq!(block_reward(2 * HALVING_INTERVAL), INITIAL_REWARD / 4);
-        // 50 JEF = 5e9 base units: the 32nd halving is the last nonzero reward.
-        assert_eq!(block_reward(32 * HALVING_INTERVAL), 1);
-        assert_eq!(block_reward(33 * HALVING_INTERVAL), 0);
-        // No shift overflow at extreme heights.
-        assert_eq!(block_reward(64 * HALVING_INTERVAL), 0);
-        assert_eq!(block_reward(u64::MAX), 0);
-    }
-
-    #[test]
-    fn total_supply_is_bounded() {
-        // Height 0 is genesis (no coinbase), so start at height 1.
-        let mut supply: u64 = 0;
-        for era in 0..64 {
-            let first = (era * HALVING_INTERVAL).max(1);
-            let blocks = (era + 1) * HALVING_INTERVAL - first;
-            supply += blocks * block_reward(era * HALVING_INTERVAL);
-        }
-        assert!(supply < 3_200_000 * COIN);
-        assert!(supply > 3_199_000 * COIN);
+    fn timestamp_below_the_context_minimum_is_rejected() {
+        let genesis = Block::genesis(&REGTEST);
+        let state = State::new();
+        let (block, _) = build_and_mine(
+            &genesis.header,
+            &state,
+            REGTEST.initial_reward,
+            [1u8; 32],
+            None,
+            REGTEST.pow_limit,
+            50,
+        )
+        .unwrap();
+        let ctx = |min_timestamp| BlockContext {
+            height: 1,
+            reward: REGTEST.initial_reward,
+            target: REGTEST.pow_limit,
+            min_timestamp,
+        };
+        assert!(block.validate_and_apply(&genesis.header, &state, &ctx(50)).is_ok());
+        assert_eq!(
+            block.validate_and_apply(&genesis.header, &state, &ctx(51)).unwrap_err(),
+            BlockError::TimestampTooOld
+        );
     }
 
     #[test]
     fn coinbase_is_capped_by_the_halved_reward() {
         // A parent one block before the first halving, so the child is the
         // first block of the halved era.
-        let mut parent = Block::genesis().header;
-        parent.height = HALVING_INTERVAL - 1;
+        let mut parent = Block::genesis(&REGTEST).header;
+        parent.height = REGTEST.halving_interval - 1;
         let state = State::new();
-        let halved = block_reward(HALVING_INTERVAL);
+        let halved = REGTEST.block_reward(REGTEST.halving_interval);
 
         // Claiming the old reward is rejected.
         let (greedy, _) =
-            build_and_mine(&parent, &state, INITIAL_REWARD, [1u8; 32], None, POW_LIMIT, 1)
+            build_and_mine(&parent, &state, REGTEST.initial_reward, [1u8; 32], None, REGTEST.pow_limit, 1)
                 .unwrap();
-        assert_eq!(greedy.header.height, HALVING_INTERVAL);
-        let err = greedy
-            .validate_and_apply(&parent, &state, halved, &POW_LIMIT)
+        assert_eq!(greedy.header.height, REGTEST.halving_interval);
+        let err = validate_with(&greedy, &parent, &state, halved, &REGTEST.pow_limit)
             .unwrap_err();
         assert_eq!(err, BlockError::CoinbaseTooLarge);
 
         // Claiming the halved reward is accepted and pays exactly that.
         let (honest, _) =
-            build_and_mine(&parent, &state, halved, [2u8; 32], None, POW_LIMIT, 1).unwrap();
-        let applied = honest
-            .validate_and_apply(&parent, &state, halved, &POW_LIMIT)
+            build_and_mine(&parent, &state, halved, [2u8; 32], None, REGTEST.pow_limit, 1).unwrap();
+        let applied = validate_with(&honest, &parent, &state, halved, &REGTEST.pow_limit)
             .unwrap();
-        assert_eq!(applied.balance(&[2u8; 32]), INITIAL_REWARD / 2);
+        assert_eq!(applied.balance(&[2u8; 32]), REGTEST.initial_reward / 2);
     }
 
     // --- Adversarial battery: each malformed block must be rejected. ---
@@ -621,50 +587,47 @@ mod tests {
 
     #[test]
     fn unmined_block_is_rejected() {
-        let genesis = Block::genesis();
+        let genesis = Block::genesis(&REGTEST);
         let (mut block, _) =
-            build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, [7u8; 32], None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &State::new(), REGTEST.initial_reward, [7u8; 32], None, REGTEST.pow_limit, 1)
                 .unwrap();
         // Break the proof of work.
         while block.header.meets_target() {
             block.header.nonce = block.header.nonce.wrapping_add(1);
         }
-        let err = block
-            .validate_and_apply(&genesis.header, &State::new(), INITIAL_REWARD, &POW_LIMIT)
+        let err = validate_with(&block, &genesis.header, &State::new(), REGTEST.initial_reward, &REGTEST.pow_limit)
             .unwrap_err();
         assert_eq!(err, BlockError::PowNotMet);
     }
 
     #[test]
     fn wrong_target_is_rejected() {
-        let genesis = Block::genesis();
+        let genesis = Block::genesis(&REGTEST);
         let (mut block, _) =
-            build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, [7u8; 32], None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &State::new(), REGTEST.initial_reward, [7u8; 32], None, REGTEST.pow_limit, 1)
                 .unwrap();
         block.header.target = [0xff; 32]; // claim a trivial target
-        let err = block
-            .validate_and_apply(&genesis.header, &State::new(), INITIAL_REWARD, &POW_LIMIT)
+        let err = validate_with(&block, &genesis.header, &State::new(), REGTEST.initial_reward, &REGTEST.pow_limit)
             .unwrap_err();
         assert_eq!(err, BlockError::WrongTarget);
     }
 
     #[test]
     fn bad_transactions_hash_is_rejected() {
-        let genesis = Block::genesis();
+        let genesis = Block::genesis(&REGTEST);
         let (mut block, _) =
-            build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, [7u8; 32], None, POW_LIMIT, 1)
+            build_and_mine(&genesis.header, &State::new(), REGTEST.initial_reward, [7u8; 32], None, REGTEST.pow_limit, 1)
                 .unwrap();
         block.header.transactions_hash = [0u8; 32];
         mine_header(&mut block.header);
-        let err = block
-            .validate_and_apply(&genesis.header, &State::new(), INITIAL_REWARD, &POW_LIMIT)
+        let err = validate_with(&block, &genesis.header, &State::new(), REGTEST.initial_reward, &REGTEST.pow_limit)
             .unwrap_err();
         assert_eq!(err, BlockError::BadTransactionsHash);
     }
 
     #[test]
     fn body_without_a_coinbase_is_rejected() {
-        let genesis = Block::genesis();
+        let genesis = Block::genesis(&REGTEST);
         let normal = Transaction {
             tx_type: crate::tx_type::NORMAL,
             sender: [1u8; 32],
@@ -682,22 +645,106 @@ mod tests {
             transactions_hash: transactions_hash(&transactions),
             state_root: State::new().state_root(),
             timestamp: 1,
-            target: POW_LIMIT,
+            target: REGTEST.pow_limit,
             nonce: 0,
         };
         mine_header(&mut header);
         let block = Block { header, transactions };
-        let err = block
-            .validate_and_apply(&genesis.header, &State::new(), INITIAL_REWARD, &POW_LIMIT)
+        let err = validate_with(&block, &genesis.header, &State::new(), REGTEST.initial_reward, &REGTEST.pow_limit)
             .unwrap_err();
         assert_eq!(err, BlockError::BadBody);
     }
 
+    /// Mine a height-1 block on genesis with exactly these transactions and this
+    /// version. The state root is computed by applying the body as `apply` would,
+    /// so the only defect is the one under test.
+    fn block_on_genesis(transactions: Vec<Transaction>, version: u32) -> Block {
+        let genesis = Block::genesis(&REGTEST);
+        let mut state = State::new();
+        for tx in &transactions {
+            let _ = state.apply(tx);
+        }
+        let mut header = BlockHeader {
+            version,
+            height: 1,
+            previous_block_hash: genesis.header.block_hash(),
+            transactions_hash: transactions_hash(&transactions),
+            state_root: state.state_root(),
+            timestamp: 1,
+            target: REGTEST.pow_limit,
+            nonce: 0,
+        };
+        mine_header(&mut header);
+        Block { header, transactions }
+    }
+
+    fn validate_on_genesis(block: &Block) -> Result<State, BlockError> {
+        validate_with(&block, &Block::genesis(&REGTEST).header, &State::new(), REGTEST.initial_reward, &REGTEST.pow_limit)
+    }
+
+    #[test]
+    fn unknown_block_version_is_rejected() {
+        let coinbase = Transaction::coinbase([1u8; 32], REGTEST.initial_reward);
+        let block = block_on_genesis(vec![coinbase.clone()], BLOCK_VERSION + 1);
+        assert_eq!(validate_on_genesis(&block).unwrap_err(), BlockError::BadVersion);
+        // Control: the same body at the current version is valid.
+        let block = block_on_genesis(vec![coinbase], BLOCK_VERSION);
+        assert!(validate_on_genesis(&block).is_ok());
+    }
+
+    #[test]
+    fn non_canonical_coinbase_is_rejected() {
+        // Each variant sets one ignored coinbase field to a nonzero value.
+        let mut variants = Vec::new();
+        let mut cb = Transaction::coinbase([1u8; 32], REGTEST.initial_reward);
+        cb.sender = [5u8; 32];
+        variants.push(cb);
+        let mut cb = Transaction::coinbase([1u8; 32], REGTEST.initial_reward);
+        cb.fee = 1;
+        variants.push(cb);
+        let mut cb = Transaction::coinbase([1u8; 32], REGTEST.initial_reward);
+        cb.nonce = 7;
+        variants.push(cb);
+        let mut cb = Transaction::coinbase([1u8; 32], REGTEST.initial_reward);
+        cb.signature = [9u8; 64];
+        variants.push(cb);
+        for cb in variants {
+            let block = block_on_genesis(vec![cb], BLOCK_VERSION);
+            assert_eq!(validate_on_genesis(&block).unwrap_err(), BlockError::BadCoinbase);
+        }
+    }
+
+    #[test]
+    fn unknown_transaction_type_in_body_is_rejected() {
+        let coinbase = Transaction::coinbase([1u8; 32], REGTEST.initial_reward);
+        let unknown = Transaction {
+            tx_type: 7,
+            sender: [1u8; 32],
+            recipient: [2u8; 32],
+            amount: 1,
+            fee: 0,
+            nonce: 0,
+            signature: [0u8; 64],
+        };
+        let block = block_on_genesis(vec![coinbase, unknown], BLOCK_VERSION);
+        assert_eq!(validate_on_genesis(&block).unwrap_err(), BlockError::BadBody);
+    }
+
+    #[test]
+    fn unknown_transaction_type_does_not_decode() {
+        let mut bytes = Transaction::coinbase([1u8; 32], 5).serialize_to_bytes();
+        assert!(Transaction::from_bytes(&bytes).is_some());
+        bytes[0] = 2;
+        assert!(Transaction::from_bytes(&bytes).is_none());
+        bytes[0] = 255;
+        assert!(Transaction::from_bytes(&bytes).is_none());
+    }
+
     #[test]
     fn bad_signature_in_block_is_rejected() {
-        let genesis = Block::genesis();
+        let genesis = Block::genesis(&REGTEST);
         let key = SigningKey::generate(&mut OsRng);
-        let coinbase = Transaction::coinbase([7u8; 32], INITIAL_REWARD);
+        let coinbase = Transaction::coinbase([7u8; 32], REGTEST.initial_reward);
         let normal = Transaction {
             tx_type: crate::tx_type::NORMAL,
             sender: key.verifying_key().to_bytes(),
@@ -715,22 +762,21 @@ mod tests {
             transactions_hash: transactions_hash(&transactions),
             state_root: State::new().state_root(),
             timestamp: 1,
-            target: POW_LIMIT,
+            target: REGTEST.pow_limit,
             nonce: 0,
         };
         mine_header(&mut header);
         let block = Block { header, transactions };
-        let err = block
-            .validate_and_apply(&genesis.header, &State::new(), INITIAL_REWARD, &POW_LIMIT)
+        let err = validate_with(&block, &genesis.header, &State::new(), REGTEST.initial_reward, &REGTEST.pow_limit)
             .unwrap_err();
         assert_eq!(err, BlockError::BadSignature);
     }
 
     #[test]
     fn overspend_in_block_is_rejected() {
-        let genesis = Block::genesis();
+        let genesis = Block::genesis(&REGTEST);
         let key = SigningKey::generate(&mut OsRng);
-        let coinbase = Transaction::coinbase([7u8; 32], INITIAL_REWARD);
+        let coinbase = Transaction::coinbase([7u8; 32], REGTEST.initial_reward);
         let mut normal = Transaction {
             tx_type: crate::tx_type::NORMAL,
             sender: key.verifying_key().to_bytes(),
@@ -749,13 +795,12 @@ mod tests {
             transactions_hash: transactions_hash(&transactions),
             state_root: State::new().state_root(),
             timestamp: 1,
-            target: POW_LIMIT,
+            target: REGTEST.pow_limit,
             nonce: 0,
         };
         mine_header(&mut header);
         let block = Block { header, transactions };
-        let err = block
-            .validate_and_apply(&genesis.header, &State::new(), INITIAL_REWARD, &POW_LIMIT)
+        let err = validate_with(&block, &genesis.header, &State::new(), REGTEST.initial_reward, &REGTEST.pow_limit)
             .unwrap_err();
         assert!(matches!(err, BlockError::Apply(_)));
     }

@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 pub mod amount;
 pub mod block;
 pub mod chain;
+pub mod consensus;
+pub mod mempool;
 pub mod node;
 pub mod p2p;
 pub mod state;
@@ -79,6 +81,29 @@ impl Transaction {
         self.tx_type == tx_type::COINBASE
     }
 
+    /// True if this is a normal (signed) transfer.
+    pub fn is_normal(&self) -> bool {
+        self.tx_type == tx_type::NORMAL
+    }
+
+    /// True if `tx_type` is a known type code. Unknown types must be rejected,
+    /// never read as a known type: otherwise adding a type later is a silent
+    /// hard fork, because old nodes would accept it under the old meaning.
+    pub fn is_known_type(&self) -> bool {
+        self.is_normal() || self.is_coinbase()
+    }
+
+    /// True if a coinbase is in canonical form: the fields it does not use
+    /// (sender, fee, nonce, signature) are all zero. This stops two blocks from
+    /// differing only in ignored coinbase bytes.
+    pub fn is_canonical_coinbase(&self) -> bool {
+        self.is_coinbase()
+            && self.sender == [0u8; 32]
+            && self.fee == 0
+            && self.nonce == 0
+            && self.signature == [0u8; 64]
+    }
+
     /// Full canonical byte serialization, including the signature.
     pub fn serialize_to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(Self::SERIALIZED_LEN);
@@ -88,9 +113,13 @@ impl Transaction {
     }
 
     /// Parse a transaction from its canonical serialization. Returns `None` if
-    /// the slice is not exactly `SERIALIZED_LEN` bytes.
+    /// the slice is not exactly `SERIALIZED_LEN` bytes or the type code is
+    /// unknown.
     pub fn from_bytes(bytes: &[u8]) -> Option<Transaction> {
         if bytes.len() != Self::SERIALIZED_LEN {
+            return None;
+        }
+        if bytes[0] != tx_type::NORMAL && bytes[0] != tx_type::COINBASE {
             return None;
         }
         Some(Transaction {

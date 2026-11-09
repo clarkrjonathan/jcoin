@@ -7,7 +7,7 @@ vault at `Chudjacknostim-Reorganized/Projects/JeffyCoin/`.
 ## Status at a glance
 
 - Branch: `initial-vertical`. **Nothing is pushed to GitHub** — all local.
-- Build: `cd jcoin && cargo build` is clean. `cargo test --lib` = **58 passing**.
+- Build: `cd jcoin && cargo build` is clean. `cargo test --lib` = **79 passing**.
 - The working tree shows modifications under `spike/` — those predate this work
   and are not part of it. `spike/` is frozen scratchwork; ignore it.
 
@@ -29,17 +29,17 @@ propagates, and balances settle consistently on a node that never saw the wallet
   one transfer; PoW `SHA256(header) < target`; genesis with the marker
   "I am 20 years old, I love Jeffy!"; mining (`assemble_block` + `mine_chunk`,
   interruptible); full `validate_and_apply`.
-- **Amounts + reward halving** (`src/amount.rs`, `block_reward` in
-  `src/block.rs`): amounts are `u64` base units, 1 JEF = 100,000,000. The block
+- **Amounts + reward halving** (`src/amount.rs`, `Params::block_reward` in
+  `src/consensus.rs`): amounts are `u64` base units, 1 JEF = 100,000,000. The block
   subsidy is 50 JEF at height 1 and halves every 32,000 blocks (about 111 days);
-  `chain.accept` passes `block_reward(height)` to validation, so a coinbase that
+  `Chain::context_for_child` supplies the reward to validation, so a coinbase that
   claims a pre-halving reward is rejected. Supply caps just under 3,200,000 JEF; the
   reward reaches 0 at about 10 years, but ~89% is minted in year 1.
   The wallet parses decimal JEF (`12.5`, max 8 decimal places).
 - **Difficulty + timestamps**: epoch-based retarget toward `TARGET_BLOCK_TIME`
   (300 s). Difficulty is constant within a `RETARGET_WINDOW` (12) epoch,
   recomputed only at a boundary from that epoch's span, clamped to 4x/step, never
-  easier than `POW_LIMIT`. Median-time-past (last 11) is a consensus lower bound
+  easier than `pow_limit`. Median-time-past (last 11) is a consensus lower bound
   on timestamps (in `chain.accept`); a 2-hour future bound is a local admission
   rule in the node core (never in deterministic validation, so replay is stable).
 - **Chain + fork choice** (`src/chain.rs`): hash-keyed block store; each block
@@ -66,12 +66,16 @@ propagates, and balances settle consistently on a node that never saw the wallet
 
 ### Tests
 
-`cargo test --lib` (49). Highlights: frame/message/addr/relay round-trips;
+`cargo test --lib` (79). Highlights: frame/message/addr/relay round-trips;
 handshake + self-connection; gossip (direct and through the relay); late-joiner
 sync; work-based reorg; retarget hardening/cap; median-time-past rejection; an
 adversarial block battery (bad PoW, wrong target, bad tx hash, bad body, bad
-signature, overspend). Tests use `cfg(test)` easy targets and a zero genesis
-timestamp so they mine in milliseconds.
+signature, overspend, unknown version or type, non-canonical coinbase); the
+mempool (conflicts, cap, re-admission); torn block-log repair; address-book and
+dial caps; relay eviction of a slow receiver; the halving enforced by
+`chain.accept` across a real boundary. Tests run the real code with the
+`REGTEST` parameter set (easy PoW, zero genesis timestamp), so they mine in
+milliseconds.
 
 There is also `src/bin/attack.rs`, a dev tool that connects over P2P and sends
 one crafted-bad message (used to confirm live rejection), and `src/bin/hashbench.rs`,
@@ -117,13 +121,15 @@ See `KNOWN-ISSUES.md` for the full list with severities, including the
 security-relevant vulnerabilities (unbounded fork storage, no peer banning,
 time-warp, no finality). Summary:
 
-- **Reorg mempool re-add**: transactions dropped by a reorg are not re-queued.
+- **Reorg mempool re-add**: transactions dropped by a reorg are not re-queued
+  automatically. Resubmitting one now works (the mempool, not the seen cache,
+  decides admission).
 - **Relay**: one TCP connection per node multiplexes all channels, so a stalled
   channel head-of-line-blocks the rest; handle rotation is not implemented.
 - **No misbehaviour scoring/banning** (the notes mention a blacklist).
 - No block/consensus-version signaling.
 - **Persistence** stores blocks only and never compacts the log.
-- `POW_LIMIT` is machine/build-specific (calibrated from a debug-build hash rate).
+- `MAINNET.pow_limit` is machine/build-specific (calibrated from a debug-build hash rate).
 
 ## Gotchas discovered this session (save yourself the time)
 
@@ -139,8 +145,12 @@ time-warp, no finality). Summary:
   deterministic test instead.
 - **Port reuse on restart.** A killed node leaves the port in TIME_WAIT briefly;
   a quick restart can fail to bind. Wait a couple of seconds between stop/start.
-- `cfg(test)` overrides `POW_LIMIT` (easy) and `GENESIS_TIMESTAMP` (0) so the
-  suite stays fast; the real values are in the `cfg(not(test))` arms.
+- Consensus values live in `consensus::Params`. Tests use `REGTEST` (or a
+  modified copy, for example a 4-block halving interval); the real network is
+  `MAINNET`. Regtest and mainnet have different genesis blocks, so their nodes
+  reject each other's blocks.
+- **Do not run `cargo fmt`.** The repo is not rustfmt-formatted; it rewrites
+  hundreds of unrelated lines.
 
 ## Suggested next steps
 

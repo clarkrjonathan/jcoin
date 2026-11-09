@@ -32,10 +32,22 @@ not in this repo:
   - `src/lib.rs` — core `Transaction` (type-tagged, fixed-width, Ed25519
     signing + verification, SHA-256 tx id, coinbase constructor).
   - `src/state.rs` — account state table (balance + nonce) and `state_root`.
+  - `src/consensus.rs` — `Params` (every consensus value as data: `MAINNET`,
+    `REGTEST`), `block_reward`, and `BlockContext` (what the next block must
+    satisfy). There are no `cfg(test)` consensus constants; tests use `REGTEST`.
   - `src/block.rs` — header, block, PoW, genesis, mining, validation.
-  - `src/chain.rs` — block store and canonical-chain selection by cumulative work.
+    `validate_and_apply` takes a `BlockContext` and is the whole deterministic
+    rule set.
+  - `src/chain.rs` — block store and canonical-chain selection by cumulative
+    work. `context_for_child` is the one place the next block's height,
+    reward, target, and minimum timestamp are derived.
+  - `src/mempool.rs` — the mempool (indexed by id and by sender + nonce,
+    capped, rejects same-nonce conflicts) and a bounded seen-id cache that
+    only answers status queries.
+  - `src/amount.rs` — base unit (`COIN`) and decimal JEF parse/format.
+  - `src/store.rs` — append-only block log; a torn tail is cut on startup.
   - `src/node.rs` — node core: the `NodeRequest` set and the `run_node` task
-    owning the chain, mempool, and seen set.
+    owning the chain, mempool, and seen cache.
   - `src/p2p/` — peer-to-peer layer: `frame` (JEFY codec), `message` (gossip-v1
     messages), `addr` (Endpoint/handle encoding), `link` (the `PeerLink` seam),
     `peer` (handshake, run loop, `run_peer`), `network` (peer registry, address
@@ -77,20 +89,21 @@ Starting from the initial vertical (wallet → REST → node core over an
 - **State** (`src/state.rs`): account balances + nonce, canonical `state_root`.
 - **Blocks** (`src/block.rs`): 156-byte header, coinbase + ≤1 transfer, PoW
   `SHA256(header) < target`, genesis, mining, validation.
-- **Amounts + reward** (`src/amount.rs`, `block_reward` in `src/block.rs`): all
-  amounts are `u64` base units; 1 JEF = `COIN` = 100,000,000. The wallet takes
-  decimal JEF on the command line. The coinbase may claim
-  `block_reward(height) + fees`, where `block_reward = INITIAL_REWARD (50 JEF)
-  >> (height / HALVING_INTERVAL)` and `HALVING_INTERVAL` = 32,000 blocks (about
-  111 days at 5-minute blocks). The subsidy reaches 0 after 33 halvings (about
+- **Amounts + reward** (`src/amount.rs`, `Params::block_reward` in
+  `src/consensus.rs`): all amounts are `u64` base units; 1 JEF = `COIN` =
+  100,000,000. The wallet takes decimal JEF on the command line. The coinbase
+  may claim `block_reward(height) + fees`, where `block_reward = initial_reward
+  (50 JEF) >> (height / halving_interval)` and `halving_interval` = 32,000
+  blocks on `MAINNET` (about 111 days at 5-minute blocks; `REGTEST` uses 150). The subsidy reaches 0 after 33 halvings (about
   10 years); total supply is just under 3,200,000 JEF, about 89% of it minted
   in year 1.
-- **Difficulty + timestamps**: epoch-based retarget toward `TARGET_BLOCK_TIME`
-  (5 min). Difficulty is constant within a `RETARGET_WINDOW`-block epoch and
+- **Difficulty + timestamps**: epoch-based retarget toward `target_block_time`
+  (5 min). Difficulty is constant within a `retarget_window`-block epoch and
   recomputed only at a boundary from the completed epoch's span, clamped to
-  4x/step, never easier than `POW_LIMIT` (the easy start/cap). Adjusting only
+  4x/step, never easier than `pow_limit` (the easy start/cap). Adjusting only
   after a full epoch converges without overshoot. Median-time-past is a consensus
-  lower bound on timestamps (in `chain.accept`); a 2-hour future bound is a local
+  lower bound on timestamps (in `BlockContext::min_timestamp`, checked by
+  `validate_and_apply`; the miner uses it as a floor); a 2-hour future bound is a local
   admission rule (in the node core, not in deterministic validation). Genesis
   carries a realistic timestamp so the first epoch measures a real span.
 - **Chain + fork choice** (`src/chain.rs`): hash-keyed block store, canonical tip
@@ -98,18 +111,26 @@ Starting from the initial vertical (wallet → REST → node core over an
 - **Chain sync**: `NEW_BLOCK` gossip, and `GET_BLOCKS` (block locator) → `BLOCKS`
   for initial download and orphan catch-up.
 - **Node** (`src/bin/node.rs`): full nonce/balance validation on submit (ADR
-  000), `--mine`/`--miner`, `/chain` and real `/balance`; the wallet fetches the
-  nonce and refuses to overspend.
+  000), `--mine`/`--miner`, `--regtest`, `/chain` and real `/balance`; the
+  wallet fetches the nonce and refuses to overspend. Transaction status is
+  `pending`, `seen`, or `unknown`.
+- **Validation hardening**: unknown transaction types and block versions are
+  rejected; the coinbase must be canonical (zero sender, fee, nonce,
+  signature). The address book is capped (1,000, random eviction), one `ADDR`
+  is read up to 256 entries, and in-flight dials count toward `--max-peers`.
+  The relay never drops bytes: a connection that cannot keep up is evicted
+  and its peers get `CLOSE`.
 
 Verified by unit tests and integration tests (direct + relay gossip, late-joiner
 sync, work-based reorg), plus live multi-node runs.
 
 ### Not yet built / open
 
-Reorg mempool re-add (txs dropped by a reorg are not re-queued), relay handle
+Reorg mempool re-add (txs dropped by a reorg are not re-queued automatically;
+resubmitting one now works), relay handle
 rotation and per-channel flow control, block/consensus-version signaling,
 and misbehaviour scoring/banning. Persistence stores blocks only (state is
-replayed) and the log is never compacted. `POW_LIMIT` is machine/build-specific
+replayed) and the log is never compacted. `MAINNET.pow_limit` is machine/build-specific
 (calibrated from a debug-build hash rate).
 
 ## Build and run

@@ -83,24 +83,35 @@ impl State {
             return self.credit(&tx.recipient, tx.amount);
         }
 
+        let debit = self.check(tx)?;
         let sender = self.accounts.entry(tx.sender).or_default();
-        if tx.nonce != sender.nonce {
-            return Err(StateError::BadNonce {
-                expected: sender.nonce,
-                got: tx.nonce,
-            });
-        }
-        let debit = tx.amount.checked_add(tx.fee).ok_or(StateError::Overflow)?;
-        if sender.balance < debit {
-            return Err(StateError::InsufficientBalance {
-                needed: debit,
-                available: sender.balance,
-            });
-        }
         sender.balance -= debit;
         sender.nonce += 1;
 
         self.credit(&tx.recipient, tx.amount)
+    }
+
+    /// Check whether a normal transfer applies to this state, without changing
+    /// it: the nonce is the sender's next nonce and the sender covers
+    /// `amount + fee`. Returns the total debit. This is the single nonce and
+    /// balance rule; `apply`, mempool admission, and mining all use it.
+    pub fn check(&self, tx: &Transaction) -> Result<u64, StateError> {
+        let expected = self.nonce(&tx.sender);
+        if tx.nonce != expected {
+            return Err(StateError::BadNonce {
+                expected,
+                got: tx.nonce,
+            });
+        }
+        let debit = tx.amount.checked_add(tx.fee).ok_or(StateError::Overflow)?;
+        let available = self.balance(&tx.sender);
+        if available < debit {
+            return Err(StateError::InsufficientBalance {
+                needed: debit,
+                available,
+            });
+        }
+        Ok(debit)
     }
 
     /// Canonical serialization: for each account in key order,

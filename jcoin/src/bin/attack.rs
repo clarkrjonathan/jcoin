@@ -1,21 +1,26 @@
 //! Adversarial test tool: connect to a node over P2P, complete the handshake,
 //! and send one crafted message to confirm the node's verification rejects it.
 //!
-//! Usage: attack <node-p2p-addr> <mode>
-//! Modes: badtx-sig | block-badpow | block-badstate | block-badbody |
-//!        block-badtxhash | block-good (a valid control that should be accepted)
+//! Usage: attack <node-p2p-addr> <mode> [--regtest]
+//! Modes: badtx-sig | tx-badnonce | tx-nofunds | block-badpow | block-badstate |
+//!        block-badbody | block-badtxhash | block-good (a valid control that
+//!        should be accepted)
+//!
+//! Crafted blocks sit at height 1 on the genesis of the chosen network
+//! (`--regtest` must match the node). They use that network's real target,
+//! reward, and a current timestamp, so each one fails only the check it is
+//! named for. (Earlier versions used timestamp 1, so on the real network every
+//! block mode failed the median-time-past rule first.)
 
 use std::env;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use tokio::net::TcpStream;
 
-use jcoin::block::{
-    build_and_mine, transactions_hash, Block, BlockHeader, INITIAL_REWARD, BLOCK_VERSION,
-    POW_LIMIT,
-};
+use jcoin::block::{build_and_mine, transactions_hash, Block, BlockHeader, BLOCK_VERSION};
+use jcoin::consensus::{MAINNET, REGTEST};
 use jcoin::p2p::{handshake, local_hello, write_message, Message};
 use jcoin::state::State;
 use jcoin::Transaction;
@@ -45,12 +50,14 @@ fn remine(header: &mut BlockHeader) {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!("usage: attack <node-p2p-addr> <mode>");
+    let regtest = args.len() == 4 && args[3] == "--regtest";
+    if args.len() != 3 && !regtest {
+        eprintln!("usage: attack <node-p2p-addr> <mode> [--regtest]");
         std::process::exit(2);
     }
     let addr = &args[1];
     let mode = &args[2];
+    let params = if regtest { REGTEST } else { MAINNET };
 
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     // A fixed non-zero nonce; it only needs to differ from the node's.
@@ -58,7 +65,15 @@ async fn main() {
         .await
         .expect("handshake");
 
-    let genesis = Block::genesis();
+    let genesis = Block::genesis(&params);
+    // What consensus requires of a height-1 block on this genesis.
+    let reward = params.block_reward(1);
+    let target = params.pow_limit;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let timestamp = now.max(params.genesis_timestamp + 1);
     let message = match mode.as_str() {
         // A transaction with a zeroed (invalid) signature.
         "badtx-sig" => Message::NewTransaction(Transaction {
@@ -87,7 +102,7 @@ async fn main() {
 
         // A structurally valid block that was never mined (hash does not meet target).
         "block-badpow" => {
-            let coinbase = Transaction::coinbase([9u8; 32], INITIAL_REWARD);
+            let coinbase = Transaction::coinbase([9u8; 32], reward);
             let transactions = vec![coinbase];
             let mut state = State::new();
             state.apply(&transactions[0]).unwrap();
@@ -97,8 +112,8 @@ async fn main() {
                 previous_block_hash: genesis.header.block_hash(),
                 transactions_hash: transactions_hash(&transactions),
                 state_root: state.state_root(),
-                timestamp: 1,
-                target: POW_LIMIT,
+                timestamp,
+                target,
                 nonce: 0, // not mined
             };
             Message::NewBlock(Block { header, transactions })
@@ -107,7 +122,7 @@ async fn main() {
         // A mined block with a tampered state_root (re-mined so PoW still holds).
         "block-badstate" => {
             let (mut block, _) =
-                build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, [9u8; 32], None, POW_LIMIT, 1)
+                build_and_mine(&genesis.header, &State::new(), reward, [9u8; 32], None, target, timestamp)
                     .unwrap();
             block.header.state_root = [0u8; 32];
             remine(&mut block.header);
@@ -117,7 +132,7 @@ async fn main() {
         // A mined block with a tampered transactions_hash.
         "block-badtxhash" => {
             let (mut block, _) =
-                build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, [9u8; 32], None, POW_LIMIT, 1)
+                build_and_mine(&genesis.header, &State::new(), reward, [9u8; 32], None, target, timestamp)
                     .unwrap();
             block.header.transactions_hash = [0u8; 32];
             remine(&mut block.header);
@@ -142,8 +157,8 @@ async fn main() {
                 previous_block_hash: genesis.header.block_hash(),
                 transactions_hash: transactions_hash(&transactions),
                 state_root: State::new().state_root(),
-                timestamp: 1,
-                target: POW_LIMIT,
+                timestamp,
+                target,
                 nonce: 0,
             };
             remine(&mut header);
@@ -153,7 +168,7 @@ async fn main() {
         // A valid block on top of genesis: the control, which must be accepted.
         "block-good" => {
             let (block, _) =
-                build_and_mine(&genesis.header, &State::new(), INITIAL_REWARD, [9u8; 32], None, POW_LIMIT, 1)
+                build_and_mine(&genesis.header, &State::new(), reward, [9u8; 32], None, target, timestamp)
                     .unwrap();
             Message::NewBlock(block)
         }

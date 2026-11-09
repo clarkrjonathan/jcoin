@@ -19,7 +19,7 @@ fn main() {
         .unwrap_or(300.0);
 
     // Hash a header repeatedly, varying the nonce, exactly as mining does.
-    let mut header = Block::genesis().header;
+    let mut header = Block::genesis(&jcoin::consensus::MAINNET).header;
     let start = Instant::now();
     let mut hashes: u64 = 0;
     while start.elapsed().as_secs_f64() < 2.0 {
