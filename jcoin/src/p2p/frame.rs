@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAGIC: [u8; 4] = *b"JEFY";
 
 /// Current wire-protocol version. Distinct from the block/consensus version.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Fixed header size in bytes.
 pub const HEADER_LEN: usize = 16;

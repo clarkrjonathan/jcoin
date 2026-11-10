@@ -1,10 +1,9 @@
 //! The peer-link seam.
 //!
 //! A peer is a bidirectional byte stream, nothing more. All protocol logic runs
-//! over a `PeerLink` and never learns whether that stream is a direct TCP
-//! connection or a channel through a relay. A `tokio::net::TcpStream` is a
-//! `PeerLink` today; a relay channel will implement the same traits later, so
-//! node logic does not change when the relay is added.
+//! over a `PeerLink` and never learns what carries it. In the node it is a
+//! libp2p stream (over TCP or a relay circuit, encrypted with Noise); in tests
+//! it is also a plain `tokio::net::TcpStream` or an in-memory duplex.
 
 use tokio::io::{AsyncRead, AsyncWrite};
 

@@ -138,6 +138,7 @@ impl Chain {
         let height = self.blocks[&parent_hash].height + 1;
         BlockContext {
             height,
+            version: crate::consensus::consensus_version(height),
             reward: self.params.block_reward(height),
             target: self.target_for_child(parent_hash),
             // Strictly greater than median-time-past.
@@ -174,39 +175,48 @@ impl Chain {
 
     /// The required difficulty target for the child of `parent_hash`.
     ///
-    /// Epoch-based: difficulty is constant within an epoch of `RETARGET_WINDOW`
-    /// blocks and is recomputed only at an epoch boundary, from the span of the
-    /// epoch just completed. Adjusting only after observing a full epoch at the
-    /// current difficulty (rather than every block off a trailing window) is
-    /// what keeps it from overshooting. Steered toward `TARGET_BLOCK_TIME`,
-    /// clamped per step, never easier than `POW_LIMIT`.
+    /// Per-block LWMA (linearly weighted moving average). Difficulty is recomputed
+    /// every block from a weighted average of the solvetimes of the last
+    /// `lwma_window` blocks, with the most recent solvetime weighted most, so it
+    /// reacts to a hash-rate change within a few blocks instead of a few epochs.
+    /// Each solvetime is clamped to `[1, target_block_time * max_adjust_factor]`,
+    /// so one manipulated timestamp (bounded below by median-time-past, above by
+    /// the future-drift rule) has limited leverage; the per-block change is
+    /// clamped to `max_adjust_factor` and never eased below `pow_limit`.
     fn target_for_child(&self, parent_hash: [u8; 32]) -> [u8; 32] {
         let p = &self.params;
         let parent = &self.blocks[&parent_hash];
         let height = parent.height + 1;
+        let n = p.lwma_window;
 
-        // First epoch mines at the easy limit.
-        if height < p.retarget_window {
+        // Until a full window of history exists, mine at the easy limit.
+        if height <= n {
             return p.pow_limit;
         }
-        // Mid-epoch: keep the epoch's difficulty (inherit the parent's target).
-        if height % p.retarget_window != 0 {
-            return parent.block.header.target;
+
+        // Timestamps of the parent (newest) back through its n ancestors.
+        // `height > n` guarantees all n+1 blocks exist, so the walk never ends
+        // early.
+        let mut ts_desc: Vec<u64> = Vec::with_capacity((n + 1) as usize);
+        let mut cur = Some(&self.blocks[&parent_hash]);
+        for _ in 0..=n {
+            let b = cur.expect("height > lwma_window guarantees n+1 ancestors");
+            ts_desc.push(b.block.header.timestamp);
+            cur = self.blocks.get(&b.block.header.previous_block_hash);
         }
 
-        // Epoch boundary: retarget from the span of the just-completed epoch,
-        // blocks [height - retarget_window, height - 1].
-        let intervals = p.retarget_window - 1;
-        let Some(first) = self.ancestor(parent_hash, intervals) else {
-            return p.pow_limit;
-        };
-        let expected = intervals * p.target_block_time;
-        let actual = parent
-            .block
-            .header
-            .timestamp
-            .saturating_sub(first.block.header.timestamp);
-        retarget(p, &parent.block.header.target, actual, expected)
+        // Linearly weighted average solvetime: the newest solvetime
+        // (ts_desc[0] - ts_desc[1]) gets weight n, the oldest weight 1.
+        let cap = p.target_block_time * p.max_adjust_factor;
+        let mut weighted_sum: u128 = 0;
+        for i in 0..n as usize {
+            let st = ts_desc[i].saturating_sub(ts_desc[i + 1]).clamp(1, cap);
+            let weight = (n as usize - i) as u128;
+            weighted_sum += weight * st as u128;
+        }
+        let weight_total = (n as u128) * (n as u128 + 1) / 2;
+        let wavg = (weighted_sum / weight_total) as u64;
+        retarget(p, &parent.block.header.target, wavg, p.target_block_time)
     }
 
     /// Offer a block to the store: validate against its parent, store it, and
@@ -438,10 +448,12 @@ mod tests {
 
     #[test]
     fn retarget_hardens_when_fast_and_caps_when_slow() {
-        let expected = REGTEST.retarget_window * REGTEST.target_block_time;
+        // The LWMA feeds a weighted-average solvetime into `retarget` with the
+        // per-block expected span. Exercise the clamp/cap directly.
+        let expected = REGTEST.target_block_time;
 
-        // Blocks far faster than target: the window span is tiny, so difficulty
-        // tightens (target shrinks) relative to the limit.
+        // Solvetime far faster than target: difficulty tightens (target shrinks)
+        // relative to the limit.
         let faster = retarget(&REGTEST, &REGTEST.pow_limit, 1, expected);
         assert!(
             U256::from_big_endian(&faster) < U256::from_big_endian(&REGTEST.pow_limit),
@@ -453,6 +465,32 @@ mod tests {
         let slower = retarget(&REGTEST, &faster, expected * 100, expected);
         assert!(U256::from_big_endian(&slower) > U256::from_big_endian(&faster));
         assert!(U256::from_big_endian(&slower) <= U256::from_big_endian(&REGTEST.pow_limit));
+    }
+
+    #[test]
+    fn lwma_holds_difficulty_steady_on_target_and_reads_fast_blocks() {
+        // On-target blocks (spaced exactly target_block_time) must not drift the
+        // difficulty: the LWMA of all-300 s solvetimes returns the same target,
+        // so mining stays at pow_limit (and the test stays fast). This exercises
+        // the per-block LWMA walk over a full window.
+        let mut chain = Chain::new(REGTEST);
+        let n = REGTEST.lwma_window;
+        let t0 = REGTEST.genesis_timestamp;
+        for i in 1..=(n + 2) {
+            let b = mine_from_context(
+                &chain,
+                REGTEST.initial_reward,
+                t0 + i * REGTEST.target_block_time,
+            );
+            assert!(matches!(chain.accept(b), Accept::Stored { .. }));
+        }
+        // Past a full window of on-target blocks, difficulty is unchanged.
+        assert_eq!(chain.next_context().target, REGTEST.pow_limit);
+
+        // And the LWMA reads a fast window as harder: feed the helper a weighted
+        // average well under target and confirm it tightens below the limit.
+        let faster = retarget(&REGTEST, &REGTEST.pow_limit, 10, REGTEST.target_block_time);
+        assert!(U256::from_big_endian(&faster) < U256::from_big_endian(&REGTEST.pow_limit));
     }
 
     #[test]

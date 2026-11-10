@@ -171,22 +171,37 @@ async fn send_transaction(
 
     let client = reqwest::Client::new();
 
-    // Fetch the sender's balance and next nonce from the node.
-    let account = client
+    // Fetch the sender's balance and pending chain from the node. A failed
+    // request or a missing field is an error: defaulting to 0 would sign with
+    // the wrong nonce.
+    let response = client
         .get(format!("{node}/balance/{}", hex::encode(sender)))
         .send()
-        .await?
-        .json::<serde_json::Value>()
         .await?;
-    let balance = account["balance"].as_u64().unwrap_or(0);
-    let nonce = account["nonce"].as_u64().unwrap_or(0);
+    if !response.status().is_success() {
+        return Err(format!("node returned {} for the balance query", response.status()).into());
+    }
+    let account = response.json::<serde_json::Value>().await?;
+    let field = |name: &str| {
+        account[name]
+            .as_u64()
+            .ok_or_else(|| format!("node reply has no '{name}' field"))
+    };
+    let balance = field("balance")?;
+    // The next free nonce after any pending transactions, so a sender can
+    // queue several before a block confirms them.
+    let nonce = field("next_nonce")?;
+    let pending = field("pending")?;
 
     let needed = amount.checked_add(fee).ok_or("amount + fee is too large")?;
-    if balance < needed {
+    let available = balance.saturating_sub(pending);
+    if available < needed {
         return Err(format!(
-            "balance too low: need {} JEF, have {} JEF",
+            "balance too low: need {} JEF, have {} JEF ({} JEF confirmed, {} JEF committed to pending transactions)",
             format_jef(needed),
-            format_jef(balance)
+            format_jef(available),
+            format_jef(balance),
+            format_jef(pending)
         )
         .into());
     }

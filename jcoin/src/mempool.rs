@@ -6,9 +6,19 @@
 //! The seen cache only answers "has this node seen this id recently" for status
 //! queries; it never blocks admission.
 //!
-//! Both are owned by the node core task, so neither needs a lock.
+//! A sender may have a chain of pending transactions with consecutive nonces:
+//! the confirmed nonce `n`, then `n + 1`, and so on. Admission enforces three
+//! rules against the tip state, so the chain is always minable in order:
+//! - the nonce is exactly the next one after the sender's pending chain (no
+//!   gaps, no reuse; reusing a pending nonce is a conflict, ADR 000),
+//! - the confirmed balance covers the whole chain (`amount + fee` of every
+//!   pending transaction, this one included; incoming pending credits are not
+//!   counted),
+//! - the chain is at most `MAX_PENDING_PER_SENDER` long.
+//!
+//! Both structures are owned by the node core task, so neither needs a lock.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use crate::state::State;
@@ -16,6 +26,9 @@ use crate::Transaction;
 
 /// Most transactions held in the mempool. Admission fails when it is full.
 pub const MAX_MEMPOOL: usize = 10_000;
+
+/// Most pending transactions one sender may have queued.
+pub const MAX_PENDING_PER_SENDER: usize = 25;
 
 /// Most transaction ids remembered by the seen cache (oldest evicted first).
 pub const SEEN_CAPACITY: usize = 50_000;
@@ -38,6 +51,16 @@ pub enum AdmitError {
     /// A different transaction from the same sender with the same nonce is
     /// already pending. ADR 000: do not take part in propagating a conflict.
     Conflict { pending: TxId },
+    /// The nonce is below the sender's confirmed nonce (already used).
+    StaleNonce { expected: u64, got: u64 },
+    /// The nonce skips ahead of the sender's pending chain.
+    NonceGap { expected: u64, got: u64 },
+    /// The confirmed balance does not cover the pending chain plus this one.
+    InsufficientBalance { needed: u64, available: u64 },
+    /// The sender already has `MAX_PENDING_PER_SENDER` pending transactions.
+    SenderLimit,
+    /// `amount + fee` overflows.
+    Overflow,
     /// The mempool is at `MAX_MEMPOOL`.
     Full,
 }
@@ -50,6 +73,21 @@ impl fmt::Display for AdmitError {
                 "conflicts with pending transaction {} (same sender and nonce)",
                 hex::encode(pending)
             ),
+            AdmitError::StaleNonce { expected, got } => {
+                write!(f, "bad nonce: {got} is already used (next is {expected})")
+            }
+            AdmitError::NonceGap { expected, got } => {
+                write!(f, "bad nonce: expected {expected}, got {got} (gap)")
+            }
+            AdmitError::InsufficientBalance { needed, available } => write!(
+                f,
+                "insufficient balance: pending transactions plus this one need {needed}, have {available}"
+            ),
+            AdmitError::SenderLimit => write!(
+                f,
+                "sender already has {MAX_PENDING_PER_SENDER} pending transactions"
+            ),
+            AdmitError::Overflow => write!(f, "amount + fee overflows"),
             AdmitError::Full => write!(f, "mempool is full"),
         }
     }
@@ -57,18 +95,33 @@ impl fmt::Display for AdmitError {
 
 impl std::error::Error for AdmitError {}
 
-/// Pending transactions, indexed by id and by `(sender, nonce)`.
+/// A sender's view of the mempool, for wallets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PendingSummary {
+    /// The nonce the sender's next transaction must use.
+    pub next_nonce: u64,
+    /// Total `amount + fee` of the sender's pending transactions.
+    pub pending_debit: u64,
+    /// Number of the sender's pending transactions.
+    pub count: usize,
+}
+
+/// Pending transactions, indexed by id and by sender, then nonce.
 pub struct Mempool {
     by_id: HashMap<TxId, Transaction>,
-    by_slot: HashMap<([u8; 32], u64), TxId>,
+    by_sender: HashMap<[u8; 32], BTreeMap<u64, TxId>>,
     capacity: usize,
+}
+
+fn debit(tx: &Transaction) -> Option<u64> {
+    tx.amount.checked_add(tx.fee)
 }
 
 impl Mempool {
     pub fn new(capacity: usize) -> Mempool {
         Mempool {
             by_id: HashMap::new(),
-            by_slot: HashMap::new(),
+            by_sender: HashMap::new(),
             capacity,
         }
     }
@@ -85,29 +138,77 @@ impl Mempool {
         self.by_id.contains_key(id)
     }
 
-    /// Admit a transaction that the caller has already validated against the
-    /// tip state. Enforces one pending transaction per `(sender, nonce)` and
-    /// the size cap.
-    pub fn insert(&mut self, tx: Transaction) -> Result<Admitted, AdmitError> {
+    /// The sender's pending chain on top of `state`: next nonce and total
+    /// committed debit.
+    pub fn summary(&self, sender: &[u8; 32], state: &State) -> PendingSummary {
+        let confirmed = state.nonce(sender);
+        let Some(chain) = self.by_sender.get(sender) else {
+            return PendingSummary {
+                next_nonce: confirmed,
+                pending_debit: 0,
+                count: 0,
+            };
+        };
+        let pending_debit = chain
+            .values()
+            .filter_map(|id| self.by_id.get(id).and_then(debit))
+            .fold(0u64, |acc, d| acc.saturating_add(d));
+        PendingSummary {
+            next_nonce: confirmed + chain.len() as u64,
+            pending_debit,
+            count: chain.len(),
+        }
+    }
+
+    /// Admit a normal transaction whose signature and type the caller has
+    /// already checked. Nonce and balance are checked here against `state`
+    /// (the tip) and the sender's pending chain; see the module docs.
+    pub fn insert(&mut self, tx: Transaction, state: &State) -> Result<Admitted, AdmitError> {
         let id = tx.tx_id();
         if self.by_id.contains_key(&id) {
             return Ok(Admitted::AlreadyPending);
         }
-        let slot = (tx.sender, tx.nonce);
-        if let Some(pending) = self.by_slot.get(&slot) {
+        let confirmed = state.nonce(&tx.sender);
+        if tx.nonce < confirmed {
+            return Err(AdmitError::StaleNonce {
+                expected: confirmed,
+                got: tx.nonce,
+            });
+        }
+        if let Some(pending) = self.by_sender.get(&tx.sender).and_then(|c| c.get(&tx.nonce)) {
             return Err(AdmitError::Conflict { pending: *pending });
+        }
+        let summary = self.summary(&tx.sender, state);
+        if tx.nonce != summary.next_nonce {
+            return Err(AdmitError::NonceGap {
+                expected: summary.next_nonce,
+                got: tx.nonce,
+            });
+        }
+        if summary.count >= MAX_PENDING_PER_SENDER {
+            return Err(AdmitError::SenderLimit);
+        }
+        let needed = debit(&tx)
+            .and_then(|d| d.checked_add(summary.pending_debit))
+            .ok_or(AdmitError::Overflow)?;
+        let available = state.balance(&tx.sender);
+        if available < needed {
+            return Err(AdmitError::InsufficientBalance { needed, available });
         }
         if self.by_id.len() >= self.capacity {
             return Err(AdmitError::Full);
         }
-        self.by_slot.insert(slot, id);
+        self.by_sender
+            .entry(tx.sender)
+            .or_default()
+            .insert(tx.nonce, id);
         self.by_id.insert(id, tx);
         Ok(Admitted::New)
     }
 
     /// The pending transaction to mine next on top of `state`: among those that
-    /// apply, the highest fee, with ties broken by the smallest id so the choice
-    /// is deterministic.
+    /// apply now (the head of each sender's chain), the highest fee, with ties
+    /// broken by the smallest id so the choice is deterministic.
     pub fn best_applicable(&self, state: &State) -> Option<Transaction> {
         self.by_id
             .iter()
@@ -116,18 +217,50 @@ impl Mempool {
             .map(|(_, tx)| tx.clone())
     }
 
-    /// Drop every pending transaction that no longer applies on `state`
-    /// (already included in a block, a stale nonce, or a balance that no longer
-    /// covers it).
+    /// Re-check every sender's pending chain against `state` (the new tip):
+    /// drop transactions already included (nonce below the confirmed nonce),
+    /// then keep the chain only while it stays consecutive and affordable.
+    /// After a reorg this also drops the part of a chain that no longer fits.
     pub fn prune(&mut self, state: &State) {
-        let by_slot = &mut self.by_slot;
-        self.by_id.retain(|_, tx| {
-            let keep = state.check(tx).is_ok();
-            if !keep {
-                by_slot.remove(&(tx.sender, tx.nonce));
-            }
-            keep
-        });
+        let mut drop_ids = Vec::new();
+        for (sender, chain) in self.by_sender.iter_mut() {
+            let mut expected = state.nonce(sender);
+            let available = state.balance(sender);
+            let mut committed: u64 = 0;
+            let mut broken = false;
+            chain.retain(|&nonce, id| {
+                let keep = !broken
+                    && nonce == expected
+                    && self
+                        .by_id
+                        .get(id)
+                        .and_then(debit)
+                        .and_then(|d| committed.checked_add(d))
+                        .is_some_and(|total| {
+                            if total <= available {
+                                committed = total;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                if keep {
+                    expected += 1;
+                } else {
+                    // Below the confirmed nonce: included. Otherwise the chain
+                    // is broken here, and everything after it goes too.
+                    if nonce >= expected {
+                        broken = true;
+                    }
+                    drop_ids.push(*id);
+                }
+                keep
+            });
+        }
+        self.by_sender.retain(|_, chain| !chain.is_empty());
+        for id in drop_ids {
+            self.by_id.remove(&id);
+        }
     }
 }
 
@@ -179,6 +312,8 @@ mod tests {
     use crate::consensus::REGTEST;
     use crate::tx_type;
 
+    const REWARD: u64 = REGTEST.initial_reward;
+
     fn tx(sender: u8, nonce: u64, amount: u64, fee: u64) -> Transaction {
         Transaction {
             tx_type: tx_type::NORMAL,
@@ -195,16 +330,17 @@ mod tests {
     fn funded() -> State {
         let mut s = State::new();
         for who in [1u8, 2, 3] {
-            s.apply(&Transaction::coinbase([who; 32], REGTEST.initial_reward)).unwrap();
+            s.apply(&Transaction::coinbase([who; 32], REWARD)).unwrap();
         }
         s
     }
 
     #[test]
     fn same_transaction_twice_is_already_pending() {
+        let state = funded();
         let mut pool = Mempool::new(10);
-        assert_eq!(pool.insert(tx(1, 0, 5, 0)), Ok(Admitted::New));
-        assert_eq!(pool.insert(tx(1, 0, 5, 0)), Ok(Admitted::AlreadyPending));
+        assert_eq!(pool.insert(tx(1, 0, 5, 0), &state), Ok(Admitted::New));
+        assert_eq!(pool.insert(tx(1, 0, 5, 0), &state), Ok(Admitted::AlreadyPending));
         assert_eq!(pool.len(), 1);
     }
 
@@ -212,13 +348,14 @@ mod tests {
     // mempool. Only the first is admitted.
     #[test]
     fn conflicting_transactions_at_the_same_nonce_are_rejected() {
+        let state = funded();
         let mut pool = Mempool::new(10);
         let first = tx(1, 0, 5, 0);
         let first_id = first.tx_id();
-        assert_eq!(pool.insert(first), Ok(Admitted::New));
+        assert_eq!(pool.insert(first, &state), Ok(Admitted::New));
         for amount in 6..20 {
             assert_eq!(
-                pool.insert(tx(1, 0, amount, 0)),
+                pool.insert(tx(1, 0, amount, 0), &state),
                 Err(AdmitError::Conflict { pending: first_id })
             );
         }
@@ -226,38 +363,121 @@ mod tests {
     }
 
     #[test]
+    fn a_sender_can_queue_consecutive_nonces() {
+        let state = funded();
+        let mut pool = Mempool::new(10);
+        for nonce in 0..4 {
+            assert_eq!(pool.insert(tx(1, nonce, 5, 1), &state), Ok(Admitted::New));
+        }
+        let s = pool.summary(&[1u8; 32], &state);
+        assert_eq!(s.next_nonce, 4);
+        assert_eq!(s.pending_debit, 4 * 6);
+        assert_eq!(s.count, 4);
+        // Only the head of the chain applies on the tip.
+        assert_eq!(pool.best_applicable(&state).unwrap().nonce, 0);
+    }
+
+    #[test]
+    fn gaps_and_stale_nonces_are_rejected() {
+        let mut state = funded();
+        let mut pool = Mempool::new(10);
+        assert_eq!(
+            pool.insert(tx(1, 2, 5, 0), &state),
+            Err(AdmitError::NonceGap { expected: 0, got: 2 })
+        );
+        // Confirm nonce 0, then nonce 0 again is stale.
+        state.apply(&tx(1, 0, 5, 0)).unwrap();
+        assert_eq!(
+            pool.insert(tx(1, 0, 7, 0), &state),
+            Err(AdmitError::StaleNonce { expected: 1, got: 0 })
+        );
+    }
+
+    #[test]
+    fn the_whole_chain_must_be_affordable() {
+        let state = funded();
+        let mut pool = Mempool::new(10);
+        let half = REWARD / 2;
+        assert_eq!(pool.insert(tx(1, 0, half, 0), &state), Ok(Admitted::New));
+        assert_eq!(pool.insert(tx(1, 1, half, 0), &state), Ok(Admitted::New));
+        // Each alone is affordable, but the chain now needs more than REWARD.
+        assert_eq!(
+            pool.insert(tx(1, 2, 1, 0), &state),
+            Err(AdmitError::InsufficientBalance {
+                needed: REWARD + 1,
+                available: REWARD
+            })
+        );
+    }
+
+    #[test]
+    fn per_sender_limit_is_enforced() {
+        let state = funded();
+        let mut pool = Mempool::new(100);
+        for nonce in 0..MAX_PENDING_PER_SENDER as u64 {
+            pool.insert(tx(1, nonce, 1, 0), &state).unwrap();
+        }
+        assert_eq!(
+            pool.insert(tx(1, MAX_PENDING_PER_SENDER as u64, 1, 0), &state),
+            Err(AdmitError::SenderLimit)
+        );
+    }
+
+    #[test]
     fn capacity_is_enforced() {
+        let state = funded();
         let mut pool = Mempool::new(2);
-        assert_eq!(pool.insert(tx(1, 0, 1, 0)), Ok(Admitted::New));
-        assert_eq!(pool.insert(tx(2, 0, 1, 0)), Ok(Admitted::New));
-        assert_eq!(pool.insert(tx(3, 0, 1, 0)), Err(AdmitError::Full));
+        assert_eq!(pool.insert(tx(1, 0, 1, 0), &state), Ok(Admitted::New));
+        assert_eq!(pool.insert(tx(2, 0, 1, 0), &state), Ok(Admitted::New));
+        assert_eq!(pool.insert(tx(3, 0, 1, 0), &state), Err(AdmitError::Full));
     }
 
     #[test]
     fn best_applicable_prefers_the_highest_fee() {
         let state = funded();
         let mut pool = Mempool::new(10);
-        pool.insert(tx(1, 0, 5, 1)).unwrap();
-        pool.insert(tx(2, 0, 5, 9)).unwrap();
-        pool.insert(tx(3, 0, 5, 4)).unwrap();
-        // Not applicable: wrong nonce for sender 4 (who has nothing anyway).
-        pool.insert(tx(4, 3, 5, 100)).unwrap();
-        assert_eq!(pool.best_applicable(&state).unwrap().sender, [2u8; 32]);
+        pool.insert(tx(1, 0, 5, 1), &state).unwrap();
+        pool.insert(tx(2, 0, 5, 9), &state).unwrap();
+        pool.insert(tx(3, 0, 5, 4), &state).unwrap();
+        // Sender 2's second transaction has the top fee but does not apply yet.
+        pool.insert(tx(2, 1, 5, 50), &state).unwrap();
+        let best = pool.best_applicable(&state).unwrap();
+        assert_eq!((best.sender, best.nonce), ([2u8; 32], 0));
     }
 
+    // Mining the head moves the chain forward: the included transaction goes,
+    // the next one becomes the head.
     #[test]
-    fn prune_removes_both_indexes() {
+    fn prune_after_inclusion_keeps_the_rest_of_the_chain() {
         let mut state = funded();
         let mut pool = Mempool::new(10);
-        let t = tx(1, 0, 5, 0);
-        pool.insert(t.clone()).unwrap();
-        // Include it: the sender's nonce moves to 1, so it no longer applies.
-        state.apply(&t).unwrap();
+        let t0 = tx(1, 0, 5, 0);
+        pool.insert(t0.clone(), &state).unwrap();
+        pool.insert(tx(1, 1, 5, 0), &state).unwrap();
+        state.apply(&t0).unwrap();
         pool.prune(&state);
-        assert!(pool.is_empty());
-        // The (sender, nonce) slot is free again: a new tx at nonce 1 is new,
-        // and nothing remains at nonce 0 to conflict with.
-        assert_eq!(pool.insert(tx(1, 1, 5, 0)), Ok(Admitted::New));
+        assert_eq!(pool.len(), 1);
+        assert!(!pool.contains(&t0.tx_id()));
+        assert_eq!(pool.best_applicable(&state).unwrap().nonce, 1);
+        assert_eq!(pool.summary(&[1u8; 32], &state).next_nonce, 2);
+    }
+
+    // After a reorg to a state with less balance, the part of the chain that
+    // no longer fits is dropped, from the first unaffordable transaction on.
+    #[test]
+    fn prune_drops_the_unaffordable_tail() {
+        let state = funded();
+        let mut pool = Mempool::new(10);
+        let third = REWARD / 3;
+        for nonce in 0..3 {
+            pool.insert(tx(1, nonce, third, 0), &state).unwrap();
+        }
+        // New tip: sender 1 holds only enough for the first two.
+        let mut poorer = State::new();
+        poorer.apply(&Transaction::coinbase([1u8; 32], 2 * third + 1)).unwrap();
+        pool.prune(&poorer);
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.summary(&[1u8; 32], &poorer).next_nonce, 2);
     }
 
     // S3: a transaction that left the mempool is admitted again on resubmit.
@@ -266,13 +486,12 @@ mod tests {
         let state = funded();
         let mut pool = Mempool::new(10);
         let t = tx(1, 0, 5, 0);
-        pool.insert(t.clone()).unwrap();
+        pool.insert(t.clone(), &state).unwrap();
         // Simulate a reorg to a state where the sender has no funds: pruned.
         pool.prune(&State::new());
         assert!(!pool.contains(&t.tx_id()));
         // Back on a state where it applies, the same tx is new again.
-        assert!(state.check(&t).is_ok());
-        assert_eq!(pool.insert(t), Ok(Admitted::New));
+        assert_eq!(pool.insert(t, &state), Ok(Admitted::New));
     }
 
     #[test]

@@ -16,4 +16,8 @@ RUN cargo build --release --no-default-features --bin relay
 FROM alpine:3.20
 COPY --from=build /src/target/release/relay /usr/local/bin/jcoin-relay
 EXPOSE 9000
-ENTRYPOINT ["/usr/local/bin/jcoin-relay", "--addr", "0.0.0.0:9000"]
+# Mount a volume at /data so the identity key (and so the peer id) survives
+# container restarts. Pass the public address at run time, for example:
+#   docker run -v jcoin-relay:/data -p 9000:9000 jcoin-relay --external 203.0.113.5:9000
+VOLUME /data
+ENTRYPOINT ["/usr/local/bin/jcoin-relay", "--addr", "0.0.0.0:9000", "--key-file", "/data/relay_key"]

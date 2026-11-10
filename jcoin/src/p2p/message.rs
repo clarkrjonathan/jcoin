@@ -8,7 +8,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::block::Block;
 use crate::Transaction;
 
-use super::addr::{decode_addrs, encode_addrs, Endpoint};
+use libp2p::Multiaddr;
+
+use super::addr::{decode_addrs, encode_addrs};
 use super::frame::{read_frame, write_frame, FrameError, RawFrame};
 
 /// Message type codes, matching `docs/p2p-protocol.md`.
@@ -75,7 +77,7 @@ pub enum Message {
     /// Request the peer's known addresses.
     GetAddr,
     /// A list of peer addresses.
-    Addr(Vec<Endpoint>),
+    Addr(Vec<Multiaddr>),
     /// A newly mined or relayed block.
     NewBlock(Block),
     /// Request canonical blocks after the most recent locator hash the peer has.

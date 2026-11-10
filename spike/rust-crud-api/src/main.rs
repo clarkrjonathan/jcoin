@@ -74,6 +74,7 @@ async fn get_handler() -> Json<serde_json::Value> {
     Json(json_response)
 }
 
+//this was just a fun test to see it mine and figure out which crypto and big int crates I may want to use
 fn quick_luh_mine(difficulty: U256, input: String) -> u32 {
     assert!(!difficulty.is_zero());
     let target = U256::MAX / difficulty;

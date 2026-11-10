@@ -4,8 +4,31 @@ use serde_json::json;
 
 use std::io::{stdout, Write};
 use std::collections::HashMap;
+use std::fs;
+
+use ed25519_dalek::{Signer, SigningKey};
+use primitive_types::{U256, U512};
+use rand::rngs::OsRng;
 
 use rust_crud_api::Transaction;
+
+// The private key (32-byte seed) is stored as hex in this file
+const KEY_FILE: &str = "wallet_ed25519";
+
+// Load the wallet key, or generate a new one on the first run
+fn load_or_generate_key() -> Result<SigningKey, Box<dyn std::error::Error>> {
+    if let Ok(hex_seed) = fs::read_to_string(KEY_FILE) {
+        let seed: [u8; 32] = hex::decode(hex_seed.trim())?
+            .try_into()
+            .map_err(|_| "key file must hold 32 bytes")?;
+        return Ok(SigningKey::from_bytes(&seed));
+    }
+
+    let signing_key = SigningKey::generate(&mut OsRng);
+    fs::write(KEY_FILE, hex::encode(signing_key.to_bytes()))?;
+    println!("Generated new key, saved to {}", KEY_FILE);
+    Ok(signing_key)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,14 +74,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = reqwest::Client::new();
 
-    let transaction = Transaction {
-        sender: [0; 32],
-        recipient: [0; 32],
+    let signing_key = load_or_generate_key()?;
+
+    // The sender field is the public key, so the node can verify with it
+    let mut transaction = Transaction {
+        sender: U256::from_big_endian(signing_key.verifying_key().as_bytes()),
+        recipient: U256::zero(),
         input: 0,
         output: 0,
-        nonce: 0,
-        signature: [0; 64],
+        nonce: 1212, // the node only checks the signature for this nonce right now
+        signature: U512::zero(),
     };
+
+    // Sign everything except the signature, then fill it in
+    let signature = signing_key.sign(&transaction.signing_bytes());
+    transaction.signature = U512::from_big_endian(&signature.to_bytes());
 
     if let Ok(pretty_json) = serde_json::to_string_pretty(&transaction) {
         println!("Pretty:\n{}", pretty_json);

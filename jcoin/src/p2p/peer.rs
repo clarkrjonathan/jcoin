@@ -1,4 +1,4 @@
-//! Per-connection peer logic: the handshake, and (added next) the run loop.
+//! Per-peer session logic: the handshake and the run loop, over any `PeerLink`.
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
@@ -21,7 +21,7 @@ pub const PEER_TIMEOUT: Duration = Duration::from_secs(90);
 const CHANNEL_BOUND: usize = 64;
 
 /// Lowest wire version this node will talk to.
-pub const MIN_PROTOCOL_VERSION: u16 = 1;
+pub const MIN_PROTOCOL_VERSION: u16 = 2;
 
 /// Errors from the handshake.
 #[derive(Debug)]
@@ -529,85 +529,6 @@ mod gossip_tests {
     }
 
     #[tokio::test]
-    async fn gossip_through_relay() {
-        use crate::p2p::addr::Endpoint;
-        use crate::p2p::relay_client::run_relay_client;
-        use crate::p2p::relay_server::serve;
-
-        // Start an in-process relay.
-        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let relay_addr = relay_listener.local_addr().unwrap();
-        tokio::spawn(serve(relay_listener));
-
-        // Node A connects to the relay (no direct address advertised).
-        let core_a = spawn_core();
-        let net_a = Network::new(core_a.clone(), 8333, Vec::new(), 8);
-        tokio::spawn(run_relay_client(relay_addr, net_a.clone()));
-
-        // Discover A's assigned relay handle from its advertised endpoints.
-        let mut handle_a = None;
-        for _ in 0..100 {
-            if let Some(Endpoint::Relay { handle, .. }) = net_a
-                .advertised()
-                .into_iter()
-                .find(|e| matches!(e, Endpoint::Relay { .. }))
-            {
-                handle_a = Some(handle);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let handle_a = handle_a.expect("node A never registered a relay handle");
-
-        // Node B is seeded with A's handle and opens a channel through the relay.
-        let core_b = spawn_core();
-        let net_b = Network::new(core_b.clone(), 8334, Vec::new(), 8);
-        net_b.learn(vec![Endpoint::Relay {
-            relay: relay_addr,
-            handle: handle_a,
-        }]);
-        tokio::spawn(run_relay_client(relay_addr, net_b.clone()));
-
-        assert!(
-            wait_until(|| net_a.peer_count() >= 1 && net_b.peer_count() >= 1).await,
-            "relay channel did not establish"
-        );
-
-        // Fund a sender on both nodes.
-        let key = SigningKey::generate(&mut OsRng);
-        let block1 = coinbase_block(key.verifying_key().to_bytes());
-        submit_block(&core_a, block1.clone()).await;
-        submit_block(&core_b, block1).await;
-
-        // A transaction submitted to A must reach B through the relay.
-        let tx = signed_from(&key, 0);
-        let tx_id = tx.tx_id_hex();
-        let (reply, rx) = oneshot::channel();
-        core_a
-            .send(NodeRequest::SubmitTransaction {
-                tx: tx.clone(),
-                reply,
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            rx.await.unwrap(),
-            SubmitResult::Accepted { is_new: true, .. }
-        ));
-        net_a.broadcast_transaction(&tx, None);
-
-        let mut reached_b = false;
-        for _ in 0..150 {
-            if is_seen(&core_b, &tx_id).await {
-                reached_b = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(reached_b, "transaction did not gossip through the relay to B");
-    }
-
-    #[tokio::test]
     async fn mined_block_propagates_to_a_connected_peer() {
         // Both nodes start at genesis and are connected, so a block that extends
         // the tip applies on the peer. (A follower that joins mid-chain and
@@ -701,30 +622,5 @@ mod gossip_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(synced, "late joiner did not sync to height 5");
-    }
-
-    #[tokio::test]
-    async fn relay_directory_bootstraps_peers_without_seeding() {
-        use crate::p2p::relay_client::run_relay_client;
-        use crate::p2p::relay_server::serve;
-
-        // One relay, two nodes that know only the relay (no --relay-open, no
-        // shared handles). They must find each other via the relay directory.
-        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let relay_addr = relay_listener.local_addr().unwrap();
-        tokio::spawn(serve(relay_listener));
-
-        let core_a = spawn_core();
-        let net_a = Network::new(core_a.clone(), 8333, Vec::new(), 8);
-        tokio::spawn(run_relay_client(relay_addr, net_a.clone()));
-
-        let core_b = spawn_core();
-        let net_b = Network::new(core_b.clone(), 8334, Vec::new(), 8);
-        tokio::spawn(run_relay_client(relay_addr, net_b.clone()));
-
-        assert!(
-            wait_until(|| net_a.peer_count() >= 1 && net_b.peer_count() >= 1).await,
-            "relay directory did not connect the two peers"
-        );
     }
 }

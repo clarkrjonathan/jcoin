@@ -39,16 +39,14 @@ clock only (not network-adjusted time). A node with a badly wrong clock can
 mis-accept or mis-reject blocks until its clock corrects. Non-consensus by
 design, but worth noting.
 
-### V6. Relay trust and transport are unauthenticated
-P2P and relay streams are plaintext and unauthenticated. The relay sees routing
-tokens (ephemeral handles) and could drop or misroute traffic; peers are not
-identified, so a man-in-the-middle on an unencrypted link could tamper. The
-design intentionally keeps the relay chain-blind, but there is no transport
-encryption or peer authentication yet. The relay now has basic abuse caps (one
-handle per connection, a per-connection channel limit) and a directory (`LIST`)
-that returns all handles to any connector — fine inside a restricted security
-group, not for an open internet relay. Access control for a deployed relay is
-the security group; see `DEPLOY-RELAY.md`.
+### V6. Relay trust (mostly resolved by the move to libp2p)
+Every connection, relayed ones included, is now encrypted end to end with Noise
+and authenticated by libp2p peer id, so neither the relay nor a man in the
+middle can read or alter traffic or impersonate a node. What remains: the relay
+can refuse service, drop circuits, or omit peers from rendezvous answers, and a
+node behind NAT that knows no other peer depends on it. Peer ids are not tied
+to any allowlist, so anyone can join an open network. Fix directions: support
+several relays per node, persist the address book, and add peer scoring (V2).
 
 ## Operational limitations (correctness-safe, but rough edges)
 
@@ -65,19 +63,21 @@ A block whose parent is missing is dropped and triggers a full block-locator
 sync, rather than being held until its parent arrives. Correct, but chatty under
 heavy delay, and it depends on the delivering peer staying connected.
 
-### O3. Relay head-of-line blocking
-One TCP connection per node multiplexes all relay channels, so a stalled or slow
-channel backs up the others. No per-channel flow control; no relay handle
-rotation.
+### O3. Relay head-of-line blocking (resolved)
+The custom relay multiplexed every channel on one TCP connection. It is gone.
+libp2p connections use Yamux, which gives each stream its own flow-control
+window, and each peer pair has its own relay circuit.
 
 ### O4. Persistence is append-only and uncompacted
 The block log (`store.rs`) only grows and is never compacted; state is not
 snapshotted (it is replayed from all blocks on startup), so startup cost grows
 with chain length.
 
-### O5. Duplicate peer links
-With no persistent node identity, two nodes can open several redundant links to
-each other. Harmless (gossip dedups) but wasteful.
+### O5. Duplicate peer links (mostly resolved)
+Nodes now have a persistent identity (the libp2p peer id). The host opens at
+most one JeffyCoin session per peer and keeps it across a hole-punch upgrade.
+Two sessions can still appear when two nodes dial each other at the same
+moment. Harmless (gossip dedups).
 
 ### O6. Machine-specific difficulty floor
 `MAINNET.pow_limit` (the easy start/cap and genesis target) was calibrated from one
@@ -88,6 +88,15 @@ genesis hash are environment-specific.
 The first retarget epoch includes genesis; because the genesis timestamp is not
 close to real "now", that epoch's span clamps and difficulty hardening begins one
 epoch late. Harmless, converges anyway, but surprising.
+
+### O8. Queued transactions that arrive out of order are rejected
+A sender may queue transactions with consecutive nonces, and the mempool
+accepts nonce `n + 1` only after `n`. Gossip over one link is in order, but a
+node that receives `n + 1` from one peer before `n` from another rejects
+`n + 1` as a nonce gap and does not keep it. The transaction still reaches
+that node's miners only if another peer relays it again later, which does not
+happen today. Fix direction: hold out-of-order transactions in a small
+per-sender buffer and admit them when the gap fills.
 
 ## Suggested fix order
 1. **V1** bound/prune the fork store (cap by work-distance from tip or by count).

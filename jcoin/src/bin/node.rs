@@ -1,11 +1,14 @@
 //! JeffyCoin node binary.
 //!
 //! Runs three things over one Tokio runtime: the node-core task (owns state),
-//! an axum REST server (wallet-facing), and the P2P layer (a TCP listener plus
-//! a dialer per configured peer). Transactions that arrive by REST or by gossip
-//! are validated by the core and, when new, relayed to the other peers.
+//! an axum REST server (wallet-facing), and the P2P layer (a libp2p host:
+//! TCP + Noise + Yamux, relay circuits with hole punching, and rendezvous
+//! discovery, carrying the JeffyCoin protocol on one stream per peer).
+//! Transactions that arrive by REST or by gossip are validated by the core
+//! and, when new, relayed to the other peers.
 
-use std::net::SocketAddr;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -17,15 +20,16 @@ use axum::{
 };
 use clap::Parser;
 use serde_json::json;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
-use jcoin::block::{assemble_block, mine_chunk, Block};
+use jcoin::block::{assemble_block, mine_chunk, Block, BlockError, BlockHeader};
+use jcoin::Transaction;
 use jcoin::consensus::{MAINNET, REGTEST};
 use jcoin::node::{
     run_node, BlockOutcome, ChainInfo, MiningJob, NodeRequest, StatusResult, SubmitResult,
 };
-use jcoin::p2p::{run_peer, run_relay_client, Endpoint, Network};
+use jcoin::p2p::{load_or_create_keypair, parse_addr, run_host, HostConfig, Network};
 
 #[derive(Parser)]
 #[command(name = "jcoin-node", about = "JeffyCoin node")]
@@ -33,26 +37,38 @@ struct Cli {
     /// Address for the wallet-facing REST server.
     #[arg(long, default_value = "0.0.0.0:3000")]
     rest_addr: String,
-    /// Address for the P2P TCP listener.
+    /// P2P listen address: `ip:port` (TCP) or a multiaddr.
     #[arg(long, default_value = "0.0.0.0:8333")]
     p2p_addr: String,
-    /// Peer address to dial on startup (repeatable).
+    /// Peer to dial on startup and redial while disconnected: `ip:port` or a
+    /// multiaddr, optionally ending in `/p2p/<peer id>` (repeatable).
     #[arg(long = "peer")]
     peers: Vec<String>,
-    /// A directly reachable address of this node to advertise (repeatable). A
-    /// concrete (non-wildcard) --p2p-addr is advertised automatically.
+    /// Do not listen for inbound connections. The node then dials out only
+    /// and, with --relay, is reachable only through the relay (as a node
+    /// behind carrier-grade NAT would be).
+    #[arg(long)]
+    no_listen: bool,
+    /// An extra reachable address of this node to advertise, such as a public
+    /// address behind port forwarding (repeatable). Listen addresses are
+    /// advertised automatically.
     #[arg(long = "advertise")]
     advertise: Vec<String>,
     /// Soft cap on peers before the auto-dialer stops reaching out.
     #[arg(long, default_value_t = 8)]
     max_peers: usize,
-    /// Relay address to connect through for peers behind carrier-grade NAT.
+    /// A relay for nodes behind NAT, as a multiaddr ending in `/p2p/<relay
+    /// peer id>` (the relay prints it at startup). The node reserves a slot on
+    /// it, registers with its rendezvous service, and discovers other nodes
+    /// there; hole punching upgrades relayed connections to direct ones when
+    /// the NATs allow it.
     #[arg(long)]
     relay: Option<String>,
-    /// A peer's relay directory handle (hex) to open a channel to on startup,
-    /// used to bootstrap before handles are learned via gossip. Repeatable.
-    #[arg(long = "relay-open")]
-    relay_open: Vec<String>,
+    /// File holding this node's libp2p identity key (created if missing).
+    /// Defaults to `<data-dir>/node_key`; without a data dir the identity is
+    /// new on every start.
+    #[arg(long)]
+    key_file: Option<std::path::PathBuf>,
     /// Mine blocks. Requires --miner.
     #[arg(long)]
     mine: bool,
@@ -75,70 +91,85 @@ struct Cli {
 struct AppState {
     node: mpsc::Sender<NodeRequest>,
     network: Network,
+    /// Block templates handed to external miners (see `mining_work`).
+    work: Arc<Mutex<WorkStore>>,
+}
+
+/// Listen addresses for a node. If `addr` is the IPv4 unspecified address
+/// (`0.0.0.0`), also listen on the IPv6 unspecified address (`[::]`) on the same
+/// TCP port, so the node is dual-stack and reachable over IPv6 where both ends
+/// have it — bypassing IPv4 carrier-grade NAT (ADR 0003). A concrete address is
+/// left as the sole listener (the operator asked for exactly that).
+fn dual_stack(addr: libp2p::Multiaddr) -> Vec<libp2p::Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let parts: Vec<_> = addr.iter().collect();
+    if let (Some(Protocol::Ip4(ip)), Some(Protocol::Tcp(port))) = (parts.first(), parts.get(1)) {
+        if *ip == Ipv4Addr::UNSPECIFIED {
+            let v6 = libp2p::Multiaddr::empty()
+                .with(Protocol::Ip6(Ipv6Addr::UNSPECIFIED))
+                .with(Protocol::Tcp(*port));
+            return vec![addr, v6];
+        }
+    }
+    vec![addr]
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let p2p_sock: SocketAddr = cli
-        .p2p_addr
-        .parse()
-        .expect("p2p-addr must be an ip:port");
-    let listen_port = p2p_sock.port();
+    let listen = parse_addr(&cli.p2p_addr).expect("bad --p2p-addr");
+    let listen_port = listen
+        .iter()
+        .find_map(|p| match p {
+            libp2p::multiaddr::Protocol::Tcp(port) => Some(port),
+            _ => None,
+        })
+        .unwrap_or(0);
 
     // Node core.
     let (node_tx, node_rx) = mpsc::channel::<NodeRequest>(100);
     let params = if cli.regtest { REGTEST } else { MAINNET };
     tokio::spawn(run_node(node_rx, cli.data_dir.clone(), params));
 
-    // Addresses this node advertises: the configured ones, plus a concrete
-    // --p2p-addr.
-    let mut advertised: Vec<Endpoint> = cli
-        .advertise
-        .iter()
-        .map(|s| Endpoint::Direct(s.parse().expect("advertise must be ip:port")))
-        .collect();
-    if !p2p_sock.ip().is_unspecified() {
-        let own = Endpoint::Direct(p2p_sock);
-        if !advertised.contains(&own) {
-            advertised.push(own);
-        }
-    }
+    let network = Network::new(node_tx.clone(), listen_port, Vec::new(), cli.max_peers);
 
-    let network = Network::new(node_tx.clone(), listen_port, advertised, cli.max_peers);
-
-    // P2P listener.
-    tokio::spawn(p2p_listen(p2p_sock, network.clone()));
-
-    // One dialer per configured peer; each retries on disconnect.
-    for peer in cli.peers {
-        tokio::spawn(p2p_dial(peer, network.clone()));
-    }
-
-    // Optional relay client for peers behind carrier-grade NAT.
-    if let Some(relay) = cli.relay {
-        let relay_sock: SocketAddr = relay.parse().expect("relay must be an ip:port");
-        // Seed bootstrap handles into the book so the client opens them once it
-        // registers.
-        let seeds: Vec<Endpoint> = cli
-            .relay_open
-            .iter()
-            .map(|h| {
-                let bytes = hex::decode(h).expect("relay-open must be hex");
-                let handle: jcoin::p2p::Handle =
-                    bytes.try_into().expect("relay-open handle must be 16 bytes");
-                Endpoint::Relay {
-                    relay: relay_sock,
-                    handle,
-                }
-            })
-            .collect();
-        if !seeds.is_empty() {
-            network.learn(seeds);
-        }
-        tokio::spawn(run_relay_client(relay_sock, network.clone()));
-    } else if !cli.relay_open.is_empty() {
-        eprintln!("--relay-open requires --relay");
+    // P2P host: identity, listener, bootstrap peers, and the optional relay.
+    let key_file = cli
+        .key_file
+        .clone()
+        .or_else(|| cli.data_dir.as_ref().map(|d| d.join("node_key")));
+    let keypair = match &key_file {
+        Some(path) => load_or_create_keypair(path).expect("cannot load or create the node key"),
+        None => libp2p::identity::Keypair::generate_ed25519(),
+    };
+    let parse_all = |list: &[String], flag: &str| -> Vec<libp2p::Multiaddr> {
+        list.iter()
+            .map(|s| parse_addr(s).unwrap_or_else(|e| panic!("bad {flag}: {e}")))
+            .collect()
+    };
+    let config = HostConfig {
+        keypair,
+        listen: if cli.no_listen {
+            Vec::new()
+        } else {
+            dual_stack(listen)
+        },
+        advertise: parse_all(&cli.advertise, "--advertise"),
+        bootstrap: parse_all(&cli.peers, "--peer"),
+        relay: cli
+            .relay
+            .as_deref()
+            .map(|s| parse_addr(s).expect("bad --relay")),
+        tick: Duration::from_secs(10),
+    };
+    {
+        let network = network.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_host(config, network).await {
+                eprintln!("[p2p] host stopped: {e}");
+            }
+        });
     }
 
     // Optional miner.
@@ -154,6 +185,7 @@ async fn main() {
     let state = AppState {
         node: node_tx,
         network,
+        work: Arc::new(Mutex::new(WorkStore::default())),
     };
 
     let app = Router::new()
@@ -161,6 +193,8 @@ async fn main() {
         .route("/wallet/transaction/{tx_id}", get(transaction_status))
         .route("/balance/{address}", get(balance))
         .route("/chain", get(chain_info))
+        .route("/mining/work/{miner}", get(mining_work))
+        .route("/mining/submit", post(mining_submit))
         .with_state(state);
 
     let listener = TcpListener::bind(&cli.rest_addr)
@@ -174,31 +208,6 @@ async fn main() {
     axum::serve(listener, app).await.expect("server error");
 }
 
-/// Accept inbound P2P connections and run each as a peer.
-async fn p2p_listen(addr: SocketAddr, network: Network) {
-    let listener = match TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[p2p] failed to bind {addr}: {e}");
-            return;
-        }
-    };
-    println!("[p2p] listening on {addr}");
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, peer_addr)) => {
-                tokio::spawn(run_peer(
-                    stream,
-                    network.clone(),
-                    format!("{peer_addr} (in)"),
-                ));
-            }
-            Err(e) => eprintln!("[p2p] accept error: {e}"),
-        }
-    }
-}
-
 /// Mine blocks continuously, crediting `miner`. Each round asks the core for a
 /// job (tip + state + an applicable mempool transaction), mines off the runtime
 /// with `spawn_blocking`, submits the result, and gossips it when accepted. A
@@ -208,50 +217,19 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
     const CHUNK: u64 = 200_000;
 
     loop {
-        // Fetch a fresh job: the current tip, its state, and a mempool tx if any.
-        let (job_tx, job_rx) = oneshot::channel();
-        if network
-            .node()
-            .send(NodeRequest::GetMiningJob { reply: job_tx })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let Ok(MiningJob {
-            parent,
-            parent_state,
-            normal,
-            context,
-        }) = job_rx.await
-        else {
-            return;
-        };
-        let target_height = context.height;
-
-        // Never below the consensus minimum: a clock behind median-time-past
-        // would otherwise build blocks the chain rejects, forever.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let timestamp = now.max(context.min_timestamp);
-        let (mut header, transactions, _state) = match assemble_block(
-            &parent,
-            &parent_state,
-            context.reward,
-            miner,
-            normal,
-            context.target,
-            timestamp,
-        ) {
-            Ok(parts) => parts,
-            Err(e) => {
+        let Template {
+            mut header,
+            transactions,
+        } = match new_template(network.node(), miner).await {
+            None => return,
+            Some(Ok(t)) => t,
+            Some(Err(e)) => {
                 eprintln!("[mine] assemble failed: {e}");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
         };
+        let target_height = header.height;
 
         // Mine in chunks off the runtime; between chunks, give up if someone
         // else already extended the chain to our target height.
@@ -269,39 +247,8 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
                     header: header.clone(),
                     transactions: transactions.clone(),
                 };
-                println!(
-                    "[mine] found candidate height {} ({} txs) {}",
-                    block.header.height,
-                    block.transactions.len(),
-                    hex::encode(block.hash())
-                );
-                let (ack_tx, ack_rx) = oneshot::channel();
-                if network
-                    .node()
-                    .send(NodeRequest::SubmitBlock {
-                        block: Box::new(block.clone()),
-                        reply: ack_tx,
-                    })
-                    .await
-                    .is_err()
-                {
+                if submit_mined(&network, block, "mine").await.is_none() {
                     return;
-                }
-                match ack_rx.await {
-                    Ok(BlockOutcome::Accepted { is_new: true, height, .. }) => {
-                        println!("[mine] won block {height} {}", hex::encode(block.hash()));
-                        network.broadcast_block(&block, None);
-                    }
-                    Ok(BlockOutcome::Accepted { is_new: false, height, .. }) => {
-                        println!("[mine] candidate at height {height} already known");
-                    }
-                    Ok(BlockOutcome::Rejected { reason }) => {
-                        println!("[mine] candidate REJECTED: {reason}");
-                    }
-                    Ok(BlockOutcome::Orphan) => {
-                        println!("[mine] candidate ORPHAN (parent unknown)");
-                    }
-                    Err(_) => return,
                 }
                 break;
             }
@@ -326,17 +273,226 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
     }
 }
 
-/// Dial a configured peer and run it; on disconnect, wait and retry.
-async fn p2p_dial(addr: String, network: Network) {
-    loop {
-        match TcpStream::connect(&addr).await {
-            Ok(stream) => {
-                run_peer(stream, network.clone(), format!("{addr} (out)")).await;
+/// A block ready to mine: a header (nonce 0) and the transactions it commits to.
+#[derive(Clone)]
+struct Template {
+    header: BlockHeader,
+    transactions: Vec<Transaction>,
+}
+
+/// Ask the core for a mining job (tip, its state, an applicable mempool
+/// transaction) and assemble a block template that pays `miner`. `None` means
+/// the core is gone; `Some(Err)` means assembly failed.
+async fn new_template(
+    node: &mpsc::Sender<NodeRequest>,
+    miner: [u8; 32],
+) -> Option<Result<Template, BlockError>> {
+    let (job_tx, job_rx) = oneshot::channel();
+    node.send(NodeRequest::GetMiningJob { reply: job_tx })
+        .await
+        .ok()?;
+    let MiningJob {
+        parent,
+        parent_state,
+        normal,
+        context,
+    } = job_rx.await.ok()?;
+
+    // Never below the consensus minimum: a clock behind median-time-past
+    // would otherwise build blocks the chain rejects, forever.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let timestamp = now.max(context.min_timestamp);
+    Some(
+        assemble_block(
+            &parent,
+            &parent_state,
+            context.reward,
+            miner,
+            normal,
+            context.target,
+            timestamp,
+        )
+        .map(|(mut header, transactions, _state)| {
+            // Stamp the height-selected consensus version, not the binary's
+            // constant, so mining uses the same per-block input as validation
+            // (consensus inputs all flow through BlockContext).
+            header.version = context.version;
+            Template {
+                header,
+                transactions,
             }
-            Err(e) => eprintln!("[p2p] dial {addr} failed: {e}"),
+        }),
+    )
+}
+
+/// Submit a mined block to the core and gossip it when it is new. Logs the
+/// outcome under `tag`. `None` means the core is gone.
+async fn submit_mined(network: &Network, block: Block, tag: &str) -> Option<BlockOutcome> {
+    println!(
+        "[{tag}] found candidate height {} ({} txs) {}",
+        block.header.height,
+        block.transactions.len(),
+        hex::encode(block.hash())
+    );
+    let (ack_tx, ack_rx) = oneshot::channel();
+    network
+        .node()
+        .send(NodeRequest::SubmitBlock {
+            block: Box::new(block.clone()),
+            reply: ack_tx,
+        })
+        .await
+        .ok()?;
+    let outcome = ack_rx.await.ok()?;
+    match &outcome {
+        BlockOutcome::Accepted { is_new: true, height, .. } => {
+            println!("[{tag}] won block {height} {}", hex::encode(block.hash()));
+            network.broadcast_block(&block, None);
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        BlockOutcome::Accepted { is_new: false, height, .. } => {
+            println!("[{tag}] candidate at height {height} already known");
+        }
+        BlockOutcome::Rejected { reason } => {
+            println!("[{tag}] candidate REJECTED: {reason}");
+        }
+        BlockOutcome::Orphan => {
+            println!("[{tag}] candidate ORPHAN (parent unknown)");
+        }
     }
+    Some(outcome)
+}
+
+/// Templates handed to external miners by GET /mining/work, kept so that a
+/// submitted nonce can be matched to its template. Bounded: the oldest are
+/// dropped, and a nonce for a dropped template is reported as stale.
+#[derive(Default)]
+struct WorkStore {
+    next_id: u64,
+    jobs: VecDeque<(u64, Template)>,
+}
+
+const MAX_WORK: usize = 64;
+
+/// GET /mining/work/{miner}
+///
+/// A block template for an external miner (for example the GPU miner) that
+/// pays the hex address `miner`. Returns the job id, the height, the 156-byte
+/// header with nonce 0 (hex), and the target (hex). The miner searches the
+/// nonce (the last 8 header bytes, big-endian) for SHA-256(header) < target
+/// and posts the job id and nonce to /mining/submit. Fetch new work when the
+/// chain height changes.
+async fn mining_work(
+    State(state): State<AppState>,
+    Path(miner): Path<String>,
+) -> impl IntoResponse {
+    let miner: [u8; 32] = match hex::decode(&miner).ok().and_then(|b| b.try_into().ok()) {
+        Some(m) => m,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "miner must be a 32-byte hex address" })),
+            )
+        }
+    };
+    let template = match new_template(&state.node, miner).await {
+        Some(Ok(t)) => t,
+        Some(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("assemble failed: {e}") })),
+            )
+        }
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "node core unavailable" })),
+            )
+        }
+    };
+    let body = |id: u64, t: &Template| {
+        json!({
+            "job": id,
+            "height": t.header.height,
+            "header": hex::encode(t.header.serialize()),
+            "target": hex::encode(t.header.target),
+        })
+    };
+    let mut store = state.work.lock().unwrap();
+    let id = store.next_id;
+    store.next_id += 1;
+    let response = body(id, &template);
+    store.jobs.push_back((id, template));
+    while store.jobs.len() > MAX_WORK {
+        store.jobs.pop_front();
+    }
+    (StatusCode::OK, Json(response))
+}
+
+#[derive(serde::Deserialize)]
+struct WorkSubmission {
+    job: u64,
+    nonce: u64,
+}
+
+/// POST /mining/submit  `{"job": <id>, "nonce": <u64>}`
+///
+/// Puts the nonce into the job's template and submits the block. `status` is
+/// `accepted` (new tip, gossiped), `known`, `rejected` (with `reason`),
+/// `orphan`, `stale` (job no longer held), or `invalid` (hash does not meet
+/// the target; HTTP 400).
+async fn mining_submit(
+    State(state): State<AppState>,
+    Json(sub): Json<WorkSubmission>,
+) -> impl IntoResponse {
+    let template = {
+        let store = state.work.lock().unwrap();
+        store
+            .jobs
+            .iter()
+            .find(|(id, _)| *id == sub.job)
+            .map(|(_, t)| t.clone())
+    };
+    let Some(Template {
+        mut header,
+        transactions,
+    }) = template
+    else {
+        return (StatusCode::OK, Json(json!({ "status": "stale" })));
+    };
+    header.nonce = sub.nonce;
+    if !header.meets_target() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "status": "invalid", "error": "hash does not meet the target" })),
+        );
+    }
+    let block = Block {
+        header,
+        transactions,
+    };
+    let hash = hex::encode(block.hash());
+    let body = match submit_mined(&state.network, block, "work").await {
+        Some(BlockOutcome::Accepted { is_new: true, height, .. }) => {
+            json!({ "status": "accepted", "height": height, "hash": hash })
+        }
+        Some(BlockOutcome::Accepted { is_new: false, height, .. }) => {
+            json!({ "status": "known", "height": height, "hash": hash })
+        }
+        Some(BlockOutcome::Rejected { reason }) => {
+            json!({ "status": "rejected", "reason": reason.to_string() })
+        }
+        Some(BlockOutcome::Orphan) => json!({ "status": "orphan" }),
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "node core unavailable" })),
+            )
+        }
+    };
+    (StatusCode::OK, Json(body))
 }
 
 /// POST /wallet/transaction
@@ -429,7 +585,9 @@ async fn transaction_status(
     }
 }
 
-/// GET /balance/{address} — the account's balance and next nonce from the tip.
+/// GET /balance/{address} — the account's confirmed balance and nonce at the
+/// tip, plus its pending chain: `next_nonce` (the nonce a new transaction must
+/// use) and `pending` (base units already committed by pending transactions).
 async fn balance(State(state): State<AppState>, Path(address): Path<String>) -> impl IntoResponse {
     let parsed: Option<[u8; 32]> = hex::decode(&address)
         .ok()
@@ -457,10 +615,23 @@ async fn balance(State(state): State<AppState>, Path(address): Path<String>) -> 
         );
     }
 
-    let (balance, nonce) = reply_rx.await.unwrap_or((0, 0));
+    // A missing reply is an error, never a zero balance and nonce: a wallet
+    // would sign with nonce 0 and the transaction would be rejected.
+    let Ok(info) = reply_rx.await else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "no response from node core" })),
+        );
+    };
     (
         StatusCode::OK,
-        Json(json!({ "address": address, "balance": balance, "nonce": nonce })),
+        Json(json!({
+            "address": address,
+            "balance": info.balance,
+            "nonce": info.nonce,
+            "next_nonce": info.next_nonce,
+            "pending": info.pending_debit,
+        })),
     )
 }
 

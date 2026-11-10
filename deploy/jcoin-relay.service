@@ -1,17 +1,22 @@
 [Unit]
-Description=JeffyCoin relay (multiplexing router)
+Description=JeffyCoin relay (libp2p circuit relay + rendezvous)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 # Expects the lean static binary at this path. Port 9000 is unprivileged, so no
-# extra capabilities are needed. Override the port with: --addr 0.0.0.0:PORT
-ExecStart=/usr/local/bin/jcoin-relay --addr 0.0.0.0:9000
+# extra capabilities are needed. Replace RELAY_IP with the instance's public
+# (static) IP: the relay serves reservations only once it knows it.
+ExecStart=/usr/local/bin/jcoin-relay --addr 0.0.0.0:9000 --external RELAY_IP:9000 --key-file /var/lib/jcoin-relay/relay_key
+# Keeps the identity key across restarts, so the relay's peer id (part of the
+# address nodes use) does not change. Created owned by the dynamic user.
+StateDirectory=jcoin-relay
 Restart=always
 RestartSec=3
 
-# The relay is stateless (in-memory directory only); a restart just drops live
-# pairings and nodes reconnect within a few seconds.
+# Apart from its key, the relay keeps no state; a restart drops live circuits
+# and rendezvous registrations, and nodes reconnect and re-register within a
+# few seconds.
 
 # Hardening: run as an ephemeral unprivileged user with a locked-down view.
 DynamicUser=yes
@@ -20,7 +25,9 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-RestrictAddressFamilies=AF_INET AF_INET6
+# AF_NETLINK is required: libp2p enumerates local network interfaces over a
+# netlink socket at startup. Without it the relay exits 1 immediately.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

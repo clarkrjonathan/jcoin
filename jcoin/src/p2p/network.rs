@@ -1,28 +1,28 @@
 //! The shared P2P runtime handle: the peer registry, the address book, gossip
-//! fan-out, and the dialer.
+//! fan-out, and dial requests.
 //!
 //! `Network` is cloned into every connection task and into the REST state. It
-//! tracks connected peers by a local, ephemeral `PeerId` (not a protocol node
-//! identifier), remembers learned peer addresses, and can dial a learned
-//! `Direct` endpoint to grow the mesh.
+//! tracks protocol sessions (one per `run_peer`) by a local, ephemeral
+//! `PeerId` (a counter, not the libp2p peer id), remembers learned peer
+//! addresses, and asks the libp2p host to dial newly learned ones.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::net::TcpStream;
+use libp2p::multiaddr::Protocol;
+use libp2p::Multiaddr;
 use tokio::sync::mpsc;
 
 use crate::block::Block;
 use crate::node::NodeRequest;
 use crate::Transaction;
 
-use super::addr::{Endpoint, Handle};
 use super::message::Message;
 
-/// Local, per-process identifier for a connected peer. Assigned on connect and
-/// forgotten on disconnect. It never appears on the wire.
+/// Local, per-process identifier for one protocol session with a peer.
+/// Assigned when `run_peer` starts and forgotten when it ends. It never
+/// appears on the wire.
 pub type PeerId = u64;
 
 /// Most addresses to return in one `ADDR` reply.
@@ -30,36 +30,46 @@ const ADDR_SAMPLE: usize = 64;
 
 /// Most entries read from one received `ADDR` message; the rest are ignored.
 /// A legitimate reply holds at most `ADDR_SAMPLE` plus a few advertised
-/// endpoints, so this only limits abuse.
+/// addresses, so this only limits abuse.
 pub const MAX_ADDR_PER_MESSAGE: usize = 256;
 
-/// Most endpoints kept in the address book. When it is full, a new endpoint
+/// Most addresses kept in the address book. When it is full, a new address
 /// replaces a random existing one, so a single peer cannot fill the book once
 /// and lock out every later address.
 pub const MAX_BOOK: usize = 1_000;
+
+/// The libp2p peer id at the end of an address (`.../p2p/<id>`), if any.
+pub fn peer_of(addr: &Multiaddr) -> Option<libp2p::PeerId> {
+    match addr.iter().last() {
+        Some(Protocol::P2p(id)) => Some(id),
+        _ => None,
+    }
+}
 
 struct Inner {
     peers: Mutex<HashMap<PeerId, mpsc::Sender<Message>>>,
     next_id: AtomicU64,
     /// Learned peer addresses.
-    book: Mutex<HashSet<Endpoint>>,
-    /// Direct addresses already dialed, to avoid hammering the same peer.
-    attempted: Mutex<HashSet<SocketAddr>>,
-    /// Outbound dials started but not yet connected or failed. They count
-    /// toward `max_peers`, so one `ADDR` cannot start thousands of dials.
+    book: Mutex<HashSet<Multiaddr>>,
+    /// Addresses already handed to the host to dial, to avoid hammering the
+    /// same peer. Cleared by the host when a dial fails or a peer disconnects.
+    attempted: Mutex<HashSet<Multiaddr>>,
+    /// Dials requested but not yet connected or failed. They count toward
+    /// `max_peers`, so one `ADDR` cannot start thousands of dials.
     dialing: AtomicUsize,
-    /// This node's own reachable endpoints, advertised to peers. Mutable so the
-    /// relay client can add a `Relay` endpoint once it has a handle.
-    advertised: Mutex<Vec<Endpoint>>,
+    /// This node's own reachable addresses (with `/p2p/<own id>`), advertised
+    /// to peers. Kept current by the libp2p host.
+    advertised: Mutex<Vec<Multiaddr>>,
+    /// libp2p peers with an open connection, kept current by the host.
+    connected: Mutex<HashSet<libp2p::PeerId>>,
     /// This node's P2P listen port, placed in the outgoing `HELLO`.
     listen_port: u16,
     /// Channel into the node core.
     node: mpsc::Sender<NodeRequest>,
     /// Soft cap on the number of peers before the dialer stops reaching out.
     max_peers: usize,
-    /// When a relay client is running, learned `Relay` endpoints are opened
-    /// through it by sending the handle here.
-    relay_open: Mutex<Option<mpsc::Sender<Handle>>>,
+    /// Dial requests to the libp2p host, once it is running.
+    dialer: Mutex<Option<mpsc::Sender<Multiaddr>>>,
 }
 
 #[derive(Clone)]
@@ -71,7 +81,7 @@ impl Network {
     pub fn new(
         node: mpsc::Sender<NodeRequest>,
         listen_port: u16,
-        advertised: Vec<Endpoint>,
+        advertised: Vec<Multiaddr>,
         max_peers: usize,
     ) -> Self {
         Network {
@@ -82,10 +92,11 @@ impl Network {
                 attempted: Mutex::new(HashSet::new()),
                 dialing: AtomicUsize::new(0),
                 advertised: Mutex::new(advertised),
+                connected: Mutex::new(HashSet::new()),
                 listen_port,
                 node,
                 max_peers,
-                relay_open: Mutex::new(None),
+                dialer: Mutex::new(None),
             }),
         }
     }
@@ -98,44 +109,75 @@ impl Network {
         self.inner.listen_port
     }
 
-    pub fn advertised(&self) -> Vec<Endpoint> {
+    pub fn advertised(&self) -> Vec<Multiaddr> {
         self.inner.advertised.lock().unwrap().clone()
     }
 
-    /// Add one of this node's own reachable endpoints (used by the relay client
-    /// once it has a handle).
-    pub fn add_advertised(&self, endpoint: Endpoint) {
+    /// Add one of this node's own reachable addresses (the host calls this for
+    /// each listen address and for a relayed address once a reservation holds).
+    pub fn add_advertised(&self, addr: Multiaddr) {
         let mut advertised = self.inner.advertised.lock().unwrap();
-        if !advertised.contains(&endpoint) {
-            advertised.push(endpoint);
+        if !advertised.contains(&addr) {
+            advertised.push(addr);
         }
     }
 
-    /// Register the relay client's open channel. Learned `Relay` endpoints are
-    /// routed here to be opened.
-    pub fn set_relay_opener(&self, opener: mpsc::Sender<Handle>) {
-        *self.inner.relay_open.lock().unwrap() = Some(opener);
+    /// Remove one of this node's addresses (for example, an expired listener).
+    pub fn remove_advertised(&self, addr: &Multiaddr) {
+        self.inner.advertised.lock().unwrap().retain(|a| a != addr);
     }
 
-    /// Clear the relay opener when the relay client stops.
-    pub fn clear_relay_opener(&self) {
-        *self.inner.relay_open.lock().unwrap() = None;
+    /// Register the libp2p host's dial channel. Learned addresses are sent here.
+    pub fn set_dialer(&self, dialer: mpsc::Sender<Multiaddr>) {
+        *self.inner.dialer.lock().unwrap() = Some(dialer);
     }
 
-    /// Register a peer's outbound channel and return its new id.
+    /// Register a protocol session's outbound channel and return its new id.
     pub fn register(&self, sender: mpsc::Sender<Message>) -> PeerId {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         self.inner.peers.lock().unwrap().insert(id, sender);
         id
     }
 
-    /// Drop a peer from the registry.
+    /// Drop a protocol session from the registry.
     pub fn remove(&self, id: PeerId) {
         self.inner.peers.lock().unwrap().remove(&id);
     }
 
+    /// Number of protocol sessions (peers we gossip with).
     pub fn peer_count(&self) -> usize {
         self.inner.peers.lock().unwrap().len()
+    }
+
+    /// Record that the host now has (or no longer has) a connection to `peer`.
+    /// On disconnect, its addresses may be dialed again when learned.
+    pub fn set_connected(&self, peer: libp2p::PeerId, connected: bool) {
+        if connected {
+            self.inner.connected.lock().unwrap().insert(peer);
+        } else {
+            self.inner.connected.lock().unwrap().remove(&peer);
+            self.inner
+                .attempted
+                .lock()
+                .unwrap()
+                .retain(|a| peer_of(a) != Some(peer));
+        }
+    }
+
+    pub fn is_connected(&self, peer: &libp2p::PeerId) -> bool {
+        self.inner.connected.lock().unwrap().contains(peer)
+    }
+
+    /// The host reports that a requested dial finished. A failed address may
+    /// be dialed again when learned again.
+    pub fn dial_finished(&self, addr: &Multiaddr, succeeded: bool) {
+        let _ = self
+            .inner
+            .dialing
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        if !succeeded {
+            self.inner.attempted.lock().unwrap().remove(addr);
+        }
     }
 
     /// Send a transaction to every peer except `except`. Non-blocking: a full
@@ -161,45 +203,30 @@ impl Network {
         }
     }
 
-    /// Addresses to share in an `ADDR`: this node's own endpoints plus a sample
-    /// of the book.
-    pub fn known_addrs(&self) -> Vec<Endpoint> {
+    /// Addresses to share in an `ADDR`: this node's own addresses plus a
+    /// sample of the book.
+    pub fn known_addrs(&self) -> Vec<Multiaddr> {
         let mut out = self.inner.advertised.lock().unwrap().clone();
         let book = self.inner.book.lock().unwrap();
-        for endpoint in book.iter().take(ADDR_SAMPLE) {
-            out.push(endpoint.clone());
+        for addr in book.iter().take(ADDR_SAMPLE) {
+            out.push(addr.clone());
         }
         out
     }
 
-    /// Handles in the book reachable through the given relay. Used by the relay
-    /// client at registration to open channels to peers already known.
-    pub fn relay_handles(&self, relay: SocketAddr) -> Vec<Handle> {
-        self.inner
-            .book
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|endpoint| match endpoint {
-                Endpoint::Relay { relay: r, handle } if *r == relay => Some(*handle),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Add endpoints to the book, returning the ones not already known. This
-    /// node's own advertised endpoints are never stored. At most
+    /// Add addresses to the book, returning the ones not already known. This
+    /// node's own advertised addresses are never stored. At most
     /// `MAX_ADDR_PER_MESSAGE` entries are read, and the book never grows past
     /// `MAX_BOOK` (a random entry is evicted to make room).
-    pub fn learn(&self, endpoints: Vec<Endpoint>) -> Vec<Endpoint> {
+    pub fn learn(&self, addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
         use rand::Rng;
 
         let advertised = self.inner.advertised.lock().unwrap().clone();
         let mut book = self.inner.book.lock().unwrap();
         let mut rng = rand::thread_rng();
         let mut fresh = Vec::new();
-        for endpoint in endpoints.into_iter().take(MAX_ADDR_PER_MESSAGE) {
-            if advertised.contains(&endpoint) || book.contains(&endpoint) {
+        for addr in addrs.into_iter().take(MAX_ADDR_PER_MESSAGE) {
+            if advertised.contains(&addr) || book.contains(&addr) {
                 continue;
             }
             if book.len() >= MAX_BOOK {
@@ -208,72 +235,52 @@ impl Network {
                     book.remove(&victim);
                 }
             }
-            book.insert(endpoint.clone());
-            fresh.push(endpoint);
+            book.insert(addr.clone());
+            fresh.push(addr);
         }
         fresh
     }
 
-    /// Number of endpoints in the address book.
+    /// Number of addresses in the address book.
     pub fn book_len(&self) -> usize {
         self.inner.book.lock().unwrap().len()
     }
 
-    /// Number of outbound dials in progress.
+    /// Number of dials in progress.
     pub fn dials_in_flight(&self) -> usize {
         self.inner.dialing.load(Ordering::Relaxed)
     }
 
-    /// Act on newly-learned endpoints. A `Direct` endpoint is dialed within the
-    /// peer cap, skipping any already attempted or belonging to this node. A
-    /// `Relay` endpoint is handed to the relay client to open, if one is running.
-    pub fn maybe_dial(&self, endpoints: Vec<Endpoint>) {
+    /// Ask the host to dial newly learned addresses, within the peer cap,
+    /// skipping this node's own addresses, peers already connected, and
+    /// addresses already attempted.
+    pub fn maybe_dial(&self, addrs: Vec<Multiaddr>) {
+        let Some(dialer) = self.inner.dialer.lock().unwrap().clone() else {
+            return;
+        };
         let advertised = self.inner.advertised.lock().unwrap().clone();
-        for endpoint in endpoints {
-            match endpoint {
-                Endpoint::Direct(addr) => {
-                    let in_flight = self.inner.dialing.load(Ordering::Relaxed);
-                    if self.peer_count() + in_flight >= self.inner.max_peers {
-                        continue;
-                    }
-                    if advertised.contains(&Endpoint::Direct(addr)) {
-                        continue;
-                    }
-                    {
-                        let mut attempted = self.inner.attempted.lock().unwrap();
-                        if !attempted.insert(addr) {
-                            continue; // already tried
-                        }
-                    }
-                    self.inner.dialing.fetch_add(1, Ordering::Relaxed);
-                    let this = self.clone();
-                    tokio::spawn(this.dial(addr));
-                }
-                Endpoint::Relay { handle, .. } => {
-                    let opener = self.inner.relay_open.lock().unwrap().clone();
-                    if let Some(tx) = opener {
-                        let _ = tx.try_send(handle);
-                    }
+        let own: HashSet<libp2p::PeerId> = advertised.iter().filter_map(peer_of).collect();
+        for addr in addrs {
+            let in_flight = self.inner.dialing.load(Ordering::Relaxed);
+            if self.peer_count() + in_flight >= self.inner.max_peers {
+                return;
+            }
+            if advertised.contains(&addr) {
+                continue;
+            }
+            if let Some(peer) = peer_of(&addr) {
+                if own.contains(&peer) || self.is_connected(&peer) {
+                    continue;
                 }
             }
-        }
-    }
-
-    /// Connect to a direct address and run it as a peer. One-shot: on
-    /// disconnect the address is cleared from `attempted` so it can be redialed
-    /// if learned again.
-    async fn dial(self, addr: SocketAddr) {
-        let connected = TcpStream::connect(addr).await;
-        // The dial is no longer in flight; a connected peer is counted by the
-        // registry once its handshake completes.
-        self.inner.dialing.fetch_sub(1, Ordering::Relaxed);
-        match connected {
-            Ok(stream) => {
-                super::peer::run_peer(stream, self.clone(), format!("{addr} (auto)")).await;
+            if !self.inner.attempted.lock().unwrap().insert(addr.clone()) {
+                continue; // already tried
             }
-            Err(e) => eprintln!("[p2p] auto-dial {addr} failed: {e}"),
+            self.inner.dialing.fetch_add(1, Ordering::Relaxed);
+            if dialer.try_send(addr.clone()).is_err() {
+                self.dial_finished(&addr, false);
+            }
         }
-        self.inner.attempted.lock().unwrap().remove(&addr);
     }
 }
 
@@ -281,9 +288,9 @@ impl Network {
 mod tests {
     use super::*;
 
-    fn direct(i: u32) -> Endpoint {
+    fn addr(i: u32) -> Multiaddr {
         let ip = std::net::Ipv4Addr::from(0x0a00_0000 + i); // 10.x.x.x
-        Endpoint::Direct(SocketAddr::from((ip, 8333)))
+        format!("/ip4/{ip}/tcp/8333").parse().unwrap()
     }
 
     fn network(max_peers: usize) -> Network {
@@ -296,31 +303,51 @@ mod tests {
     #[test]
     fn address_book_is_bounded() {
         let net = network(8);
-        let fresh = net.learn((0..60_000).map(direct).collect());
+        let fresh = net.learn((0..60_000).map(addr).collect());
         assert_eq!(fresh.len(), MAX_ADDR_PER_MESSAGE);
         for batch in 1..20u32 {
             let start = batch * 10_000;
-            net.learn((start..start + 1_000).map(direct).collect());
+            net.learn((start..start + 1_000).map(addr).collect());
         }
         assert_eq!(net.book_len(), MAX_BOOK);
     }
 
     #[test]
-    fn known_and_own_endpoints_are_not_fresh() {
+    fn known_and_own_addresses_are_not_fresh() {
         let (node, _rx) = mpsc::channel(1);
-        let net = Network::new(node, 8333, vec![direct(1)], 8);
-        let fresh = net.learn(vec![direct(1), direct(2), direct(2)]);
-        assert_eq!(fresh, vec![direct(2)]);
-        assert!(net.learn(vec![direct(2)]).is_empty());
+        let net = Network::new(node, 8333, vec![addr(1)], 8);
+        let fresh = net.learn(vec![addr(1), addr(2), addr(2)]);
+        assert_eq!(fresh, vec![addr(2)]);
+        assert!(net.learn(vec![addr(2)]).is_empty());
     }
 
-    // S5: in-flight dials count toward max_peers, so learning many endpoints
-    // starts at most max_peers dials.
+    // S5: in-flight dials count toward max_peers, so learning many addresses
+    // requests at most max_peers dials.
     #[tokio::test]
     async fn dials_in_flight_are_capped_by_max_peers() {
         let net = network(4);
-        let fresh = net.learn((0..200).map(direct).collect());
+        let (dial_tx, mut dial_rx) = mpsc::channel(1_000);
+        net.set_dialer(dial_tx);
+        let fresh = net.learn((0..200).map(addr).collect());
         net.maybe_dial(fresh);
-        assert!(net.dials_in_flight() <= 4, "{} dials", net.dials_in_flight());
+        assert_eq!(net.dials_in_flight(), 4);
+        let mut requested = 0;
+        while dial_rx.try_recv().is_ok() {
+            requested += 1;
+        }
+        assert_eq!(requested, 4);
+        // A failed dial frees its slot, and its address may be tried again.
+        net.dial_finished(&addr(0), false);
+        assert_eq!(net.dials_in_flight(), 3);
+        net.maybe_dial(vec![addr(0)]);
+        assert_eq!(net.dials_in_flight(), 4);
+    }
+
+    #[test]
+    fn peer_of_reads_the_trailing_peer_id() {
+        let id = libp2p::PeerId::random();
+        let with: Multiaddr = format!("/ip4/127.0.0.1/tcp/1/p2p/{id}").parse().unwrap();
+        assert_eq!(peer_of(&with), Some(id));
+        assert_eq!(peer_of(&addr(1)), None);
     }
 }

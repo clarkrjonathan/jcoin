@@ -7,9 +7,116 @@ vault at `Chudjacknostim-Reorganized/Projects/JeffyCoin/`.
 ## Status at a glance
 
 - Branch: `initial-vertical`. **Nothing is pushed to GitHub** — all local.
-- Build: `cd jcoin && cargo build` is clean. `cargo test --lib` = **79 passing**.
+- Build: `cd jcoin && cargo build` is clean. `cargo test --lib` = **85 passing**.
 - The working tree shows modifications under `spike/` — those predate this work
   and are not part of it. `spike/` is frozen scratchwork; ignore it.
+
+## Where the last session (2026-11-09) stopped
+
+Commits made that day: `0fb1bcb` (reward halving, JEF base unit) and `499e695`
+(structural audit fixes S1-S8). **Uncommitted** in the working tree (Jonathan
+had not yet approved a commit):
+1. Queued pending transactions per sender (`mempool.rs`, `/balance` reports
+   `next_nonce` and `pending`, the wallet uses them).
+2. The move to rust-libp2p 0.57 (`p2p/host.rs`, `p2p/relay_host.rs`; the old
+   relay router, relay client, and relay framing were deleted; wire version 2).
+3. `demo/` (scripts; its chain data, keys, and logs are git-ignored).
+4. Doc updates for all of the above.
+
+Rules Jonathan set that day:
+- All live testing runs on the one persisted chain in `demo/`. Never start a
+  fresh chain for live tests. (`cargo test` keeps its in-memory REGTEST chains.)
+- "Commit" means a local commit only. Never push without an explicit request.
+- No Claude co-author or "Generated with Claude" lines in commits.
+- Do not run `cargo fmt`.
+
+Open decisions (his to make):
+1. **Block capacity.** A v1 block holds one transfer, about 12 transactions per
+   hour at 5-minute blocks. The demo's queues fill up (25-per-sender cap). This
+   is a consensus change; decide it before friends run nodes.
+2. **Commit** the uncommitted work above; then **GitHub**: private repo with
+   collaborators, or public.
+3. **Reachability for friends**: deploy the relay (`DEPLOY-RELAY.md`; needs his
+   AWS account), port forwarding, or Tailscale.
+
+Planned work for friends to join (proposed, not started): a safety pass (REST
+should default to `127.0.0.1`, not `0.0.0.0`), release builds for all miners
+(debug miners lose to release miners), `JOINING.md` plus a join script, and a
+build of the static musl relay binary (not verified yet).
+
+### Dedicated miner (iMac)
+
+The dedicated miner is an iMac14,1 (late 2013, 4 cores, 8 GB RAM, 256 GB
+Apple SSD). It runs Debian 13 from its **internal SSD** (installed
+2026-11-09). The image, its build configuration, and the console password are
+in `~/Documents/senior_year/jcoin-miner-image/` (see the README there).
+- Login: `ssh miner@jcoin-miner.local` (key `~/.ssh/id_ed25519`, passwordless
+  sudo, key-only SSH). Wired Ethernet `enp3s0f0`, DHCP (10.0.0.88 at install).
+- It boots Debian without a keyboard. The SD card is no longer used: Linux
+  cannot drive this iMac's Broadcom SD reader (command timeouts), so the image
+  was written over the internal SSD from the old Ubuntu, which is gone.
+- Verified on the hardware: boot, DHCP, SSH, sudo, root filesystem grown to
+  the full SSD, `screen-off.service` active with backlight 0, no failed units.
+  The only boot errors are from the unused Wi-Fi driver (b43).
+- The old Ubuntu ran two Minecraft servers. Their world folders are backed up,
+  checksum-verified, in `~/Documents/senior_year/imac-minecraft-backup/`.
+- **Mining since 2026-11-09:** systemd unit `jcoin-node` (enabled) runs
+  `/usr/local/bin/jcoin-node` (release build of the uncommitted working tree,
+  copied to `~/jcoin` on the iMac) with `--data-dir /var/lib/jcoin`, P2P on
+  `0.0.0.0:8333`, REST on `127.0.0.1:3000`, rewards to the key `imac` in
+  `demo/keys/`. It joined the persisted chain at height 151 (synced first,
+  then mining enabled, so it could not fork from genesis).
+- **Reference point for difficulty analysis:** the iMac mined its first block
+  at height **152** (2026-11-09 22:30:56 local, 04:30:56 UTC); it synced to
+  151 first. Heights 1-151 had only the three laptop miners (debug builds).
+  `demo/miners.py` attributes every block on the best chain to its coinbase
+  key (noah, jon, holden, imac), per epoch and since height 152. Jonathan's
+  working assumption (2026-11-09): the jump in mining power from the iMac
+  explains the unstable block times; recheck with `miners.py` after the chain
+  has run for a while, before changing the retarget rule.
+- **Second reference point:** the laptop miners (noah, jon, holden) switched
+  from debug to release builds at height **180** (the chain was at 179 when
+  they restarted, 2026-11-09 about 23:27 local). `demo/start.sh` and
+  `demo/txgen.sh` now use `target/release`. So for difficulty analysis:
+  1-151 three debug miners; 152-179 plus the iMac (release); 180 onward all
+  four miners on release builds. Epoch 180-191 is the first clean epoch.
+- **Decision (Jonathan, 2026-11-09):** GPUs are eventually meant to be the main
+  miners. Proof of work stays GPU-friendly (SHA-256 now; a GPU-oriented
+  algorithm is possible later); a GPU miner has to be written. The retarget
+  rule still needs to react faster (per-block LWMA was recommended), pending
+  the data review.
+- **Data review (2026-11-10):** with the miners unchanged from 180, the rule
+  converged as its formula predicts: 180-191 58 s/block (4x clamp), 192-203
+  234 s, 204-215 296 s. The working assumption holds; no bias in the formula
+  was found. The remaining problem is speed: a large change in mining power
+  takes several epochs to absorb because of the 4x clamp and the one-epoch lag.
+- **Third reference point:** the GPU miner (`gpu-miner/`, Intel Iris Xe, about
+  140 MH/s, key `gpu`, started with `GPU=1 demo/start.sh` against noah) mined
+  its first block at height **216** (2026-11-10 about 01:40 local). The CPU
+  miners and the iMac keep mining. The GPU is about 15x the CPU network, so
+  epochs from 216 run far below 300 s/block until the 4x steps catch up.
+- The laptop firewall (ufw) blocks inbound LAN connections, so the laptop
+  dials the iMac: `demo/start.sh` gives noah `--peer $IMAC_PEER`
+  (default `10.0.0.88:8333`). If the iMac's DHCP address changes, set
+  `IMAC_PEER` or reserve the address in the router.
+- Hardware fixes on this iMac (it froze once, idle, about 12 min after boot):
+  - GPU runtime suspend is disabled (`/usr/local/sbin/screen-off` writes `on`
+    to `0000:00:02.0/power/control`). i915 runtime PM tried to enter PC8 every
+    23 s and logged a WARN each time ("PCH PWM1 enabled"); this is the likely
+    cause of the freeze.
+  - ACPI GPE 06 is masked (`acpi_mask_gpe=0x06` in
+    `/etc/default/grub.d/90-jcoin-miner.cfg`); it fired about 25,000 times
+    per second and used about 80% of one core.
+  - Hardware watchdog: `RuntimeWatchdogSec=60s`
+    (`/etc/systemd/system.conf.d/10-watchdog.conf`) reboots it if it hangs.
+  - Serial console removed from the kernel command line and
+    `serial-getty@ttyS0` masked (the iMac has no serial port).
+- The miner uses one CPU core (the node mines on one thread); the iMac
+  has four.
+
+The demo network (relay + Noah/Jon/Holden miners + `txgen.sh`) was left
+running on the Mint laptop when the session ended. `demo/stop.sh` stops it;
+`demo/start.sh` resumes the same chain.
 
 ## What JeffyCoin is now
 
@@ -47,32 +154,36 @@ propagates, and balances settle consistently on a node that never saw the wallet
   greatest cumulative work; reorg is a pointer move.
 - **Chain sync**: `NEW_BLOCK` gossip; a behind node sends a block locator via
   `GET_BLOCKS` and receives `BLOCKS` (initial download and orphan catch-up).
-- **P2P** (`src/p2p/`): `JEFY` frame codec (`frame`), gossip messages
-  (`message`), the `PeerLink` seam (`link`), handshake + heartbeat + run loop
-  (`peer`), peer registry / address book / dialer (`network`), peer discovery
-  (`GET_ADDR` / `ADDR`), and the relay transport — a multiplexing router
-  (`relay_server`, the `relay` binary) that pairs node channels by ephemeral
-  handle, serves a handle directory (`LIST`/`HANDLES`) so an all-CGNAT network
-  self-bootstraps, and forwards opaque `DATA`, with the node-side client in
-  `relay_client`. Deployment: `docs/DEPLOY-RELAY.md` + `deploy/` (systemd unit,
-  Dockerfile); build lean with `--no-default-features --bin relay`.
+- **P2P** (`src/p2p/`): the JeffyCoin protocol — `JEFY` frame codec
+  (`frame`), messages (`message`), multiaddr `ADDR` encoding (`addr`), the
+  `PeerLink` seam (`link`), handshake + heartbeat + run loop (`peer`), session
+  registry / address book / dial requests (`network`) — runs unchanged on
+  libp2p (`host`): one `/jeffycoin/2.0.0` stream per peer over TCP or a relay
+  circuit, Noise-encrypted, Yamux-multiplexed, with peer ids from an Ed25519
+  key in `<data-dir>/node_key`. NAT traversal: circuit relay v2, rendezvous
+  discovery (namespace `jeffycoin`) and DCUtR hole punching. The `relay`
+  binary (`relay_host`) is the relay + rendezvous node. Deployment:
+  `docs/DEPLOY-RELAY.md` + `deploy/`; build lean with
+  `--no-default-features --bin relay`.
 - **Persistence** (`src/store.rs`): append-only block log; state is replayed on
   startup, so blocks are the single source of truth. Enable with `--data-dir`.
-- **Node** (`src/bin/node.rs`): node-core task + axum REST + P2P listener/dialers
-  + optional relay client + optional miner. Full nonce/balance validation on
+- **Node** (`src/bin/node.rs`): node-core task + axum REST + libp2p host
+  (`--p2p-addr`, `--peer`, `--relay`, `--no-listen`, `--key-file`) + optional
+  miner. Full nonce/balance validation on
   submit (ADR 000). `/chain` exposes height, tip, and the difficulty target.
 - **Wallet** (`src/bin/wallet.rs`): clap CLI; `key new/show`, `transaction
   new/status`; fetches nonce+balance and refuses to overspend.
 
 ### Tests
 
-`cargo test --lib` (79). Highlights: frame/message/addr/relay round-trips;
-handshake + self-connection; gossip (direct and through the relay); late-joiner
+`cargo test --lib` (85). Highlights: frame/message/addr round-trips;
+handshake + self-connection; gossip over TCP and over libp2p (direct, and
+relay-only nodes that find each other through rendezvous); late-joiner
 sync; work-based reorg; retarget hardening/cap; median-time-past rejection; an
 adversarial block battery (bad PoW, wrong target, bad tx hash, bad body, bad
 signature, overspend, unknown version or type, non-canonical coinbase); the
 mempool (conflicts, cap, re-admission); torn block-log repair; address-book and
-dial caps; relay eviction of a slow receiver; the halving enforced by
+dial caps; queued transactions confirming in order; the halving enforced by
 `chain.accept` across a real boundary. Tests run the real code with the
 `REGTEST` parameter set (easy PoW, zero genesis timestamp), so they mine in
 milliseconds.
@@ -94,9 +205,11 @@ cargo run --bin node -- --rest-addr 127.0.0.1:3000 --p2p-addr 127.0.0.1:8333 \
 cargo run --bin node -- --rest-addr 127.0.0.1:3001 --p2p-addr 127.0.0.1:8334 \
   --peer 127.0.0.1:8333 --data-dir ./dataB
 
-# Relay (for nodes behind CGNAT): cargo run --bin relay -- --addr 127.0.0.1:9000
-#   then start nodes with --relay 127.0.0.1:9000 (and --relay-open <handle> to
-#   bootstrap to a known peer handle).
+# Relay (for nodes behind NAT):
+cargo run --bin relay -- --addr 127.0.0.1:9000 --key-file ./relay_key
+#   It prints its address, /ip4/127.0.0.1/tcp/9000/p2p/<relay id>
+#   (or: relay ... --show-address). Start nodes with --relay <that address>;
+#   add --no-listen for a node reachable only through the relay.
 
 # Wallet
 cargo run --bin wallet -- key new alice
@@ -105,15 +218,16 @@ cargo run --bin wallet -- --node http://127.0.0.1:3000 \
 curl -s localhost:3000/chain   # height, tip, difficulty target
 ```
 
-## Live demo harness (ephemeral)
+## Live demo network (persisted)
 
-A demo lives in the session scratchpad (NOT the repo, so it will not survive):
-three mining nodes (one each for Noah / Jon / Holden), a random transaction
-generator (`txgen.sh`) writing `txgen.log`, a `stop.sh`, and `keys.txt`
-(name → address). If you want to keep it, move `txgen.sh` / `stop.sh` into the
-repo. As of this handoff the demo is running on the retargeting binary and its
-difficulty is ramping correctly toward ~5-minute blocks (it steps ~4x per
-12-block epoch). Three miners peg three cores continuously; `stop.sh` ends it.
+`demo/` in the repo holds the one persisted demo chain. **All live testing
+runs on it; do not start fresh chains for live tests.** `start.sh` starts a
+relay and three mining nodes on the existing `data-*/` dirs: Noah and Jon
+listen directly, Holden is relay-only (`--no-listen`) and finds them through
+rendezvous. `txgen.sh` sends random transfers (logged to `txgen.log`),
+`status.sh` prints heights and balances, `stop.sh` stops everything (the chain
+stays). Chain data, keys, and logs are git-ignored. The miners keep three
+cores busy while it runs.
 
 ## Known limitations / not built
 
@@ -124,8 +238,9 @@ time-warp, no finality). Summary:
 - **Reorg mempool re-add**: transactions dropped by a reorg are not re-queued
   automatically. Resubmitting one now works (the mempool, not the seen cache,
   decides admission).
-- **Relay**: one TCP connection per node multiplexes all channels, so a stalled
-  channel head-of-line-blocks the rest; handle rotation is not implemented.
+- **Relay**: one relay per node; the address book is not persisted.
+- **Throughput**: a v1 block holds one transfer, so the network confirms
+  about 12 transactions per hour at 5-minute blocks.
 - **No misbehaviour scoring/banning** (the notes mention a blacklist).
 - No block/consensus-version signaling.
 - **Persistence** stores blocks only and never compacts the log.
@@ -154,8 +269,9 @@ time-warp, no finality). Summary:
 
 ## Suggested next steps
 
-1. Reorg mempool re-add (and surface mempool contents via REST).
-2. Relay hardening: handle rotation, per-channel flow control, the rendezvous
-   directory described in `p2p-protocol.md`.
-3. Misbehaviour scoring / peer banning.
-4. Push to GitHub and open the work for the friend nodes.
+1. Decide block capacity (transfers per block): the throughput limit above.
+2. The audit's medium findings M1/M3/M4 (one gossip component driven by core
+   events, typed errors, a `NodeHandle`), then peer scoring (V2).
+3. Fork-store pruning (V1), reorg mempool re-add (O1).
+4. Several relays per node and a persisted address book.
+5. Push to GitHub and open the work for the friend nodes.

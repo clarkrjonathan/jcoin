@@ -25,10 +25,11 @@ pub struct Params {
     pub genesis_timestamp: u64,
     /// Target average seconds between blocks. Difficulty retargets toward it.
     pub target_block_time: u64,
-    /// Blocks per difficulty epoch. Difficulty is constant within an epoch and
-    /// recomputed only at an epoch boundary.
-    pub retarget_window: u64,
-    /// Largest per-epoch difficulty change factor.
+    /// Number of recent blocks in the LWMA difficulty window. Difficulty is
+    /// recomputed every block from a linearly weighted average of the solvetimes
+    /// of the last `lwma_window` blocks (recent blocks weighted more).
+    pub lwma_window: u64,
+    /// Largest per-step difficulty change factor (clamps each retarget).
     pub max_adjust_factor: u64,
     /// Number of recent blocks whose median timestamp a new block must exceed.
     pub median_time_span: usize,
@@ -38,20 +39,24 @@ pub struct Params {
     pub halving_interval: u64,
 }
 
-/// The real network.
+/// The real network (consensus v2).
 ///
-/// `pow_limit` (top 20 bits zero) is the easy starting point from which the
-/// chain hardens toward `target_block_time`; it was calibrated from a
-/// debug-build hash rate, so it is machine-specific (KNOWN-ISSUES O6).
+/// `pow_limit` (top 35 bits zero) is the easy starting point and genesis target.
+/// It was set from a release-build hash-rate measurement (2026-11-10): the launch
+/// field (laptop GPU ~100 MH/s plus CPUs) at 300 s/block needs ~35 leading-zero
+/// bits (ADR 0001). The LWMA retarget absorbs later hash-rate changes, so this
+/// only has to be close.
+/// `genesis_timestamp` is set to the actual launch time at the genesis cut; the
+/// value here is a placeholder near the planned launch and MUST be refreshed then.
 /// `halving_interval` = 32,000 blocks, about 111 days at 5-minute blocks, puts
 /// the 33rd halving (where the subsidy reaches zero) at about 10 years. Total
 /// supply is just under `2 * initial_reward * halving_interval` (3,200,000
 /// JEF), about 89% of it minted in year 1.
 pub const MAINNET: Params = Params {
-    pow_limit: limit_with_zero_bits(20),
-    genesis_timestamp: 1_700_000_000,
+    pow_limit: limit_with_zero_bits(35),
+    genesis_timestamp: 1_763_000_000, // placeholder; set to launch time at the genesis cut
     target_block_time: 300,
-    retarget_window: 12,
+    lwma_window: 60,
     max_adjust_factor: 4,
     median_time_span: 11,
     initial_reward: 50 * COIN,
@@ -66,12 +71,19 @@ pub const REGTEST: Params = Params {
     pow_limit: limit_with_zero_bits(16),
     genesis_timestamp: 0,
     target_block_time: 300,
-    retarget_window: 12,
+    lwma_window: 12,
     max_adjust_factor: 4,
     median_time_span: 11,
     initial_reward: 50 * COIN,
     halving_interval: 150,
 };
+
+/// The consensus version a block at `height` must carry. A future rule change
+/// bumps this at a chosen activation height, so nodes validate by the version the
+/// height selects and no restart is needed. v2 is the current (genesis) rule set.
+pub const fn consensus_version(_height: u64) -> u32 {
+    2
+}
 
 /// A target whose top `bits` bits are zero and the rest one.
 const fn limit_with_zero_bits(bits: usize) -> [u8; 32] {
@@ -109,6 +121,8 @@ impl Params {
 pub struct BlockContext {
     /// The block's height (parent height + 1).
     pub height: u64,
+    /// The consensus version the header must carry (`consensus_version(height)`).
+    pub version: u32,
     /// The largest subsidy the coinbase may claim, excluding fees.
     pub reward: u64,
     /// The exact target the header must carry.
@@ -124,8 +138,9 @@ mod tests {
     #[test]
     fn limits_have_the_stated_zero_bits() {
         let main = MAINNET.pow_limit;
-        assert_eq!(&main[..3], &[0x00, 0x00, 0x0f]);
-        assert!(main[3..].iter().all(|&b| b == 0xff));
+        // 35 leading zero bits: bytes 0..4 zero, byte 4 = 0xff >> 3 = 0x1f.
+        assert_eq!(&main[..5], &[0x00, 0x00, 0x00, 0x00, 0x1f]);
+        assert!(main[5..].iter().all(|&b| b == 0xff));
         let reg = REGTEST.pow_limit;
         assert_eq!(&reg[..3], &[0x00, 0x00, 0xff]);
         assert_eq!(limit_with_zero_bits(0), [0xffu8; 32]);

@@ -41,49 +41,56 @@ not in this repo:
   - `src/chain.rs` — block store and canonical-chain selection by cumulative
     work. `context_for_child` is the one place the next block's height,
     reward, target, and minimum timestamp are derived.
-  - `src/mempool.rs` — the mempool (indexed by id and by sender + nonce,
-    capped, rejects same-nonce conflicts) and a bounded seen-id cache that
-    only answers status queries.
+  - `src/mempool.rs` — the mempool (indexed by id and by sender, then nonce;
+    capped). A sender may queue up to 25 pending transactions with
+    consecutive nonces, if the confirmed balance covers all of them; a reused
+    nonce is a conflict and is rejected. Plus a bounded seen-id cache that
+    only answers status queries. `/balance` reports `next_nonce` and
+    `pending`, and the wallet signs with `next_nonce`.
   - `src/amount.rs` — base unit (`COIN`) and decimal JEF parse/format.
   - `src/store.rs` — append-only block log; a torn tail is cut on startup.
   - `src/node.rs` — node core: the `NodeRequest` set and the `run_node` task
     owning the chain, mempool, and seen cache.
-  - `src/p2p/` — peer-to-peer layer: `frame` (JEFY codec), `message` (gossip-v1
-    messages), `addr` (Endpoint/handle encoding), `link` (the `PeerLink` seam),
-    `peer` (handshake, run loop, `run_peer`), `network` (peer registry, address
-    book, gossip fan-out, dialer), `relay` (outer transport framing),
-    `relay_server` (the multiplexing router), `relay_client` (node-side relay
-    connection).
-  - `src/bin/node.rs` — axum REST server plus the P2P listener, dialers, and
-    optional relay client.
+  - `src/p2p/` — peer-to-peer layer. The JeffyCoin protocol: `frame` (JEFY
+    codec), `message`, `addr` (multiaddr list encoding), `link` (the `PeerLink`
+    seam), `peer` (handshake, run loop, `run_peer`), `network` (session
+    registry, address book, gossip fan-out, dial requests). The transport:
+    `host` (the libp2p swarm: TCP + Noise + Yamux, relay client, DCUtR hole
+    punching, identify, ping, rendezvous client, and the `/jeffycoin/2.0.0`
+    stream that `run_peer` runs on) and `relay_host` (the relay node: circuit
+    relay v2 + rendezvous server).
+  - `src/bin/node.rs` — axum REST server, the libp2p host, and the miner.
   - `src/bin/wallet.rs` — clap wallet CLI.
-  - `src/bin/relay.rs` — the relay server (thin wrapper over `relay_server`).
+  - `src/bin/relay.rs` — the relay node (thin wrapper over `relay_host`).
 - `spike/` — **frozen scratchwork**. The original `rust-crud-api` spike where the
   wallet → REST → node → signature-verify path was first proven. Do not build on
   it; it is kept for reference only.
-- `docs/p2p-protocol.md` — the peer-to-peer wire protocol. Gossip v1 (frame
-  envelope, symmetric `HELLO` handshake, `PING`/`PONG`, `NEW_TRANSACTION`,
-  `GET_ADDR`/`ADDR`) and the outer relay transport (multiplexing router with
-  ephemeral directory handles, `Direct`/`Relay` addressing) are settled at the
-  architecture level; byte encodings and tuning values remain.
+- `docs/p2p-protocol.md` — the peer-to-peer protocol (wire version 2): frame
+  envelope, messages, gossip and sync rules, and the libp2p transport (stack,
+  identity, relay and discovery flow, and what a node in another language
+  needs).
+- `demo/` — the persisted demo network: `start.sh`, `stop.sh`, `status.sh`,
+  `txgen.sh` (a relay plus three mining nodes: Noah, Jon, and Holden, who is
+  relay-only). Its chain data, keys, and logs are git-ignored. **All live
+  testing runs on this one persisted chain; do not start fresh chains for
+  live tests.**
 
 ## What is built
 
 Starting from the initial vertical (wallet → REST → node core over an
 `mpsc`/`oneshot` channel), the following now works:
 
-- **P2P network layer** (`src/p2p/`, see `docs/p2p-protocol.md`): transaction
-  gossip over direct TCP (`JEFY` frame codec, symmetric `HELLO`, `PING`/`PONG`,
-  `NEW_TRANSACTION`); peer discovery (`GET_ADDR`/`ADDR`, address book, auto-dial;
-  `--advertise`, `--max-peers`); and the relay transport (`relay` binary, a
-  multiplexing router pairing channels by ephemeral handle; `--relay`,
-  `--relay-open`). The relay also serves a handle directory (`LIST`/`HANDLES`)
-  so an all-CGNAT network self-bootstraps without out-of-band handles, and has
-  basic abuse caps (one handle per connection, a per-connection channel limit).
-  A relay channel is a `PeerLink` like any other. Deploying the relay cheaply:
-  see `docs/DEPLOY-RELAY.md` and `deploy/`; build it lean with
-  `cargo build --release --no-default-features --bin relay` (drops the wallet's
-  TLS stack).
+- **P2P network layer** (`src/p2p/`, see `docs/p2p-protocol.md`): libp2p
+  carries the unchanged JeffyCoin protocol (`JEFY` frames, symmetric `HELLO`,
+  `PING`/`PONG`, gossip, sync, `GET_ADDR`/`ADDR` with multiaddrs) on one
+  `/jeffycoin/2.0.0` stream per peer. Every connection is encrypted (Noise) and
+  authenticated by peer id (an Ed25519 key in `<data-dir>/node_key`). Nodes
+  behind NAT use `--relay <multiaddr>/p2p/<relay id>`: they reserve a circuit
+  on the relay, register with its rendezvous service, discover each other, and
+  hole punch (DCUtR) to direct connections when possible. `--peer` accepts
+  `ip:port` or a multiaddr; `--no-listen` makes a dial-out-only node. Deploying
+  the relay: `docs/DEPLOY-RELAY.md` and `deploy/`; build it lean with
+  `cargo build --release --no-default-features --bin relay`.
 - **Transactions** (`src/lib.rs`): type-tagged `type/sender/recipient/amount/fee/
   nonce(u64)/signature`, 153 bytes; normal (signed) and coinbase (unsigned).
 - **State** (`src/state.rs`): account balances + nonce, canonical `state_root`.
@@ -118,17 +125,17 @@ Starting from the initial vertical (wallet → REST → node core over an
   rejected; the coinbase must be canonical (zero sender, fee, nonce,
   signature). The address book is capped (1,000, random eviction), one `ADDR`
   is read up to 256 entries, and in-flight dials count toward `--max-peers`.
-  The relay never drops bytes: a connection that cannot keep up is evicted
-  and its peers get `CLOSE`.
 
-Verified by unit tests and integration tests (direct + relay gossip, late-joiner
-sync, work-based reorg), plus live multi-node runs.
+Verified by unit tests and integration tests (direct libp2p gossip,
+relay-only nodes that find each other through rendezvous and gossip over a
+circuit, late-joiner sync, work-based reorg), plus live runs on the persisted
+demo chain.
 
 ### Not yet built / open
 
 Reorg mempool re-add (txs dropped by a reorg are not re-queued automatically;
-resubmitting one now works), relay handle
-rotation and per-channel flow control, block/consensus-version signaling,
+resubmitting one now works), more than one relay per node, a persisted
+address book, block/consensus-version signaling,
 and misbehaviour scoring/banning. Persistence stores blocks only (state is
 replayed) and the log is never compacted. `MAINNET.pow_limit` is machine/build-specific
 (calibrated from a debug-build hash rate).

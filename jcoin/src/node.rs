@@ -33,7 +33,7 @@ pub enum NodeRequest {
     },
     GetAccount {
         address: [u8; 32],
-        reply: oneshot::Sender<(u64, u64)>,
+        reply: oneshot::Sender<AccountInfo>,
     },
     SubmitBlock {
         block: Box<Block>,
@@ -59,6 +59,20 @@ pub enum NodeRequest {
 pub enum SubmitResult {
     Accepted { tx_id: String, is_new: bool },
     Rejected { reason: String },
+}
+
+/// An account as a wallet needs it: confirmed state plus its pending chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountInfo {
+    /// Confirmed balance at the tip.
+    pub balance: u64,
+    /// Confirmed nonce at the tip (the next nonce a block will accept).
+    pub nonce: u64,
+    /// The nonce a new transaction must use: `nonce` plus the number of the
+    /// account's pending transactions.
+    pub next_nonce: u64,
+    /// Total `amount + fee` of the account's pending transactions.
+    pub pending_debit: u64,
 }
 
 pub enum StatusResult {
@@ -164,9 +178,9 @@ pub async fn run_node(
                 // Mempool membership, not the seen cache, decides whether this
                 // is new: a transaction that left the mempool (for example after
                 // a reorg) is admitted and relayed again when resubmitted.
-                let result = match validate_pending(&tx, chain.tip_state()) {
+                let result = match validate_pending(&tx) {
                     Err(reason) => SubmitResult::Rejected { reason },
-                    Ok(()) => match mempool.insert(tx) {
+                    Ok(()) => match mempool.insert(tx, chain.tip_state()) {
                         Ok(admitted) => {
                             seen_tx.insert(id);
                             SubmitResult::Accepted {
@@ -195,7 +209,13 @@ pub async fn run_node(
 
             NodeRequest::GetAccount { address, reply } => {
                 let state = chain.tip_state();
-                let _ = reply.send((state.balance(&address), state.nonce(&address)));
+                let pending = mempool.summary(&address, state);
+                let _ = reply.send(AccountInfo {
+                    balance: state.balance(&address),
+                    nonce: state.nonce(&address),
+                    next_nonce: pending.next_nonce,
+                    pending_debit: pending.pending_debit,
+                });
             }
 
             NodeRequest::SubmitBlock { block, reply } => {
@@ -273,9 +293,11 @@ pub async fn run_node(
     }
 }
 
-/// Full validation of a loose transaction against the tip state (ADR 000: relay
-/// only fully valid transactions). Returns `Err(reason)` if it should not relay.
-fn validate_pending(tx: &Transaction, state: &State) -> Result<(), String> {
+/// Stateless checks on a loose transaction: a known normal type and a valid
+/// signature. Nonce and balance are checked by `Mempool::insert` against the
+/// tip state and the sender's pending chain (ADR 000: relay only fully valid
+/// transactions). Returns `Err(reason)` if it should not relay.
+fn validate_pending(tx: &Transaction) -> Result<(), String> {
     if tx.is_coinbase() {
         return Err("coinbase cannot be submitted directly".to_string());
     }
@@ -285,7 +307,7 @@ fn validate_pending(tx: &Transaction, state: &State) -> Result<(), String> {
     if !tx.verify_signature() {
         return Err("invalid signature".to_string());
     }
-    state.check(tx).map(|_| ()).map_err(|e| e.to_string())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -455,6 +477,84 @@ mod tests {
             SubmitResult::Rejected { reason } => assert!(reason.contains("unknown"), "{reason}"),
             SubmitResult::Accepted { .. } => panic!("unknown transaction type was accepted"),
         }
+    }
+
+    async fn account(core: &mpsc::Sender<NodeRequest>, address: [u8; 32]) -> AccountInfo {
+        let (reply, rx) = oneshot::channel();
+        core.send(NodeRequest::GetAccount { address, reply })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    // A sender queues several transactions before any is mined; each mining
+    // job takes the next one, and all confirm in nonce order.
+    #[tokio::test]
+    async fn queued_transactions_confirm_in_order() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let (core, rx) = mpsc::channel(64);
+        tokio::spawn(run_node(rx, None, REGTEST));
+        let key = SigningKey::generate(&mut OsRng);
+        let sender = key.verifying_key().to_bytes();
+
+        let mut timestamp = 0;
+        let mut mine = |job: MiningJob| {
+            timestamp += 1;
+            build_and_mine(
+                &job.parent,
+                &job.parent_state,
+                job.context.reward,
+                [7u8; 32],
+                job.normal,
+                job.context.target,
+                timestamp.max(job.context.min_timestamp),
+            )
+            .unwrap()
+            .0
+        };
+
+        // Fund the sender.
+        let j = get_job(&core).await;
+        let funding = build_and_mine(
+            &j.parent, &j.parent_state, j.context.reward, sender, None, j.context.target, 1,
+        )
+        .unwrap()
+        .0;
+        assert!(matches!(submit_block(&core, funding).await, BlockOutcome::Accepted { .. }));
+
+        // Queue nonces 0, 1, 2 using next_nonce, as the wallet does.
+        for i in 0..3u64 {
+            let info = account(&core, sender).await;
+            assert_eq!(info.next_nonce, i);
+            assert_eq!(info.pending_debit, i * 11);
+            let mut tx = Transaction {
+                tx_type: crate::tx_type::NORMAL,
+                sender,
+                recipient: [2u8; 32],
+                amount: 10,
+                fee: 1,
+                nonce: info.next_nonce,
+                signature: [0u8; 64],
+            };
+            tx.signature = key.sign(&tx.signing_bytes()).to_bytes();
+            assert!(matches!(
+                submit_tx(&core, tx).await,
+                SubmitResult::Accepted { is_new: true, .. }
+            ));
+        }
+
+        // Three mined blocks carry the three transfers in order.
+        for expected_nonce in 0..3u64 {
+            let job = get_job(&core).await;
+            assert_eq!(job.normal.as_ref().map(|t| t.nonce), Some(expected_nonce));
+            assert!(matches!(submit_block(&core, mine(job)).await, BlockOutcome::Accepted { .. }));
+        }
+        let info = account(&core, sender).await;
+        assert_eq!((info.nonce, info.next_nonce, info.pending_debit), (3, 3, 0));
+        assert_eq!(info.balance, REGTEST.initial_reward - 33);
+        assert!(get_job(&core).await.normal.is_none());
     }
 
     #[tokio::test]

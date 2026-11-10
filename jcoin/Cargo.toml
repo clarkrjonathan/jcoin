@@ -49,3 +49,11 @@ primitive-types = "0.12"
 
 # CLI (wallet)
 clap = { version = "4", features = ["derive"] }
+
+# Peer-to-peer transport: TCP + Noise + Yamux, relay (circuit v2) with
+# hole punching (DCUtR), identify, ping, and rendezvous discovery. The
+# JeffyCoin wire protocol runs unchanged on a libp2p stream (libp2p-stream).
+libp2p = { version = "0.57", features = ["tokio", "tcp", "noise", "yamux", "ed25519", "identify", "ping", "relay", "dcutr", "rendezvous", "macros"] }
+libp2p-stream = "0.5.0-alpha"
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["compat"] }

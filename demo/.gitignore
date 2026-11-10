@@ -1,0 +1,7 @@
+# Local demo state: the persisted chain, identity keys, and logs.
+data-*/
+keys/
+keys.txt
+relay_key
+*.log
+pids

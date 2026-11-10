@@ -13,11 +13,18 @@ use crate::Transaction;
 /// Header size in bytes: 4 + 8 + 32 + 32 + 32 + 8 + 32 + 8.
 pub const HEADER_LEN: usize = 156;
 
-/// Current block/consensus version.
-pub const BLOCK_VERSION: u32 = 1;
+/// The block/consensus version this binary produces. Validation requires the
+/// version that `consensus::consensus_version(height)` selects (via
+/// `BlockContext::version`), so a future rule change activates by height without
+/// a restart. v2 is the current (genesis) rule set.
+pub const BLOCK_VERSION: u32 = 2;
+
+/// Maximum number of normal transactions in a block body (besides the coinbase).
+/// A v2 body is a coinbase followed by up to `MAX_TXS` normal transactions.
+pub const MAX_TXS: usize = 64;
 
 /// The 32-byte plaintext marker placed in the genesis `previous_block_hash`.
-pub const GENESIS_MARKER: &[u8; 32] = b"I am 20 years old, I love Jeffy!";
+pub const GENESIS_MARKER: &[u8; 32] = b"I am 21 years old, I love Jeffy!";
 
 /// A block timestamp may not be more than this many seconds ahead of the
 /// receiving node's clock. This is a local admission rule, not consensus: a
@@ -130,7 +137,7 @@ impl std::fmt::Display for BlockError {
             BlockError::BadParentHash => write!(f, "previous_block_hash does not match parent"),
             BlockError::WrongTarget => write!(f, "target does not match consensus"),
             BlockError::PowNotMet => write!(f, "block hash does not meet the target"),
-            BlockError::BadBody => write!(f, "body is not a coinbase plus at most one normal tx"),
+            BlockError::BadBody => write!(f, "body is not a coinbase plus up to MAX_TXS normal txs"),
             BlockError::BadCoinbase => write!(f, "coinbase is not in canonical form"),
             BlockError::BadTransactionsHash => write!(f, "transactions_hash mismatch"),
             BlockError::BadStateRoot => write!(f, "state_root mismatch"),
@@ -207,7 +214,7 @@ impl Block {
     }
 
     /// Split the body into the coinbase and the normal transactions, enforcing
-    /// the v1 shape: first is a coinbase, the rest are normal, at most one extra.
+    /// the v2 shape: first is a coinbase, the rest are normal, up to `MAX_TXS`.
     fn split_body(&self) -> Result<(&Transaction, &[Transaction]), BlockError> {
         let first = self.transactions.first().ok_or(BlockError::BadBody)?;
         if !first.is_coinbase() {
@@ -219,7 +226,7 @@ impl Block {
         let rest = &self.transactions[1..];
         // Every other transaction must be a known, normal type: an unknown type
         // is rejected, never treated as a transfer.
-        if rest.len() > 1 || rest.iter().any(|t| !t.is_normal()) {
+        if rest.len() > MAX_TXS || rest.iter().any(|t| !t.is_normal()) {
             return Err(BlockError::BadBody);
         }
         Ok((first, rest))
@@ -238,7 +245,7 @@ impl Block {
         parent_state: &State,
         ctx: &BlockContext,
     ) -> Result<State, BlockError> {
-        if self.header.version != BLOCK_VERSION {
+        if self.header.version != ctx.version {
             return Err(BlockError::BadVersion);
         }
         if self.header.height != parent.height + 1 || self.header.height != ctx.height {
@@ -389,6 +396,7 @@ mod tests {
     ) -> Result<State, BlockError> {
         let ctx = BlockContext {
             height: parent.height + 1,
+            version: crate::consensus::consensus_version(parent.height + 1),
             reward,
             target: *target,
             min_timestamp: 0,
@@ -540,6 +548,7 @@ mod tests {
         .unwrap();
         let ctx = |min_timestamp| BlockContext {
             height: 1,
+            version: BLOCK_VERSION,
             reward: REGTEST.initial_reward,
             target: REGTEST.pow_limit,
             min_timestamp,
@@ -679,7 +688,7 @@ mod tests {
     }
 
     fn validate_on_genesis(block: &Block) -> Result<State, BlockError> {
-        validate_with(&block, &Block::genesis(&REGTEST).header, &State::new(), REGTEST.initial_reward, &REGTEST.pow_limit)
+        validate_with(block, &Block::genesis(&REGTEST).header, &State::new(), REGTEST.initial_reward, &REGTEST.pow_limit)
     }
 
     #[test]
