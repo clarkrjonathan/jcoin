@@ -132,7 +132,7 @@ pub async fn run_node(
         match load_and_repair(&path) {
             Ok(loaded) => {
                 if loaded.discarded > 0 {
-                    eprintln!(
+                    crate::log_error!(
                         "[store] cut {} bytes of torn or corrupt tail from {}",
                         loaded.discarded,
                         path.display()
@@ -147,26 +147,26 @@ pub async fn run_node(
                         Accept::Invalid(e) => {
                             rejected += 1;
                             if rejected == 1 {
-                                eprintln!("[store] replay rejected a block: {e}");
+                                crate::log_error!("[store] replay rejected a block: {e}");
                             }
                         }
                     }
                 }
                 if rejected > 0 {
-                    eprintln!(
+                    crate::log_error!(
                         "[store] replay rejected {rejected} of {count} blocks \
                          (consensus rules changed since they were written?)"
                     );
                 }
                 if count > 0 {
-                    println!("[store] replayed {count} blocks; tip height {}", chain.tip_height());
+                    crate::log_info!("[store] replayed {count} blocks; tip height {}", chain.tip_height());
                 }
             }
-            Err(e) => eprintln!("[store] failed to read {}: {e}", path.display()),
+            Err(e) => crate::log_error!("[store] failed to read {}: {e}", path.display()),
         }
         match BlockLog::open(&path) {
             Ok(l) => log = Some(l),
-            Err(e) => eprintln!("[store] failed to open {} for append: {e}", path.display()),
+            Err(e) => crate::log_error!("[store] failed to open {} for append: {e}", path.display()),
         }
     }
 
@@ -239,7 +239,7 @@ pub async fn run_node(
                     Accept::Stored { new_tip, height } => {
                         if let (Some(log), Some(block)) = (log.as_mut(), for_log.as_ref()) {
                             if let Err(e) = log.append(block) {
-                                eprintln!("[store] append failed: {e}");
+                                crate::log_error!("[store] append failed: {e}");
                             }
                         }
                         // Drop transactions no longer applicable on the new tip.

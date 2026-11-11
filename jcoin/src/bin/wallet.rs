@@ -12,11 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use ed25519_dalek::{Signer, SigningKey};
-use rand::rngs::OsRng;
 
 use jcoin::amount::{format_jef, parse_jef};
-use jcoin::Transaction;
+use jcoin::wallet::{decode_address, generate_key, load_key, sign_transfer};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -121,42 +119,6 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn key_path(dir: &Path, name: &str) -> PathBuf {
-    dir.join(format!("{name}_ed25519"))
-}
-
-/// Generate a new key and write its 32-byte seed as hex. Errors if it exists.
-fn generate_key(dir: &Path, name: &str) -> Result<SigningKey> {
-    fs::create_dir_all(dir)?;
-    let path = key_path(dir, name);
-    if path.exists() {
-        return Err(format!("key '{name}' already exists at {}", path.display()).into());
-    }
-    let key = SigningKey::generate(&mut OsRng);
-    fs::write(&path, hex::encode(key.to_bytes()))?;
-    Ok(key)
-}
-
-/// Load a stored key by name.
-fn load_key(dir: &Path, name: &str) -> Result<SigningKey> {
-    let path = key_path(dir, name);
-    let hex_seed = fs::read_to_string(&path)
-        .map_err(|_| format!("no key '{name}' at {}", path.display()))?;
-    let seed: [u8; 32] = hex::decode(hex_seed.trim())?
-        .try_into()
-        .map_err(|_| "key file must hold a 32-byte seed")?;
-    Ok(SigningKey::from_bytes(&seed))
-}
-
-/// Decode 64 hex characters into a 32-byte array (accepts an optional 0x prefix).
-fn decode_address(input: &str) -> Result<[u8; 32]> {
-    let trimmed = input.strip_prefix("0x").unwrap_or(input);
-    let bytes = hex::decode(trimmed)?;
-    bytes
-        .try_into()
-        .map_err(|_| "address must be 32 bytes (64 hex characters)".into())
-}
-
 async fn send_transaction(
     node: &str,
     key_dir: &Path,
@@ -206,19 +168,7 @@ async fn send_transaction(
         .into());
     }
 
-    let mut tx = Transaction {
-        tx_type: jcoin::tx_type::NORMAL,
-        sender,
-        recipient,
-        amount,
-        fee,
-        nonce,
-        signature: [0u8; 64],
-    };
-
-    // Sign over everything but the signature, then fill it in.
-    let signature = key.sign(&tx.signing_bytes());
-    tx.signature = signature.to_bytes();
+    let tx = sign_transfer(&key, recipient, amount, fee, nonce);
 
     let tx_id = tx.tx_id_hex();
     let url = format!("{node}/wallet/transaction");

@@ -120,11 +120,11 @@ pub async fn run_peer<L: PeerLink + 'static>(mut link: L, network: Network, labe
     let peer = match handshake(&mut link, &local).await {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[p2p] handshake with {label} failed: {e}");
+            crate::log_error!("[p2p] handshake with {label} failed: {e}");
             return;
         }
     };
-    println!(
+    crate::log_info!(
         "[p2p] connected to {label} (peer wire v{}, port {})",
         peer.version, peer.listen_port
     );
@@ -147,6 +147,7 @@ pub async fn run_peer<L: PeerLink + 'static>(mut link: L, network: Network, labe
     // Outbound channel the network pushes gossip into.
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(CHANNEL_BOUND);
     let id = network.register(out_tx);
+    network.label_session(id, &label);
 
     let mut ticker = interval(PING_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -175,7 +176,7 @@ pub async fn run_peer<L: PeerLink + 'static>(mut link: L, network: Network, labe
             _ = ticker.tick() => {
                 let idle = last_activity.elapsed();
                 if idle >= PEER_TIMEOUT {
-                    println!("[p2p] {label} timed out");
+                    crate::log_info!("[p2p] {label} timed out");
                     break;
                 }
                 if idle >= PING_INTERVAL
@@ -189,7 +190,7 @@ pub async fn run_peer<L: PeerLink + 'static>(mut link: L, network: Network, labe
 
     network.remove(id);
     reader.abort();
-    println!("[p2p] disconnected from {label}");
+    crate::log_info!("[p2p] disconnected from {label}");
 }
 
 /// Read frames until the stream fails. Decode errors that leave the stream in

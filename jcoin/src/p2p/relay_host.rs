@@ -78,29 +78,29 @@ pub async fn run_relay(
     }
     for addr in external {
         let addr = strip_peer(addr);
-        println!("[relay] reachable at {}", addr.clone().with(Protocol::P2p(local_id)));
+        crate::log_info!("[relay] reachable at {}", addr.clone().with(Protocol::P2p(local_id)));
         swarm.add_external_address(addr);
     }
-    println!("[relay] peer id {local_id}");
+    crate::log_info!("[relay] peer id {local_id}");
 
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
-                println!("[relay] listening on {}", address.with(Protocol::P2p(local_id)));
+                crate::log_info!("[relay] listening on {}", address.with(Protocol::P2p(local_id)));
             }
             SwarmEvent::Behaviour(RelayBehaviourEvent::Relay(event)) => match event {
                 relay::Event::ReservationReqAccepted { src_peer_id, renewed: false, .. } => {
-                    println!("[relay] reservation for {src_peer_id}");
+                    crate::log_info!("[relay] reservation for {src_peer_id}");
                 }
                 relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id } => {
-                    println!("[relay] circuit {src_peer_id} -> {dst_peer_id}");
+                    crate::log_info!("[relay] circuit {src_peer_id} -> {dst_peer_id}");
                 }
                 _ => {}
             },
             SwarmEvent::Behaviour(RelayBehaviourEvent::Rendezvous(
                 rendezvous::server::Event::PeerRegistered { peer, .. },
             )) => {
-                println!("[relay] rendezvous registration from {peer}");
+                crate::log_info!("[relay] rendezvous registration from {peer}");
             }
             _ => {}
         }

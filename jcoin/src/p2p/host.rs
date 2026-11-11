@@ -156,7 +156,7 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
         .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_TIMEOUT))
         .build();
 
-    println!("[p2p] peer id {local_id}");
+    crate::log_info!("[p2p] peer id {local_id}");
     for addr in &config.listen {
         swarm.listen_on(addr.clone())?;
     }
@@ -229,7 +229,7 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                         continue; // the relayed address is added on reservation
                     }
                     let address = with_peer(address, local_id);
-                    println!("[p2p] listening on {address}");
+                    crate::log_info!("[p2p] listening on {address}");
                     network.add_advertised(address);
                 }
                 SwarmEvent::ExpiredListenAddr { address, .. } => {
@@ -249,6 +249,22 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                         }
                     }
                     let is_relay = relay_peer.as_ref().map(|(p, _)| *p) == Some(peer_id);
+                    let remote = endpoint.get_remote_address();
+                    network.connection_opened(
+                        connection_id.to_string(),
+                        super::network::ConnectionInfo {
+                            peer: peer_id.to_string(),
+                            address: remote.to_string(),
+                            outbound: endpoint.is_dialer(),
+                            relayed: remote.iter().any(|p| matches!(p, Protocol::P2pCircuit)),
+                            is_relay,
+                            session: false,
+                            since: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0),
+                        },
+                    );
                     // The dialing side opens the protocol stream, unless a
                     // session already runs (for example, a hole-punched direct
                     // connection after a relayed one).
@@ -261,10 +277,13 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                         network.dial_finished(&addr, false);
                     }
                     let who = peer_id.map(|p| p.to_string()).unwrap_or_else(|| "?".into());
-                    eprintln!("[p2p] dial to {who} failed: {error}");
+                    crate::log_error!("[p2p] dial to {who} failed: {error}");
                 }
-                SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
-                    network.set_connected(peer_id, false);
+                SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
+                    network.connection_closed(&connection_id.to_string());
+                    if num_established == 0 {
+                        network.set_connected(peer_id, false);
+                    }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
                     relay::client::Event::ReservationReqAccepted { relay_peer_id, renewal, .. },
@@ -275,7 +294,7 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                             .with(Protocol::P2pCircuit)
                             .with(Protocol::P2p(local_id));
                         if !renewal {
-                            println!("[p2p] relay reservation accepted by {relay_peer_id}; reachable at {addr}");
+                            crate::log_info!("[p2p] relay reservation accepted by {relay_peer_id}; reachable at {addr}");
                         }
                         swarm.add_external_address(addr.clone());
                         network.add_advertised(addr.clone());
@@ -285,16 +304,16 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result })) => {
                     match result {
-                        Ok(_) => println!("[p2p] hole punch to {remote_peer_id} succeeded: direct connection"),
-                        Err(e) => println!("[p2p] hole punch to {remote_peer_id} failed ({e}); staying on the relay"),
+                        Ok(_) => crate::log_info!("[p2p] hole punch to {remote_peer_id} succeeded: direct connection"),
+                        Err(e) => crate::log_info!("[p2p] hole punch to {remote_peer_id} failed ({e}); staying on the relay"),
                     }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Rendezvous(event)) => match event {
                     rendezvous::client::Event::Registered { ttl, .. } => {
-                        println!("[p2p] registered with the relay's rendezvous for {ttl} s");
+                        crate::log_info!("[p2p] registered with the relay's rendezvous for {ttl} s");
                     }
                     rendezvous::client::Event::RegisterFailed { error, .. } => {
-                        eprintln!("[p2p] rendezvous registration failed: {error:?}");
+                        crate::log_error!("[p2p] rendezvous registration failed: {error:?}");
                         registered_at = None;
                     }
                     rendezvous::client::Event::Discovered { registrations, cookie: next, .. } => {
@@ -311,7 +330,7 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                         network.maybe_dial(fresh);
                     }
                     rendezvous::client::Event::DiscoverFailed { error, .. } => {
-                        eprintln!("[p2p] rendezvous discovery failed: {error:?}");
+                        crate::log_error!("[p2p] rendezvous discovery failed: {error:?}");
                         cookie = None;
                     }
                     rendezvous::client::Event::Expired { .. } => {}
@@ -329,7 +348,7 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                     Ok(()) => { pending.insert(id, addr); }
                     Err(e) => {
                         network.dial_finished(&addr, false);
-                        eprintln!("[p2p] cannot dial {addr}: {e}");
+                        crate::log_error!("[p2p] cannot dial {addr}: {e}");
                     }
                 }
             }
@@ -361,7 +380,7 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                     if circuit_addr.is_some() && due {
                         match swarm.behaviour_mut().rendezvous.register(namespace.clone(), *relay_id, None) {
                             Ok(()) => registered_at = Some(Instant::now()),
-                            Err(e) => eprintln!("[p2p] cannot register with rendezvous: {e}"),
+                            Err(e) => crate::log_error!("[p2p] cannot register with rendezvous: {e}"),
                         }
                     }
                     swarm.behaviour_mut().rendezvous.discover(
@@ -402,7 +421,7 @@ fn open_session(
             Ok(stream) => run_session(stream, peer, "out", network, sessions, closed_tx).await,
             Err(e) => {
                 release(&sessions, peer);
-                eprintln!("[p2p] could not open a protocol stream to {peer}: {e}");
+                crate::log_error!("[p2p] could not open a protocol stream to {peer}: {e}");
             }
         }
     });

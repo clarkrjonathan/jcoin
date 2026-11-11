@@ -8,6 +8,10 @@ description = "JeffyCoin GPU miner: SHA-256 proof of work on any GPU through wgp
 # a node only through the REST endpoints GET /mining/work and POST
 # /mining/submit (see docs/gpu-miner.md).
 
+[lib]
+name = "jcoin_gpu_miner"
+path = "src/lib.rs"
+
 [[bin]]
 name = "gpu-miner"
 path = "src/main.rs"

@@ -1,0 +1,33 @@
+[package]
+name = "jcoin-app"
+version = "2.1.0"
+edition = "2021"
+description = "JeffyCoin desktop app: node, wallet, and GPU miner in one window"
+
+# A separate package so the node and the command-line tools do not depend on
+# GUI libraries. It embeds the node (`jcoin::service`) and the GPU mining loop
+# (`jcoin_gpu_miner::miner`) in one process and talks to the embedded node over
+# its local REST endpoints, as the command-line wallet and miner do.
+
+# The version must match the release tag (tag `v2.1.0` for version `2.1.0`):
+# the app compares it with the release list to offer updates, and the release
+# workflow refuses a tag that does not match.
+
+[[bin]]
+name = "jcoin-app"
+path = "src/main.rs"
+
+[dependencies]
+jcoin = { path = "../jcoin", default-features = false }
+jcoin-gpu-miner = { path = "../gpu-miner" }
+eframe = "0.35"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde_json = "1"
+hex = "0.4"
+ed25519-dalek = "2"
+sha2 = "0.10"
+
+[profile.release]
+debug = false
+strip = true

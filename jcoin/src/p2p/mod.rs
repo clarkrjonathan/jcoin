@@ -23,6 +23,6 @@ pub use frame::{FrameError, RawFrame, HEADER_LEN, MAGIC, MAX_PAYLOAD, PROTOCOL_V
 pub use host::{load_or_create_keypair, parse_addr, run_host, HostConfig, PROTOCOL};
 pub use link::PeerLink;
 pub use message::{read_message, write_message, Hello, Message, MessageError};
-pub use network::{Network, PeerId};
+pub use network::{ConnectionInfo, Network, PeerId};
 pub use peer::{handshake, local_hello, run_peer, HandshakeError, PEER_TIMEOUT, PING_INTERVAL};
 pub use relay_host::run_relay;

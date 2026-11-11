@@ -13,11 +13,14 @@ pub mod amount;
 pub mod block;
 pub mod chain;
 pub mod consensus;
+pub mod log;
 pub mod mempool;
 pub mod node;
 pub mod p2p;
+pub mod service;
 pub mod state;
 pub mod store;
+pub mod wallet;
 
 /// Transaction type codes.
 pub mod tx_type {

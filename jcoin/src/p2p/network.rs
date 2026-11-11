@@ -46,8 +46,32 @@ pub fn peer_of(addr: &Multiaddr) -> Option<libp2p::PeerId> {
     }
 }
 
+/// One open libp2p connection, for diagnostics (`GET /peers`).
+#[derive(Debug, Clone)]
+pub struct ConnectionInfo {
+    /// The remote node's libp2p peer id.
+    pub peer: String,
+    /// The remote address of the connection.
+    pub address: String,
+    /// This node dialed it (otherwise the remote node did).
+    pub outbound: bool,
+    /// The connection runs through a relay circuit, not directly.
+    pub relayed: bool,
+    /// The remote node is this node's relay.
+    pub is_relay: bool,
+    /// A JeffyCoin protocol session runs with this peer (blocks and
+    /// transactions are exchanged). A connection without one is only transport.
+    pub session: bool,
+    /// When the connection opened (Unix seconds).
+    pub since: u64,
+}
+
 struct Inner {
     peers: Mutex<HashMap<PeerId, mpsc::Sender<Message>>>,
+    /// Log labels of the protocol sessions; each starts with the peer id.
+    session_labels: Mutex<HashMap<PeerId, String>>,
+    /// Open connections by libp2p connection id.
+    connections: Mutex<HashMap<String, ConnectionInfo>>,
     next_id: AtomicU64,
     /// Learned peer addresses.
     book: Mutex<HashSet<Multiaddr>>,
@@ -87,6 +111,8 @@ impl Network {
         Network {
             inner: Arc::new(Inner {
                 peers: Mutex::new(HashMap::new()),
+                session_labels: Mutex::new(HashMap::new()),
+                connections: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(0),
                 book: Mutex::new(HashSet::new()),
                 attempted: Mutex::new(HashSet::new()),
@@ -142,6 +168,46 @@ impl Network {
     /// Drop a protocol session from the registry.
     pub fn remove(&self, id: PeerId) {
         self.inner.peers.lock().unwrap().remove(&id);
+        self.inner.session_labels.lock().unwrap().remove(&id);
+    }
+
+    /// Record the log label of session `id` (it starts with the peer id), so
+    /// `connections` can tell which connections carry a session.
+    pub fn label_session(&self, id: PeerId, label: &str) {
+        self.inner
+            .session_labels
+            .lock()
+            .unwrap()
+            .insert(id, label.to_string());
+    }
+
+    /// Record an open connection under its libp2p connection id.
+    pub fn connection_opened(&self, id: String, info: ConnectionInfo) {
+        self.inner.connections.lock().unwrap().insert(id, info);
+    }
+
+    /// Forget a closed connection.
+    pub fn connection_closed(&self, id: &str) {
+        self.inner.connections.lock().unwrap().remove(id);
+    }
+
+    /// The open connections, oldest first, with `session` filled in.
+    pub fn connections(&self) -> Vec<ConnectionInfo> {
+        let labels = self.inner.session_labels.lock().unwrap();
+        let mut list: Vec<ConnectionInfo> = self
+            .inner
+            .connections
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .map(|mut c| {
+                c.session = labels.values().any(|label| label.starts_with(&c.peer));
+                c
+            })
+            .collect();
+        list.sort_by(|a, b| a.since.cmp(&b.since).then(a.peer.cmp(&b.peer)));
+        list
     }
 
     /// Number of protocol sessions (peers we gossip with).
