@@ -11,38 +11,72 @@ vault at `Chudjacknostim-Reorganized/Projects/JeffyCoin/`.
 - The working tree shows modifications under `spike/` — those predate this work
   and are not part of it. `spike/` is frozen scratchwork; ignore it.
 
-## Where the last session (2026-11-09) stopped
+## Where the last session (2026-11-11) stopped
 
-Commits made that day: `0fb1bcb` (reward halving, JEF base unit) and `499e695`
-(structural audit fixes S1-S8). **Uncommitted** in the working tree (Jonathan
-had not yet approved a commit):
-1. Queued pending transactions per sender (`mempool.rs`, `/balance` reports
-   `next_nonce` and `pending`, the wallet uses them).
-2. The move to rust-libp2p 0.57 (`p2p/host.rs`, `p2p/relay_host.rs`; the old
-   relay router, relay client, and relay framing were deleted; wire version 2).
-3. `demo/` (scripts; its chain data, keys, and logs are git-ignored).
-4. Doc updates for all of the above.
+Read this first. The sections below it are older and partly out of date; the
+current sources are `CHANGELOG.md` (what is released), `CHANGELOG-PLANNED.md`
+(what is planned, with causes), and `docs/app.md` (the desktop app).
 
-Rules Jonathan set that day:
-- All live testing runs on the one persisted chain in `demo/`. Never start a
-  fresh chain for live tests. (`cargo test` keeps its in-memory REGTEST chains.)
-- "Commit" means a local commit only. Never push without an explicit request.
-- No Claude co-author or "Generated with Claude" lines in commits.
-- Do not run `cargo fmt`.
+**State of the code**
 
-Open decisions (his to make):
-1. **Block capacity.** A v1 block holds one transfer, about 12 transactions per
-   hour at 5-minute blocks. The demo's queues fill up (25-per-sender cap). This
-   is a consensus change; decide it before friends run nodes.
-2. **Commit** the uncommitted work above; then **GitHub**: private repo with
-   collaborators, or public.
-3. **Reachability for friends**: deploy the relay (`DEPLOY-RELAY.md`; needs his
-   AWS account), port forwarding, or Tailscale.
+- Released: `v2.1.2` (tag on `main`, built for Windows and Linux).
+- `main` = `sentry-log-tooling` = `8c09ecd` on GitHub (2.1.2 plus the Sentry
+  log reader and skill). The repository is public.
+- Local only, not pushed: branch `logging-plan-2.1.3` (planned-changelog and
+  handoff edits).
+- `initial-vertical` is an old branch name, no longer used. Work goes on a
+  descriptive branch, is merged into `main`, and a `v*` tag on `main` starts
+  the release build. The tag must equal the version in `app/Cargo.toml`.
 
-Planned work for friends to join (proposed, not started): a safety pass (REST
-should default to `127.0.0.1`, not `0.0.0.0`), release builds for all miners
-(debug miners lose to release miners), `JOINING.md` plus a join script, and a
-build of the static musl relay binary (not verified yet).
+**The chain is stalled (most urgent)**
+
+- Mainnet (consensus v2, genesis 2026-11-11 00:52 UTC, 28-bit floor) is at
+  height 69 since 05:33 UTC. The difficulty rule compounds; see
+  `CHANGELOG-PLANNED.md`, "2.2.0". This needs a consensus fix (activate at
+  height 70, or restart the chain). Jonathan has not decided which.
+
+**What exists now**
+
+- Desktop app `app/` (`jcoin-app`): node + wallet + GPU miner, keys, GPU use
+  limit, Developer section, updater, per-user install, Sentry reporting.
+- `jcoin::service` (embeddable node), `jcoin::wallet`, `jcoin::log`;
+  `GET /peers`; pending transfers are re-announced to peers every 60 s.
+- Sentry: project `iowa-state-pe/jcoin-app`. Read logs with the
+  `sentry-logs` skill (`.claude/skills/sentry-logs/`, linked into
+  `~/.claude/skills/jcoin-sentry-logs`) and `tools/sentry-logs`. The reader
+  needs a user token in `~/.config/jeffycoin/sentry-token`; none exists yet,
+  and its request to Sentry is untested.
+- Relay: AWS Lightsail `3.14.123.27:9000`, ssh `ubuntu@3.14.123.27` with
+  `~/jcoin-relay.pem`. It runs the pre-2.1.1 relay program.
+
+**Not verified on Windows**
+
+- 2.1.2's install flow and Start menu shortcut, and the in-app updater, have
+  not been confirmed on a Windows PC. 2.1.1's relay reservation fix was
+  confirmed from a friend's logs.
+
+**Pending operations** (also in `CHANGELOG-PLANNED.md`)
+
+- iMac (`miner@jcoin-miner.local`, LAN only) still runs a build with the
+  earlier 35-bit genesis; it cannot sync with 2.x nodes. Redeploy from the
+  home network.
+- Redeploy the relay; add the `SENTRY_AUTH_TOKEN` repository secret; create
+  the Sentry read token.
+
+**On the laptop**
+
+- The installed app runs from `~/.local/bin/jeffycoin`, data in
+  `~/.local/share/jeffycoin`.
+- The old regtest demo (`demo/`, relay + 3 nodes + txgen) is still running
+  and is stalled at height 99 by the same difficulty bug. `demo/stop.sh`
+  stops it. `demo/archive-v1-*` holds the v1 chain.
+- The NVIDIA GPU is off (`prime-select` is `intel`); mining uses the Intel
+  GPU.
+
+**Rules (unchanged)**: never `cargo fmt`; no Claude attribution in commits;
+push, merge, and tag only when told to.
+
+## Earlier session (2026-11-09), kept for reference
 
 ### Dedicated miner (iMac)
 

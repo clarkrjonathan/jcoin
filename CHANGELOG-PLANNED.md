@@ -17,6 +17,49 @@ How to use this file:
 Status values: `planned` (agreed, not started), `in progress`, `done` (merged
 to `main`, waiting for the release).
 
+## 2.2.0 (consensus change)
+
+### The difficulty rule compounds and stalls the chain
+
+- Status: planned. Urgent: the chain is stalled.
+- Consensus: **yes**. Every node must update. The fix activates at a block
+  height through the version-by-height rule (`consensus_version`), or the
+  chain is restarted.
+- Found: 2026-11-11. The chain reached height 69 at 05:33 UTC and produced no
+  block for more than 8 hours, with about 2.1 GH/s mining. Difficulty went
+  from 28 to 44.8 leading zero bits (about 110,000 times harder) in 9 blocks.
+  Two GPUs joining explains about 4 bits, not 17.
+- Cause: the rule in `chain.rs` `target_for_child` is not an LWMA. It
+  multiplies the **parent's** target by (weighted average solve time of the
+  last 60 blocks / 300 s), every block. The 60-block average changes slowly,
+  so while it is below 300 s the difficulty is multiplied again on every
+  block, by up to 4. The first 60 blocks were mined at the 28-bit floor in a
+  second or two each, so the average stayed under 300 s for 12 more blocks and
+  the difficulty rose 4x per block: 30, 32, 34, 36, 38, 40, 42, 43.6, 44.8
+  bits. Blocks 63 to 69 took 128 s to 5,672 s each, far over the target, and
+  the difficulty still rose.
+- It also does not settle. Once slow blocks fill the window the same rule
+  divides the difficulty by up to 4 per block until it hits the floor, then
+  the cycle repeats. The regtest demo stalled at height 99 the same way.
+- Contributing: blocks 1 to 60 use the floor with no adjustment
+  (`height <= lwma_window`), and the 28-bit floor is about 2 seconds of work
+  for a laptop GPU, so the window filled with near-zero solve times.
+- Planned change:
+  - Use the real LWMA: next target = (average of the **targets** of the last
+    N blocks) x (weighted sum of their solve times) / (N(N+1)/2 x 300 s). The
+    average target anchors the result, so it does not compound.
+  - Adjust from the first blocks, with a window that grows up to N, in place
+    of 60 blocks at the floor.
+  - Tests that simulate a chain: a miner far faster than the floor, a hash
+    rate step up and down, and a miner leaving. Each must settle near 300 s
+    and never run away. The current tests only check one adjustment step.
+- Open points:
+  - Activate at a height on the current chain (balances are kept; blocks 1 to
+    69 stay valid under the old rule) or restart the chain. The next block
+    under the old rule needs about 45 bits, so the activation height would be
+    70: the first block mined by an updated node.
+  - The floor value.
+
 ## 2.1.3
 
 Theme: make the Sentry logs answer a question in one query. Since 2.1.1 the
@@ -115,6 +158,35 @@ changes consensus.
   - Verify the reader's request to Sentry with a real token. It has only been
     tested without one.
 
+## 2.1.4
+
+NOTE THIS IS A USER ADDED FEEL FREE TO MODIFY THE FORMAT TO FIT THE REST WHEN YOU NEXT TOUCH THIS
+
+I would like to add a block tracker and average block time so I can see the health of the network
+
+Additionally add some projections for time assuming this nodes hash rate is the only one hashing, eg. what is the current nodes expected time to block?
+
+Also look into the node gossip protocol for discovery, I would like for even indirect relay connections to be gossipped if possible
+
+And what is the gpu thing actually doing? Because when I go to 100% it spikes like 10x, but everything below 100% is practically the same
+
+Include device label in the node connections
+
+### Consensus backlog
+ANOTHER IMPORTANT NOTE, I WOULD LIKE TO BACKLOG THE FOLLOWING MAKE A SEPERATE STRUCTURE FOR CONESENSUS BACKLOG
+I would like to readdress the consensus for the limit to target scaling, my friends had their gpus on and then turned them off and completely stalled the block chain because my gpu is less powerful than theirs and couldn't keep up
+Additionally I believe the singular block model may have made it even worse, even with all gpus contributing that would be a expected block time of 1.6 hours so something clearly went wrong. This algorithm needs more work
+is there a **safe** way to implement some sort of 20 minute fall back where we are able to revert to a lower target or just have some other fall back system for this to prevent complete stalls for hours
+
+Imediate consensus needs to be made to change away from singular block adjustment I think. The problem is a particularly lucky block shifts target, but if we expand to larger epoch it means a drop in network compute power means we have to fight for longer. Is there a better solution?
+
+Also this may fit somewhere else but maybe a large conflicting fork with much higher pow strongly prompts for a client upgrade? If this is a good idea it should be pushed very soon
+
+## 2.1.5
+
+saved addresses for outgoing transactions
+More detailed block view for the developer view, eg full block view just expands out as you click through it
+
 ## 2.3
 
 ### Graphical overhaul of the desktop app
@@ -179,15 +251,6 @@ Problems that have been observed and have no version yet.
   on a fresh start are these failures.
 - Possible change: do not pass on or dial loopback addresses, and drop
   addresses of peers that have not been reachable for some time.
-
-### Difficulty overshoots when a fast miner starts a quiet chain
-
-- Consensus: yes, if the adjustment rule changes
-- Found: 2026-11-11. A GPU mined the first 63 blocks in about 30 seconds. The
-  difficulty rose to about 38 leading zero bits. Blocks then took far longer
-  than the 300-second target for the hash power present, and the difficulty
-  comes down only a little with each slow block.
-- Not yet investigated. Changing the rule is a consensus change.
 
 ### The miner puts at most one transfer in a block
 
