@@ -11,6 +11,47 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.1.2 (2026-11-11)
+
+### Fixed
+
+- **A transfer could be left out of blocks mined by a node that connected
+  later.** A node announced a transfer to its peers once. A node that
+  connected afterwards, or was still syncing, never learned of it and mined
+  blocks without it. Each session now sends its peer the pending transfers
+  when it starts and again every 60 seconds. Older nodes accept these as
+  ordinary announcements.
+- An empty `XDG_DATA_HOME` or `APPDATA` variable made the app put its data
+  folder in the current directory. An empty variable now counts as unset.
+
+### Added
+
+- **GPU use limit.** A slider in the app's Mining section (10% to 100%) limits
+  how much of the GPU mining uses; the hash rate falls in proportion. It can
+  be changed while mining and is remembered. The command-line miner has
+  `--limit <percent>`, which also applies to `--bench`.
+- **Install for the current user.** A downloaded copy offers to install: it
+  copies itself to a fixed place under a short name
+  (`%LOCALAPPDATA%\Programs\JeffyCoin\JeffyCoin.exe`, `~/.local/bin/jeffycoin`),
+  adds a "JeffyCoin" entry to the Start menu or application menu, and starts
+  the installed copy. The download is left in place. No administrator rights
+  are needed.
+  - Updates apply only to the installed copy.
+  - A downloaded copy can open the installed app, or replace it when the
+    versions differ.
+  - The installed copy has "Uninstall", which keeps the data folder.
+  - An "Open" button next to the data folder path.
+
+### Known limits
+
+- The install has not been run on Windows before this release.
+- The Windows Start menu entry shows a generic icon, and the app is not listed
+  under "Installed apps".
+- A downloaded copy and the installed copy can run at the same time on the
+  same data folder.
+
+Consensus: no change.
+
 ## 2.1.1 (2026-11-11)
 
 ### Fixed

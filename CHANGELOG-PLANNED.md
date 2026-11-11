@@ -17,86 +17,6 @@ How to use this file:
 Status values: `planned` (agreed, not started), `in progress`, `done` (merged
 to `main`, waiting for the release).
 
-## 2.1.2
-
-### Share pending transfers with a peer that connects later
-
-- Status: done (not committed to `main` yet)
-- Consensus: no
-- Found: 2026-11-11. A transfer was sent while two nodes were connected. A
-  third node connected afterwards and mined the next block. The block did not
-  include the transfer, and the transfer stayed pending on the sender.
-- Cause: a node announces a transfer to its peers once, when it first accepts
-  it (`NewTransaction`). The protocol has no message that gives a newly
-  connected peer the transfers that are already pending. A node that joins
-  later never learns of them, so the blocks it mines leave them out.
-- Planned change: when a session with a peer starts, send that peer the
-  pending transfers (the mempool). Old nodes accept these as ordinary
-  `NewTransaction` messages, so old and new versions work together.
-- As built: each session sends its peer the pending transfers when it starts
-  and again every 60 seconds (at most 256 each time). The repeat is needed: a
-  peer that is still syncing rejects a transfer, because it does not know the
-  sender's balance yet. A peer that already holds a transfer does not relay
-  it, so repeats stop at the first hop.
-- Tested: a node that joined after a transfer was sent held it as pending
-  within 8 seconds, and a block mined through that node confirmed it.
-
-### A limit on how much of the GPU mining uses
-
-- Status: done (not committed to `main` yet)
-- Consensus: no
-- Problem: mining runs the GPU without pause. The computer is slow to use
-  while it mines, and the GPU runs hot and loud. The only control is to stop
-  mining.
-- Planned change: a setting in the app's Mining section that limits GPU use,
-  as a share of full power (for example 25%, 50%, 75%, 100%). The mining loop
-  pauses between GPU dispatches so that the GPU is busy for about that share
-  of the time. The setting is remembered between runs and can be changed while
-  mining. The command-line miner gets the same limit as an option.
-- Effect on mining: the hash rate falls in proportion to the limit, so blocks
-  are found less often.
-- As built: a slider in the Mining section, 10% to 100% in steps of 5, which
-  can be moved while mining and is remembered. The command-line miner has
-  `--limit <percent>`, which also applies to `--bench`.
-- Measured on an Intel Iris Xe: 152, 113, 71, and 33 MH/s at 100%, 75%, 50%,
-  and 25%.
-- Not built: lowering the limit by itself while the computer is in use. That
-  moves to 2.3 (GPU statistics and modes).
-
-### A consistent install, reachable like any other app
-
-- Status: done (not committed to `main` yet). Not run on Windows.
-- Consensus: no
-- Problem: there was no install step. The download was the program, and it ran
-  from wherever it was saved (often the Downloads folder). It had no Start
-  menu or application menu entry and no icon. The updater replaced the file it
-  was started from, so what an update did depended on where that copy was.
-- As built, on Windows and Linux, for the current user, with no administrator
-  rights:
-  - A copy that is not installed shows an "Install JeffyCoin" box at the top.
-    Installing copies the program to one fixed place under a short name, adds
-    a menu entry named "JeffyCoin", and starts the installed copy. The
-    download is left where it is, under its long download name.
-  - Program: `%LOCALAPPDATA%\Programs\JeffyCoin\JeffyCoin.exe` on Windows,
-    `~/.local/bin/jeffycoin` on Linux.
-  - Menu entry: a Start menu shortcut on Windows; a `.desktop` file with an
-    icon on Linux. Searching "JeffyCoin" finds it.
-  - If the app is already installed, a downloaded copy offers "Open the
-    installed app" and, when the versions differ, "Replace it with this
-    version".
-  - Updates apply only to the installed copy. A copy that is not installed
-    has the update button disabled, with the reason.
-  - The installed copy has a two-step "Uninstall" at the bottom of the window.
-    It removes the program and the menu entry and keeps the data folder.
-  - The data folder is unchanged (`%APPDATA%\JeffyCoin`,
-    `~/.local/share/jeffycoin`) and has an "Open" button next to its path.
-- Not done:
-  - The Windows program file has no icon of its own, so the Start menu entry
-    shows a generic icon.
-  - The app does not appear under "Installed apps" in Windows Settings.
-  - Nothing stops a downloaded copy and the installed copy from running at
-    the same time on the same data folder (see "Unscheduled").
-
 ## 2.3
 
 ### Graphical overhaul of the desktop app
@@ -135,6 +55,35 @@ to `main`, waiting for the release).
   at startup; keep the sent list across restarts.
 
 Problems that have been observed and have no version yet.
+
+### Log attributes that make the logs cheaper to read
+
+- Consensus: no
+- Found: 2026-11-11, while building the log reader (`tools/sentry-logs`) and
+  the `sentry-logs` skill. The reader has to fetch the full text of a line to
+  learn which peer it is about, why a dial failed, or what height a node is
+  at. One failed-dial line is 300 to 800 characters, and a node logs dozens on
+  each start.
+- Planned change: put those facts in attributes, so a query can ask for the
+  attributes and leave the text out.
+  - `run`: a short random id made at each app start. Selects one run of one
+    node without a time window.
+  - `peer`: the 6 characters after `12D3KooW` of the other node a line is
+    about (dials, connections, hole punches, streams).
+  - `reason`: a short class for a failure, for example `timeout`, `refused`,
+    `no_reservation`, `address_in_use`, `already_dialing`, `handshake`.
+  - `via`: `relay` or `direct`, for dials and connections.
+  - `height`: the block height a line is about (blocks, replay, sync).
+- Planned change: a `status` line once a minute with the node's state in
+  attributes (`height`, `peers`, `reservation` yes/no, `mining` yes/no,
+  `hash_rate`, `pending`). One row then answers "what state is this node in"
+  without reading its history.
+- Planned change: log a sent transfer (`transfer_sent`, with its id, amount,
+  and nonce) and its confirmation (`transfer_confirmed`). The log has no
+  record of sends today.
+- Planned change: send failed dials to addresses that can never be reached
+  (loopback, link-local) at a lower level or not at all. See "Log noise from
+  addresses that cannot be reached".
 
 ### Two copies of the app can run on the same data folder
 
