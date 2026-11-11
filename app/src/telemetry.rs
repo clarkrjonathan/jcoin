@@ -213,6 +213,8 @@ pub fn classify(text: &str) -> Class {
         "app" if starts("mining started") => ("mining_started", false),
         "app" if starts("mining stopped") => ("mining_stopped", false),
         "app" if starts("cannot open the GPU") => ("gpu_unavailable", false),
+        "app" if starts("install") || starts("running") => ("install", false),
+        "app" if starts("GPU use limit") => ("gpu_limit_set", false),
         "app" if starts("update") => ("update", false),
         _ => ("other", false),
     };

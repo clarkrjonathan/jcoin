@@ -16,7 +16,7 @@ use clap::Parser;
 use rand::Rng;
 
 use jcoin_gpu_miner::gpu::{self, Gpu, WORKGROUP};
-use jcoin_gpu_miner::miner::{mine, MinerControl};
+use jcoin_gpu_miner::miner::{mine, rest_after, MinerControl};
 use jcoin_gpu_miner::pow::{gpu_work, meets_target, HEADER_LEN};
 
 #[derive(Parser)]
@@ -39,6 +39,10 @@ struct Cli {
     /// transactions and a current timestamp.
     #[arg(long, default_value_t = 20)]
     refresh: u64,
+    /// Limit GPU use to about this percent of full power (1 to 100). The miner
+    /// pauses between GPU dispatches; the hash rate falls in proportion.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=100))]
+    limit: u32,
     /// List the GPUs and exit.
     #[arg(long)]
     list: bool,
@@ -70,7 +74,7 @@ fn main() {
         std::process::exit(if self_test(&gpu) { 0 } else { 1 });
     }
     if let Some(secs) = cli.bench {
-        bench(&gpu, batch, secs);
+        bench(&gpu, batch, secs, cli.limit);
         return;
     }
     let Some(miner) = cli.miner.as_deref() else {
@@ -81,13 +85,18 @@ fn main() {
         eprintln!("--miner must be a 32-byte hex address");
         std::process::exit(2);
     }
+    let control = MinerControl::default();
+    control.set_limit(cli.limit);
+    if cli.limit < 100 {
+        println!("GPU use limited to {}%", cli.limit);
+    }
     mine(
         &gpu,
         &cli.node,
         miner,
         batch,
         Duration::from_secs(cli.refresh),
-        &MinerControl::default(),
+        &control,
     );
 }
 
@@ -137,7 +146,7 @@ fn self_test(gpu: &Gpu) -> bool {
     ok
 }
 
-fn bench(gpu: &Gpu, batch: u32, secs: u64) {
+fn bench(gpu: &Gpu, batch: u32, secs: u64, limit: u32) {
     let mut rng = rand::thread_rng();
     let work = gpu_work(&random_header(&mut rng), &[0u8; 32]);
     gpu.search(&work, 0, 0, batch); // warm-up: pipeline creation, first submit
@@ -148,10 +157,12 @@ fn bench(gpu: &Gpu, batch: u32, secs: u64) {
         if lo.checked_add(batch - 1).is_none() {
             lo = 0;
         }
+        let dispatched = Instant::now();
         gpu.search(&work, 1, lo, batch);
+        std::thread::sleep(rest_after(dispatched.elapsed(), limit));
         lo = lo.wrapping_add(batch);
         hashes += batch as u64;
     }
     let rate = hashes as f64 / start.elapsed().as_secs_f64();
-    println!("{:.1} MH/s ({} nonces per dispatch)", rate / 1e6, batch);
+    println!("{:.1} MH/s ({} nonces per dispatch, {limit}% GPU use limit)", rate / 1e6, batch);
 }

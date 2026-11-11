@@ -24,5 +24,8 @@ pub use host::{load_or_create_keypair, parse_addr, run_host, HostConfig, PROTOCO
 pub use link::PeerLink;
 pub use message::{read_message, write_message, Hello, Message, MessageError};
 pub use network::{ConnectionInfo, Network, PeerId};
-pub use peer::{handshake, local_hello, run_peer, HandshakeError, PEER_TIMEOUT, PING_INTERVAL};
+pub use peer::{
+    handshake, local_hello, run_peer, HandshakeError, ANNOUNCE_INTERVAL, ANNOUNCE_MAX, PEER_TIMEOUT,
+    PING_INTERVAL,
+};
 pub use relay_host::run_relay;

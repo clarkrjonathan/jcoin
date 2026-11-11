@@ -1,7 +1,7 @@
 //! The mining loop: get a block template from a node, search the nonce on the
 //! GPU, check every hit on the CPU, and submit it.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,8 @@ pub struct FoundBlock {
 #[derive(Default)]
 pub struct MinerControl {
     stop: AtomicBool,
+    /// GPU use limit in percent; 0 means not set (no limit).
+    limit: AtomicU32,
     /// Hash rate over the last couple of seconds, in hashes per second.
     pub hash_rate: AtomicU64,
     /// Height of the block being worked on.
@@ -46,6 +48,21 @@ impl MinerControl {
     /// Ask the mining loop to return. It does so within one GPU dispatch.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Limit GPU use to about `percent` of full power (clamped to 1..=100).
+    /// The mining loop pauses between GPU dispatches to keep to it. Takes
+    /// effect at the next dispatch, also while mining.
+    pub fn set_limit(&self, percent: u32) {
+        self.limit.store(percent.clamp(1, 100), Ordering::Relaxed);
+    }
+
+    /// The GPU use limit in percent; 100 if none was set.
+    pub fn limit(&self) -> u32 {
+        match self.limit.load(Ordering::Relaxed) {
+            0 => 100,
+            percent => percent,
+        }
     }
 
     pub fn stopped(&self) -> bool {
@@ -95,6 +112,13 @@ impl MinerControl {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// How long to rest after a GPU dispatch that took `busy`, so that the GPU is
+/// busy for `percent` of the time: `busy * (100 - percent) / percent`.
+pub fn rest_after(busy: Duration, percent: u32) -> Duration {
+    let percent = percent.clamp(1, 100);
+    busy * (100 - percent) / percent
 }
 
 #[derive(Deserialize)]
@@ -169,7 +193,13 @@ pub fn mine(gpu: &Gpu, node: &str, miner: &str, batch: u32, refresh: Duration, c
                 hi = hi.wrapping_add(1);
                 lo = 0;
             }
+            let dispatched = Instant::now();
             let hit = gpu.search(&gw, hi, lo, batch);
+            // Under a limit, rest after the dispatch so the GPU is busy for
+            // about that share of the time. A found nonce is handled first.
+            if hit.is_none() {
+                control.pause(rest_after(dispatched.elapsed(), control.limit()));
+            }
             let batch_hi = hi;
             hashes += batch as u64;
             window_hashes += batch as u64;
@@ -266,5 +296,34 @@ fn submit(
             control.log(true, format!("submit failed: {e}"));
             control.set_status(format!("submit failed: {e}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rest_keeps_the_gpu_busy_for_the_limit_share() {
+        let busy = Duration::from_millis(30);
+        assert_eq!(rest_after(busy, 100), Duration::ZERO);
+        assert_eq!(rest_after(busy, 50), Duration::from_millis(30));
+        assert_eq!(rest_after(busy, 25), Duration::from_millis(90));
+        assert_eq!(rest_after(busy, 75), Duration::from_millis(10));
+        // Out-of-range values are clamped, never a division by zero.
+        assert_eq!(rest_after(busy, 0), rest_after(busy, 1));
+        assert_eq!(rest_after(busy, 500), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_limit_defaults_to_full_power_and_is_clamped() {
+        let control = MinerControl::default();
+        assert_eq!(control.limit(), 100);
+        control.set_limit(40);
+        assert_eq!(control.limit(), 40);
+        control.set_limit(0);
+        assert_eq!(control.limit(), 1);
+        control.set_limit(250);
+        assert_eq!(control.limit(), 100);
     }
 }

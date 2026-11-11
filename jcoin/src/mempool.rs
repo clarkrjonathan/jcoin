@@ -206,6 +206,20 @@ impl Mempool {
         Ok(Admitted::New)
     }
 
+    /// Every pending transaction, each sender's in nonce order, so a node that
+    /// receives them in this order can admit each one (a transaction is only
+    /// admitted after the sender's earlier ones). Senders are in address
+    /// order, so the result is deterministic.
+    pub fn pending(&self) -> Vec<Transaction> {
+        let mut senders: Vec<_> = self.by_sender.iter().collect();
+        senders.sort_by_key(|(sender, _)| **sender);
+        senders
+            .into_iter()
+            .flat_map(|(_, chain)| chain.values())
+            .filter_map(|id| self.by_id.get(id).cloned())
+            .collect()
+    }
+
     /// The pending transaction to mine next on top of `state`: among those that
     /// apply now (the head of each sender's chain), the highest fee, with ties
     /// broken by the smallest id so the choice is deterministic.
@@ -333,6 +347,25 @@ mod tests {
             s.apply(&Transaction::coinbase([who; 32], REWARD)).unwrap();
         }
         s
+    }
+
+    #[test]
+    fn pending_lists_each_senders_transactions_in_nonce_order() {
+        let state = funded();
+        let mut pool = Mempool::new(10);
+        assert!(pool.pending().is_empty());
+        for t in [tx(2, 0, 5, 0), tx(1, 0, 5, 0), tx(1, 1, 5, 0), tx(2, 1, 5, 0), tx(1, 2, 5, 0)] {
+            assert_eq!(pool.insert(t, &state), Ok(Admitted::New));
+        }
+        let order: Vec<(u8, u64)> = pool.pending().iter().map(|t| (t.sender[0], t.nonce)).collect();
+        assert_eq!(order, [(1, 0), (1, 1), (1, 2), (2, 0), (2, 1)]);
+
+        // Replayed in that order into an empty pool, every one is admitted.
+        let mut other = Mempool::new(10);
+        for t in pool.pending() {
+            assert_eq!(other.insert(t, &state), Ok(Admitted::New));
+        }
+        assert_eq!(other.len(), 5);
     }
 
     #[test]

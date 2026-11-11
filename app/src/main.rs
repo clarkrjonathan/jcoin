@@ -10,6 +10,7 @@
 
 mod applog;
 mod backend;
+mod install;
 mod telemetry;
 mod update;
 
@@ -55,6 +56,55 @@ struct App {
     /// The label for this computer, as typed in the Developer section.
     device: String,
     device_result: Option<Result<String, String>>,
+    install: Install,
+}
+
+/// Where this copy of the program stands relative to the installed one.
+struct Install {
+    /// The install locations, if this system supports installing.
+    layout: Option<install::Layout>,
+    /// This program file.
+    exe: std::path::PathBuf,
+    /// This program file is the installed copy.
+    installed_copy: bool,
+    /// Offer to install. Off for the installed copy and for test settings.
+    offer: bool,
+    /// Why the last install or removal failed.
+    error: Option<String>,
+    /// The Uninstall button was pressed once and waits for confirmation.
+    confirm_uninstall: bool,
+}
+
+impl Install {
+    fn detect(regtest: bool) -> Install {
+        let layout = install::Layout::for_user();
+        let exe = std::env::current_exe().unwrap_or_default();
+        let installed_copy = layout.as_ref().is_some_and(|l| l.is_installed_copy(&exe));
+        if let (true, Some(layout)) = (installed_copy, &layout) {
+            // Keep the record right after an in-app update.
+            layout.record_version(update::CURRENT);
+        }
+        let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+        let test_settings = regtest || set("JCOIN_APP_DATA") || set("JCOIN_APP_NO_INSTALL");
+        Install {
+            offer: layout.is_some() && !installed_copy && !test_settings,
+            layout,
+            exe,
+            installed_copy,
+            error: None,
+            confirm_uninstall: false,
+        }
+    }
+
+    /// Install this copy (replacing an installed one) and switch to it.
+    fn install_and_switch(&mut self) {
+        let Some(layout) = &self.layout else { return };
+        let result = layout
+            .install(&self.exe, update::CURRENT)
+            .and_then(|()| install::hand_over_to(&layout.program));
+        // `hand_over_to` only returns on failure.
+        self.error = result.err();
+    }
 }
 
 /// What the update check or an install is doing.
@@ -123,6 +173,7 @@ struct KeysForm {
 impl App {
     fn new(settings: Settings) -> App {
         let device = telemetry::device_name(&settings.data_dir);
+        let install = Install::detect(settings.regtest);
         App {
             backend: Backend::start(settings),
             adapter: None,
@@ -134,6 +185,7 @@ impl App {
             updates: Updates::start(),
             device,
             device_result: None,
+            install,
         }
     }
 }
@@ -155,6 +207,7 @@ impl eframe::App for App {
                     }
                 };
                 backend.pump_miner();
+                install_banner(ui, &mut self.install);
                 if backend.settings.regtest {
                     ui.colored_label(ui.visuals().warn_fg_color, "Test network (regtest)");
                 }
@@ -176,17 +229,105 @@ impl eframe::App for App {
                     &mut self.send_result,
                 );
                 ui.add_space(12.0);
-                updates_section(ui, &mut self.updates, backend);
+                updates_section(ui, &mut self.updates, backend, self.install.offer);
                 ui.add_space(12.0);
                 developer_section(ui, backend, &mut self.device, &mut self.device_result);
                 ui.add_space(12.0);
                 ui.separator();
-                ui.small(format!("Data folder: {}", display_path(&backend.settings.data_dir)));
+                ui.horizontal(|ui| {
+                    ui.small(format!("Data folder: {}", display_path(&backend.settings.data_dir)));
+                    if ui.small_button("Open").clicked() {
+                        if let Err(e) = install::open_folder(&backend.settings.data_dir) {
+                            backend.log.push(true, &format!("[app] {e}"));
+                        }
+                    }
+                });
+                uninstall_row(ui, &mut self.install);
                 ui.small(
                     "Your coins are controlled by the key files in this folder. Back them up; anyone who has one can spend its coins.",
                 );
             });
         });
+    }
+}
+
+/// Shown at the top when this copy is not the installed one: offers to
+/// install, or to switch to (or replace) the copy that is installed.
+fn install_banner(ui: &mut egui::Ui, state: &mut Install) {
+    if !state.offer {
+        return;
+    }
+    let Some(layout) = state.layout.clone() else { return };
+    let menu = if cfg!(windows) { "Start menu" } else { "application menu" };
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        match layout.installed_version() {
+            None => {
+                ui.label(format!(
+                    "JeffyCoin is not installed yet. Installing adds \"{}\" to the {menu}, so you can find it by searching, and makes updates work the same way every time. This download stays where it is.",
+                    install::APP_NAME
+                ));
+                if ui.button("Install JeffyCoin").clicked() {
+                    state.install_and_switch();
+                }
+            }
+            Some(installed) => {
+                ui.label(format!(
+                    "This is a downloaded copy (version {}). JeffyCoin {installed} is installed; find it by searching \"{}\" in the {menu}.",
+                    update::CURRENT,
+                    install::APP_NAME
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Open the installed app").clicked() {
+                        state.error = install::hand_over_to(&layout.program).err();
+                    }
+                    if installed != update::CURRENT
+                        && ui
+                            .button(format!("Replace it with this version ({})", update::CURRENT))
+                            .clicked()
+                    {
+                        state.install_and_switch();
+                    }
+                });
+            }
+        }
+        ui.small(format!("Install location: {}", display_path(&layout.program)));
+        if let Some(e) = &state.error {
+            ui.colored_label(ui.visuals().error_fg_color, e.as_str());
+        }
+    });
+    ui.add_space(8.0);
+}
+
+/// For the installed copy: a two-step button that removes the app. The data
+/// folder (keys and chain) stays.
+fn uninstall_row(ui: &mut egui::Ui, state: &mut Install) {
+    if !state.installed_copy {
+        return;
+    }
+    let Some(layout) = state.layout.clone() else { return };
+    ui.horizontal(|ui| {
+        ui.small(format!("Installed at {}", display_path(&layout.program)));
+        if !state.confirm_uninstall {
+            if ui.small_button("Uninstall").clicked() {
+                state.confirm_uninstall = true;
+            }
+        } else {
+            if ui.small_button("Confirm: remove the app, keep my data").clicked() {
+                match layout.uninstall(&state.exe) {
+                    Ok(()) => {
+                        telemetry::flush();
+                        std::process::exit(0);
+                    }
+                    Err(e) => state.error = Some(e),
+                }
+            }
+            if ui.small_button("Cancel").clicked() {
+                state.confirm_uninstall = false;
+            }
+        }
+    });
+    if let Some(e) = &state.error {
+        ui.colored_label(ui.visuals().error_fg_color, e.as_str());
     }
 }
 
@@ -368,6 +509,19 @@ fn mining_section(ui: &mut egui::Ui, backend: &mut Backend, adapter: &mut Option
             });
     });
 
+    // The limit can be changed while mining.
+    let mut limit = backend.gpu_limit();
+    ui.horizontal(|ui| {
+        ui.label("GPU use limit");
+        ui.add(
+            egui::Slider::new(&mut limit, backend::MIN_GPU_LIMIT..=100)
+                .step_by(5.0)
+                .suffix("%"),
+        )
+        .on_hover_text("Lower this to keep the computer responsive and the GPU cooler while mining. The hash rate falls by the same share.");
+    });
+    backend.set_gpu_limit(limit);
+
     if busy {
         if ui.button("Stop mining").clicked() {
             backend.stop_mining();
@@ -407,7 +561,7 @@ fn mining_section(ui: &mut egui::Ui, backend: &mut Backend, adapter: &mut Option
     }
 }
 
-fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, backend: &Backend) {
+fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, backend: &Backend, not_installed: bool) {
     ui.strong("Updates");
     let state = updates.state.lock().unwrap().clone();
     match state {
@@ -454,8 +608,13 @@ fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, backend: &Backend) 
                     );
                     let same = chosen.relation() == "this version";
                     if ui
-                        .add_enabled(!mining && !same, egui::Button::new("Install and restart"))
-                        .on_disabled_hover_text(if same {
+                        .add_enabled(
+                            !mining && !same && !not_installed,
+                            egui::Button::new("Install and restart"),
+                        )
+                        .on_disabled_hover_text(if not_installed {
+                            "Install JeffyCoin first (see the top of the window). Updates apply to the installed copy."
+                        } else if same {
                             "This version is already running"
                         } else {
                             "Stop mining before updating"

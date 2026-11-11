@@ -42,6 +42,11 @@ pub enum NodeRequest {
     GetMiningJob {
         reply: oneshot::Sender<MiningJob>,
     },
+    /// Every pending transaction, each sender's in nonce order (to announce
+    /// them to peers).
+    GetPending {
+        reply: oneshot::Sender<Vec<Transaction>>,
+    },
     GetChainInfo {
         reply: oneshot::Sender<ChainInfo>,
     },
@@ -261,6 +266,10 @@ pub async fn run_node(
                     },
                 };
                 let _ = reply.send(outcome);
+            }
+
+            NodeRequest::GetPending { reply } => {
+                let _ = reply.send(mempool.pending());
             }
 
             NodeRequest::GetMiningJob { reply } => {

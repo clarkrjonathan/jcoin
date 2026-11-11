@@ -17,6 +17,19 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// Silence after which a peer is dropped.
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// How often a session sends its peer the pending transactions again.
+///
+/// A transaction is gossiped once, when a node first accepts it. A peer that
+/// connects later never hears of it, and a peer that is still syncing rejects
+/// it (it does not know the sender's balance yet). So each session sends the
+/// whole pending set when it starts and again at this interval. A peer that
+/// already holds a transaction accepts it as known and does not relay it, so
+/// repeats stop at the first hop.
+pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Most pending transactions sent to one peer in one announcement.
+pub const ANNOUNCE_MAX: usize = 256;
+
 /// Bound on each per-peer channel.
 const CHANNEL_BOUND: usize = 64;
 
@@ -152,9 +165,17 @@ pub async fn run_peer<L: PeerLink + 'static>(mut link: L, network: Network, labe
     let mut ticker = interval(PING_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_activity = Instant::now();
+    // The first tick is immediate: the peer gets the pending set at once.
+    let mut announce = interval(ANNOUNCE_INTERVAL);
+    announce.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
+            _ = announce.tick() => {
+                if !announce_pending(&network, &mut write_half).await {
+                    break;
+                }
+            }
             incoming = in_rx.recv() => {
                 match incoming {
                     Some(msg) => {
@@ -325,6 +346,29 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
 
 /// Ask a peer for the blocks we are missing by sending our block locator.
 /// Returns false only on a fatal write error.
+/// Send the peer this node's pending transactions. Returns false if the
+/// stream failed.
+async fn announce_pending<W: AsyncWrite + Unpin>(network: &Network, write_half: &mut W) -> bool {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if network
+        .node()
+        .send(NodeRequest::GetPending { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        return true; // node core gone; nothing to announce
+    }
+    let Ok(pending) = reply_rx.await else {
+        return true;
+    };
+    for tx in pending.into_iter().take(ANNOUNCE_MAX) {
+        if write_message(write_half, &Message::NewTransaction(tx)).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 async fn start_sync<W: AsyncWrite + Unpin>(network: &Network, write_half: &mut W) -> bool {
     let (reply_tx, reply_rx) = oneshot::channel();
     if network

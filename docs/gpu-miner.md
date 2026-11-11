@@ -41,6 +41,10 @@ cargo build --release
 ./target/release/gpu-miner --miner <hex address> --node http://127.0.0.1:3000
 ```
 
+`--limit <percent>` (1 to 100) limits GPU use: the miner rests between GPU
+dispatches so the GPU is busy for about that share of the time, and the hash
+rate falls in proportion. It also applies to `--bench`.
+
 `--adapter <index>` picks a GPU from `--list`. `--batch` sets nonces per
 dispatch (default 2^22).
 

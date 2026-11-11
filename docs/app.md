@@ -16,6 +16,32 @@ the GPU miner. A release publishes it as `JeffyCoin-windows-x86_64.exe` and
 4. Shows the connection status, block height, balance, and address, with
    controls to mine on a GPU and to send coins.
 
+## Installing
+
+`app/src/install.rs`. The download is a single file with a long name. A copy
+that is not installed shows an "Install JeffyCoin" box. Installing copies the
+program to a fixed place under a short name, adds a menu entry, and starts the
+installed copy. The download is left in place. No administrator rights are
+needed.
+
+| | Windows | Linux |
+| --- | --- | --- |
+| Program | `%LOCALAPPDATA%\Programs\JeffyCoin\JeffyCoin.exe` | `~/.local/bin/jeffycoin` |
+| Menu entry | `Start Menu\Programs\JeffyCoin.lnk` | `~/.local/share/applications/jeffycoin.desktop` |
+| Icon | none yet | `~/.local/share/icons/hicolor/scalable/apps/jeffycoin.svg` |
+| Installed version | `version.txt` next to the program | `~/.local/share/jeffycoin-install/version.txt` |
+
+- The Start menu shortcut is made by running PowerShell (a `.lnk` file can
+  only be made through the Windows shell).
+- Updates apply to the installed copy only; a copy that is not installed has
+  the update button disabled.
+- If the app is already installed, a downloaded copy offers to open the
+  installed app, or to replace it when the versions differ.
+- The installed copy has "Uninstall" at the bottom of the window. It keeps the
+  data folder.
+- The install box is hidden on the test network, when `JCOIN_APP_DATA` is set,
+  and when `JCOIN_APP_NO_INSTALL=1` is set.
+
 ## Keys
 
 The Keys section lists every key file in the data folder (`<name>_ed25519`, the
@@ -25,7 +51,10 @@ key from its secret key. The key in use is recorded in the file `active_key`.
 Switching is refused while mining, because a running miner pays the address it
 was started with. There is no delete: remove a key file by hand.
 
-Mining rewards go to the address of the key in use. A sent transfer shows
+Mining rewards go to the address of the key in use. The Mining section has a
+GPU use limit (10% to 100%): the miner rests between GPU dispatches so the GPU
+is busy for about that share of the time. It can be changed while mining and is
+stored in the file `gpu_limit`. A sent transfer shows
 "confirmed" once the wallet's confirmed nonce has passed the transfer's nonce.
 
 ## Developer section

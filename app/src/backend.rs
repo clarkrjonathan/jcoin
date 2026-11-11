@@ -27,6 +27,12 @@ const DEFAULT_RELAY: &str =
 /// Name of the key created on first run.
 const FIRST_KEY: &str = "wallet";
 
+/// File in the data folder that records the GPU use limit, in percent.
+const GPU_LIMIT_FILE: &str = "gpu_limit";
+
+/// The lowest GPU use limit the app offers, in percent.
+pub const MIN_GPU_LIMIT: u32 = 10;
+
 /// File in the data folder that records which key is in use.
 const ACTIVE_KEY_FILE: &str = "active_key";
 
@@ -65,7 +71,12 @@ impl Settings {
 /// `$XDG_DATA_HOME/jeffycoin` (or `~/.local/share/jeffycoin`) elsewhere. The
 /// test network gets its own folder so the two chains never mix.
 fn default_data_dir(regtest: bool) -> PathBuf {
-    let env = |name: &str| std::env::var_os(name).map(PathBuf::from);
+    // An empty variable counts as unset.
+    let env = |name: &str| {
+        std::env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
     let base = if cfg!(windows) {
         env("APPDATA").map(|p| p.join("JeffyCoin"))
     } else if cfg!(target_os = "macos") {
@@ -180,6 +191,8 @@ pub struct Backend {
     pub log: Arc<AppLog>,
     /// Blocks mined in mining runs that have ended.
     won: Vec<FoundBlock>,
+    /// GPU use limit while mining, in percent of full power.
+    gpu_limit: u32,
     node_url: String,
     view: Arc<Mutex<NodeView>>,
     http: reqwest::blocking::Client,
@@ -229,6 +242,20 @@ impl Backend {
 
         crate::telemetry::set_tag("address", &address);
 
+        if let Ok(exe) = std::env::current_exe() {
+            let installed = crate::install::Layout::for_user()
+                .is_some_and(|layout| layout.is_installed_copy(&exe));
+            log.push(
+                false,
+                &format!(
+                    "[app] running {} {}",
+                    if installed { "the installed copy" } else { "a copy that is not installed:" },
+                    exe.display()
+                ),
+            );
+            crate::telemetry::set_tag("installed", if installed { "yes" } else { "no" });
+        }
+
         let rest_port = free_port("127.0.0.1", 3000);
         let p2p_port = free_port("0.0.0.0", 8333);
         let node_url = format!("http://127.0.0.1:{rest_port}");
@@ -274,6 +301,7 @@ impl Backend {
             keys: Vec::new(),
             log,
             won: Vec::new(),
+            gpu_limit: 100,
             node_url,
             view,
             http,
@@ -283,6 +311,10 @@ impl Backend {
             sent: Vec::new(),
         };
         backend.refresh_keys();
+        backend.gpu_limit = std::fs::read_to_string(backend.settings.data_dir.join(GPU_LIMIT_FILE))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .map_or(100, |percent| percent.clamp(MIN_GPU_LIMIT, 100));
         Ok(backend)
     }
 
@@ -425,6 +457,29 @@ impl Backend {
         Ok(id)
     }
 
+    /// The GPU use limit while mining, in percent of full power.
+    pub fn gpu_limit(&self) -> u32 {
+        self.gpu_limit
+    }
+
+    /// Set the GPU use limit (clamped to `MIN_GPU_LIMIT..=100`). It applies
+    /// at once if mining, and is remembered for later runs.
+    pub fn set_gpu_limit(&mut self, percent: u32) {
+        let percent = percent.clamp(MIN_GPU_LIMIT, 100);
+        if percent == self.gpu_limit {
+            return;
+        }
+        self.gpu_limit = percent;
+        if let Some(m) = &self.mining {
+            m.control.set_limit(percent);
+        }
+        let _ = std::fs::write(
+            self.settings.data_dir.join(GPU_LIMIT_FILE),
+            percent.to_string(),
+        );
+        self.log.push(false, &format!("[app] GPU use limit set to {percent}%"));
+    }
+
     /// Start mining on GPU `adapter` (an index into `gpus()`), or on the one
     /// the system prefers for `None`. Rewards go to this wallet.
     pub fn start_mining(&mut self, adapter: Option<usize>) {
@@ -434,6 +489,7 @@ impl Backend {
         self.mining_error = None;
         self.log.push(false, &format!("[app] mining started, rewards to {}", self.address));
         let control = Arc::new(MinerControl::default());
+        control.set_limit(self.gpu_limit);
         let opened = Arc::new(Mutex::new(None));
         let thread = {
             let (control, opened) = (control.clone(), opened.clone());
@@ -752,8 +808,16 @@ mod tests {
         assert_eq!(copy.address, backend.address);
         wait_for("the new account", Duration::from_secs(20), || backend.view().account_known);
 
+        // The GPU limit is clamped and remembered too.
+        assert_eq!(backend.gpu_limit(), 100);
+        backend.set_gpu_limit(40);
+        backend.set_gpu_limit(3);
+        assert_eq!(backend.gpu_limit(), MIN_GPU_LIMIT);
+        backend.set_gpu_limit(55);
+
         // A second start in the same folder uses the remembered key.
         let again = Backend::start(settings()).unwrap();
+        assert_eq!(again.gpu_limit(), 55);
         assert_eq!(again.key_name, "savings");
         assert_eq!(again.address, backend.address);
         let _ = std::fs::remove_dir_all(&dir);
