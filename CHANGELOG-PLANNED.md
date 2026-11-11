@@ -53,12 +53,49 @@ to `main`, waiting for the release).
   - Tests that simulate a chain: a miner far faster than the floor, a hash
     rate step up and down, and a miner leaving. Each must settle near 300 s
     and never run away. The current tests only check one adjustment step.
-- Open points:
-  - Activate at a height on the current chain (balances are kept; blocks 1 to
-    69 stay valid under the old rule) or restart the chain. The next block
-    under the old rule needs about 45 bits, so the activation height would be
-    70: the first block mined by an updated node.
-  - The floor value.
+- Decided 2026-11-11: **restart the chain** with a new genesis. Coins mined on
+  the stalled chain are not carried over. Key files stay valid.
+- Open point: the floor value. Also see "Consensus backlog" under 2.1.4:
+  behavior when hash power leaves, and a safe fallback against long stalls,
+  are to be designed together with this rule.
+
+### Moving every client to the restarted chain
+
+- Status: planned, part of 2.2.0
+- Consensus: no (it is about how clients learn of a consensus change)
+- Problem: a client on 2.1.2 cannot follow a restart. It keeps its old chain,
+  rejects every block of the new one, and says so nowhere. Its only hint is
+  the line "A newer version is available" in the Updates section, checked
+  once at startup. A client left open never checks again.
+- What 2.1.2 clients will do when 2.2.0 nodes appear: nothing by themselves.
+  Their owners have to be told to update. This cannot be changed after the
+  fact; the points below make the *next* change announce itself.
+- Planned change, in 2.2.0:
+  - **Required updates.** A release can be marked as required (a small
+    `release.json` asset: the chain it is for and the oldest version that
+    still works). The app checks the release list at startup and every 30
+    minutes. When its own version is too old it shows a banner across the top
+    that cannot be dismissed ("This version can no longer take part in the
+    network"), with the update button in it, and stops mining so no power is
+    spent on a dead chain. This uses the same trust as the updater: the
+    project's own release page.
+  - **Chain identity in the handshake.** Peers exchange the genesis hash and
+    consensus version when they connect. A peer on another chain is refused
+    with that reason, and the app shows "N nodes you reached are on a
+    different chain; you probably need to update". Today such peers connect
+    and silently reject each other's blocks.
+  - **Separate discovery per chain.** The rendezvous name and the protocol id
+    include the chain, so nodes of the old and new chain do not find each
+    other at all. An old client then shows "Looking for other nodes".
+  - **Old chain data.** On first start, 2.2.0 moves the old `blocks.dat` aside
+    (`blocks-v2-stalled.dat`) and starts the new chain. Keys are untouched.
+- Considered, from the user's note under 2.1.4: prompt for an update when a
+  conflicting fork has much more proof of work. A client can check the proof
+  of work of headers it cannot otherwise validate, so this is possible. It is
+  weaker than the two signals above: on a small chain anyone with one GPU can
+  build a heavier chain and trigger the prompt, and "more work" does not say
+  which side is right. Keep it as a hint only ("a heavier chain exists that
+  this version cannot read") and never as the trigger that blocks mining.
 
 ## 2.1.3
 
