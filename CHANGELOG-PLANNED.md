@@ -22,7 +22,7 @@ Status values: `planned` (agreed, not started), `in progress`, `done` (merged
 to `main`, waiting for the release), `to design` (the problem is agreed, the
 change is not).
 
-2.2.0 is released. The next planned release is **2.2.1**.
+2.2.1 (a small patch) is released. The next planned release is **2.2.2**.
 
 ## After 2.2.0 (released 2026-11-11)
 
@@ -37,7 +37,7 @@ change is not).
   fallback at 20 minutes).
 - Redeploy the relay and the iMac node (see "Operations").
 
-## 2.2.1: logs that answer a question in one query
+## 2.2.2: logs that answer a question in one query
 
 Since 2.1.1 the app sends every log line to Sentry, and `tools/sentry-logs`
 and the `sentry-logs` skill read them. Reading them on 2026-11-11 showed what
@@ -170,7 +170,7 @@ is missing. None of this changes consensus.
   - Verify the reader's request to Sentry with a real token. It has only been
     tested without one.
 
-## 2.2.2: network health and mining view
+## 2.2.3: network health and mining view
 
 ### A block tracker and the average block time
 
@@ -228,10 +228,10 @@ is missing. None of this changes consensus.
 - To investigate: what the address exchange (`ADDR`, `GETADDR`) passes on
   today, whether relayed (`/p2p-circuit`) addresses are included, and why a
   LAN address was not tried.
-- This interacts with "Stop sending lines that say nothing" in 2.2.1: pass on
+- This interacts with "Stop sending lines that say nothing" in 2.2.2: pass on
   addresses that can be reached, not every address a node has.
 
-## 2.2.3: wallet and block detail
+## 2.2.4: wallet and block detail
 
 ### Saved addresses for sending
 

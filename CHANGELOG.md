@@ -11,6 +11,19 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.2.1 (2026-11-11)
+
+A small patch. No consensus change: it runs on the same chain as 2.2.0.
+
+### Changed
+
+- The example in the "Label for this computer" field (Developer → Reporting)
+  now reads "Jons Desktop".
+
+Consensus: no.
+
+Not tested on Windows; this version's build is the first Windows run.
+
 ## 2.2.0 (2026-11-11)
 
 **The chain restarts.** This release has a new genesis (2026-11-11 19:05 UTC)

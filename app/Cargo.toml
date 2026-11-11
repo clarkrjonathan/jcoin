@@ -1,6 +1,6 @@
 [package]
 name = "jcoin-app"
-version = "2.2.0"
+version = "2.2.1"
 edition = "2021"
 description = "JeffyCoin desktop app: node, wallet, and GPU miner in one window"
 
