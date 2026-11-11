@@ -25,12 +25,15 @@ pub struct Params {
     pub genesis_timestamp: u64,
     /// Target average seconds between blocks. Difficulty retargets toward it.
     pub target_block_time: u64,
-    /// Number of recent blocks in the LWMA difficulty window. Difficulty is
-    /// recomputed every block from a linearly weighted average of the solvetimes
-    /// of the last `lwma_window` blocks (recent blocks weighted more).
+    /// Number of recent blocks in the LWMA difficulty window (see
+    /// `chain::lwma_next_target`). `0` turns adjustment off: every block uses
+    /// `pow_limit`.
     pub lwma_window: u64,
-    /// Largest per-step difficulty change factor (clamps each retarget).
-    pub max_adjust_factor: u64,
+    /// The longest solve time one block counts for in the difficulty average,
+    /// as a multiple of `target_block_time`. It bounds how much one timestamp
+    /// can move the difficulty, and sets how fast difficulty falls after hash
+    /// power leaves.
+    pub solvetime_cap_factor: u64,
     /// Number of recent blocks whose median timestamp a new block must exceed.
     pub median_time_span: usize,
     /// Block subsidy at height 1, before any halving (base units).
@@ -58,7 +61,7 @@ pub const MAINNET: Params = Params {
     genesis_timestamp: 1_794_358_345, // 2026-11-11 00:52 UTC, the v2 genesis cut
     target_block_time: 300,
     lwma_window: 60,
-    max_adjust_factor: 4,
+    solvetime_cap_factor: 6,
     median_time_span: 11,
     initial_reward: 50 * COIN,
     halving_interval: 32_000,
@@ -66,16 +69,17 @@ pub const MAINNET: Params = Params {
 
 /// A local test network: the same rules as `MAINNET` with an easy proof of
 /// work (top 16 bits zero, so blocks mine in milliseconds), a zero genesis
-/// timestamp (so tests can use small increasing timestamps), a short
-/// `target_block_time` (so a local run settles to a watchable block cadence
+/// timestamp (so tests can use small increasing timestamps), no difficulty
+/// adjustment (`lwma_window` 0, so a test can mine every block at `pow_limit`
+/// with any timestamps), a short `target_block_time` (so a local run settles to a watchable block cadence
 /// instead of ramping up to the 5-minute mainnet target), and a short halving
 /// interval (so a test can cross a halving on a real chain).
 pub const REGTEST: Params = Params {
     pow_limit: limit_with_zero_bits(16),
     genesis_timestamp: 0,
     target_block_time: 10,
-    lwma_window: 12,
-    max_adjust_factor: 4,
+    lwma_window: 0,
+    solvetime_cap_factor: 6,
     median_time_span: 11,
     initial_reward: 50 * COIN,
     halving_interval: 150,

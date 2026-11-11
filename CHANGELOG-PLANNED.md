@@ -33,7 +33,8 @@ valid.
 
 ### The difficulty rule compounds and stalls the chain
 
-- Status: planned. Urgent: the chain is stalled.
+- Status: in progress on branch `consensus-2.2-restart`. The rule and its
+  tests are written; the genesis is not cut. Urgent: the chain is stalled.
 - Consensus: **yes**
 - Found: 2026-11-11. The chain reached height 69 at 05:33 UTC and produced no
   block for more than 8 hours, with about 2.1 GH/s mining. Difficulty went
@@ -63,6 +64,16 @@ valid.
   - Tests that simulate a chain: a miner far faster than the floor, a hash
     rate step up and down, and a miner leaving. Each must settle near 300 s
     and never run away. The current tests only check one adjustment step.
+- Built: `chain::lwma_next_target` (the rule as a function of recent targets
+  and solve times) and `target_for_child` feeding it. Missing history counts
+  as blocks at the limit that took 300 s, so the rule works from block 1. A
+  solve time counts for at most 6 x 300 s. Tests: exact cases, a simulated
+  miner 4,096 times faster than the floor, a 16x step up and down (20 seeds
+  each), and a real chain through `accept`. In simulation the block time
+  settles at 302 s and the difficulty never passes equilibrium by more than
+  1.5 bits.
+- `REGTEST` now has no adjustment (`lwma_window` 0), like Bitcoin's regtest,
+  so tests can mine at the limit with any timestamps.
 - Decided 2026-11-11: restart the chain, in place of activating the fix at a
   height on the stalled chain.
 - Open points: see "Consensus backlog" for the questions that are designed
@@ -397,8 +408,31 @@ under that version; this list says where each question stands.
     timestamp is past its parent's. The timestamp limits (after the median of
     the last 11 blocks, at most 2 hours ahead of the clock) bound what a
     miner can claim.
-- Each candidate goes through the chain simulation tests planned under 2.2.0
-  before one is chosen.
+- Simulated 2026-11-11 (`cargo test --release stall_report -- --ignored
+  --nocapture`; medians over 25 seeds; hash power falls to 1/15 or 1/100):
+
+  | Window | Fallback | Drop | First block | 10 blocks | Back under 2x target |
+  | --- | --- | --- | --- | --- | --- |
+  | 60 | none | 15x | 0.8 h | 7.8 h | 16 h |
+  | 60 | none | 100x | 5.1 h | 49 h | 87 h |
+  | 30 | none | 15x | 0.7 h | 6.3 h | 8 h |
+  | 60 | x2 at 20 min, then each 10 min | 15x | 0.5 h | 3.9 h | 5.8 h |
+  | 60 | x2 at 20 min, then each 10 min | 100x | 1.0 h | 6.2 h | 8.9 h |
+  | 30 | x2 at 20 min, then each 10 min | 15x | 0.6 h | 3.3 h | 3.1 h |
+  | 30 | x2 at 20 min, then each 10 min | 100x | 1.0 h | 4.8 h | 4.9 h |
+
+  A larger solve-time cap alone helps little (16 h to 11.5 h at cap 12). The
+  timestamp fallback bounds the wait for the next block at about an hour
+  whatever the drop. With constant hash power it changes little: mean block
+  time 295 s, difficulty spread 0.22 to 0.28 bits against 0.18.
+- Abuse of the timestamp fallback: a miner can stamp a block up to the
+  future-drift limit ahead and claim easing for time that has not passed.
+  With the limit at 2 hours that is one block about 2,000 times easier. With
+  the limit below the 20-minute grace period (for example 10 minutes) a
+  timestamp alone claims nothing. An eased block also carries less work, so
+  a block at normal difficulty at the same height wins.
+- Recommendation, not yet decided: window 30, fallback "x2 at 20 min, then
+  each 10 min", future-drift limit 10 minutes.
 
 ### Adjust every block or by epoch
 

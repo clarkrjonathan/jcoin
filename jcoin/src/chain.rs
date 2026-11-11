@@ -15,27 +15,75 @@ use crate::block::{Block, BlockError};
 use crate::consensus::{BlockContext, Params};
 use crate::state::State;
 
-/// New target from a parent target and the measured vs expected span of a
-/// retarget window. The span is clamped to `[expected/max_adjust_factor,
-/// expected*max_adjust_factor]` so difficulty moves at most that factor per
-/// step; the result is never easier than `pow_limit` nor zero. A span shorter
-/// than expected (blocks too fast) shrinks the target (harder).
-fn retarget(
-    params: &Params,
-    parent_target: &[u8; 32],
-    actual_span: u64,
-    expected_span: u64,
-) -> [u8; 32] {
-    let expected = expected_span.max(1);
-    let factor = params.max_adjust_factor;
-    let clamped = actual_span.clamp(expected / factor, expected * factor).max(1);
-    let parent = U256::from_big_endian(parent_target);
-    let new_target = parent.saturating_mul(U256::from(clamped)) / U256::from(expected);
-    let capped = new_target
-        .min(U256::from_big_endian(&params.pow_limit))
-        .max(U256::one());
+/// One block of history for the difficulty rule: the target it was mined at
+/// and its solve time (its timestamp minus its parent's, zero if not later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sample {
+    pub target: U256,
+    pub solvetime: u64,
+}
+
+/// The target for the next block, from the most recent blocks (newest first).
+///
+/// This is the LWMA (linearly weighted moving average) rule:
+///
+/// ```text
+/// next = average(targets) * sum(weight_i * solvetime_i) / (N(N+1)/2 * T)
+/// ```
+///
+/// over the last `N = lwma_window` blocks, with weight `N` for the newest
+/// block down to `1` for the oldest, and `T = target_block_time`. If the
+/// weighted solve time equals `T`, the next target is the average of the
+/// recent targets. Faster blocks give a smaller (harder) target, slower
+/// blocks a larger one.
+///
+/// The result is anchored to the **average of the recent targets**, not to
+/// the parent's target. A rule that scales the parent's target by a window
+/// average applies the same slow-moving ratio again on every block and
+/// compounds (the fault in consensus v2).
+///
+/// - Each solve time counts as at least 1 s and at most
+///   `T * solvetime_cap_factor`, so one timestamp has bounded effect.
+/// - Where fewer than `N` blocks exist, the missing history counts as blocks
+///   at `pow_limit` that took exactly `T`. The rule therefore works from the
+///   first block and moves gradually while the window fills.
+/// - The result is never easier than `pow_limit` and never zero.
+/// - `lwma_window == 0` turns adjustment off: the result is `pow_limit`.
+pub fn lwma_next_target(params: &Params, newest_first: &[Sample]) -> [u8; 32] {
+    let limit = U256::from_big_endian(&params.pow_limit);
+    let n = params.lwma_window;
     let mut bytes = [0u8; 32];
-    capped.to_big_endian(&mut bytes);
+    if n == 0 {
+        return params.pow_limit;
+    }
+    let t = params.target_block_time.max(1);
+    let cap = t.saturating_mul(params.solvetime_cap_factor.max(1));
+    let padding = Sample {
+        target: limit,
+        solvetime: t,
+    };
+
+    let mut target_sum = U256::zero();
+    let mut weighted: u128 = 0;
+    for i in 0..n as usize {
+        let sample = newest_first.get(i).unwrap_or(&padding);
+        // Targets are at most `pow_limit`, well below 2^256 / N, so the sum
+        // cannot overflow for any sensible limit; saturate to be safe.
+        target_sum = target_sum.saturating_add(sample.target);
+        let weight = (n as usize - i) as u128;
+        weighted += weight * sample.solvetime.clamp(1, cap) as u128;
+    }
+    let average = target_sum / U256::from(n);
+    let k = (n as u128) * (n as u128 + 1) / 2 * t as u128;
+    let (weighted, k) = (U256::from(weighted), U256::from(k));
+    // floor(average * weighted / k) without overflowing 256 bits: split
+    // `average` into quotient and remainder by `k`. The remainder is below
+    // `k`, so `remainder * weighted` is small.
+    let (quotient, remainder) = (average / k, average % k);
+    let next = quotient
+        .saturating_mul(weighted)
+        .saturating_add(remainder * weighted / k);
+    next.min(limit).max(U256::one()).to_big_endian(&mut bytes);
     bytes
 }
 
@@ -175,48 +223,28 @@ impl Chain {
 
     /// The required difficulty target for the child of `parent_hash`.
     ///
-    /// Per-block LWMA (linearly weighted moving average). Difficulty is recomputed
-    /// every block from a weighted average of the solvetimes of the last
-    /// `lwma_window` blocks, with the most recent solvetime weighted most, so it
-    /// reacts to a hash-rate change within a few blocks instead of a few epochs.
-    /// Each solvetime is clamped to `[1, target_block_time * max_adjust_factor]`,
-    /// so one manipulated timestamp (bounded below by median-time-past, above by
-    /// the future-drift rule) has limited leverage; the per-block change is
-    /// clamped to `max_adjust_factor` and never eased below `pow_limit`.
+    /// The target a child of `parent_hash` must carry: `lwma_next_target`
+    /// over the parent and its ancestors, newest first. Genesis is not a
+    /// sample (it has no solve time); its timestamp gives block 1's.
     fn target_for_child(&self, parent_hash: [u8; 32]) -> [u8; 32] {
-        let p = &self.params;
-        let parent = &self.blocks[&parent_hash];
-        let height = parent.height + 1;
-        let n = p.lwma_window;
-
-        // Until a full window of history exists, mine at the easy limit.
-        if height <= n {
-            return p.pow_limit;
+        let n = self.params.lwma_window as usize;
+        let mut samples: Vec<Sample> = Vec::with_capacity(n);
+        let mut cur = &self.blocks[&parent_hash];
+        while samples.len() < n {
+            let Some(parent) = self.blocks.get(&cur.block.header.previous_block_hash) else {
+                break; // `cur` is genesis
+            };
+            samples.push(Sample {
+                target: U256::from_big_endian(&cur.block.header.target),
+                solvetime: cur
+                    .block
+                    .header
+                    .timestamp
+                    .saturating_sub(parent.block.header.timestamp),
+            });
+            cur = parent;
         }
-
-        // Timestamps of the parent (newest) back through its n ancestors.
-        // `height > n` guarantees all n+1 blocks exist, so the walk never ends
-        // early.
-        let mut ts_desc: Vec<u64> = Vec::with_capacity((n + 1) as usize);
-        let mut cur = Some(&self.blocks[&parent_hash]);
-        for _ in 0..=n {
-            let b = cur.expect("height > lwma_window guarantees n+1 ancestors");
-            ts_desc.push(b.block.header.timestamp);
-            cur = self.blocks.get(&b.block.header.previous_block_hash);
-        }
-
-        // Linearly weighted average solvetime: the newest solvetime
-        // (ts_desc[0] - ts_desc[1]) gets weight n, the oldest weight 1.
-        let cap = p.target_block_time * p.max_adjust_factor;
-        let mut weighted_sum: u128 = 0;
-        for i in 0..n as usize {
-            let st = ts_desc[i].saturating_sub(ts_desc[i + 1]).clamp(1, cap);
-            let weight = (n as usize - i) as u128;
-            weighted_sum += weight * st as u128;
-        }
-        let weight_total = (n as u128) * (n as u128 + 1) / 2;
-        let wavg = (weighted_sum / weight_total) as u64;
-        retarget(p, &parent.block.header.target, wavg, p.target_block_time)
+        lwma_next_target(&self.params, &samples)
     }
 
     /// Offer a block to the store: validate against its parent, store it, and
@@ -446,56 +474,292 @@ mod tests {
         assert_eq!(chain.tip_state().balance(&[1u8; 32]), 0);
     }
 
-    #[test]
-    fn retarget_hardens_when_fast_and_caps_when_slow() {
-        // The LWMA feeds a weighted-average solvetime into `retarget` with the
-        // per-block expected span. Exercise the clamp/cap directly.
-        let expected = REGTEST.target_block_time;
+    /// Parameters with difficulty adjustment on, for the rule's own tests
+    /// (`REGTEST` has it off). 8 zero bits is trivial to mine.
+    fn adjusting(window: u64) -> Params {
+        let mut limit = [0xffu8; 32];
+        limit[0] = 0;
+        Params {
+            pow_limit: limit,
+            lwma_window: window,
+            solvetime_cap_factor: 6,
+            target_block_time: 300,
+            ..REGTEST
+        }
+    }
 
-        // Solvetime far faster than target: difficulty tightens (target shrinks)
-        // relative to the limit.
-        let faster = retarget(&REGTEST, &REGTEST.pow_limit, 1, expected);
-        assert!(
-            U256::from_big_endian(&faster) < U256::from_big_endian(&REGTEST.pow_limit),
-            "fast blocks should harden difficulty"
-        );
-
-        // Blocks far slower than target: difficulty eases, but never past the
-        // easy limit.
-        let slower = retarget(&REGTEST, &faster, expected * 100, expected);
-        assert!(U256::from_big_endian(&slower) > U256::from_big_endian(&faster));
-        assert!(U256::from_big_endian(&slower) <= U256::from_big_endian(&REGTEST.pow_limit));
+    fn bits(target: U256) -> f64 {
+        256.0 - (target.bits() as f64 - 1.0)
+            - ((target >> target.bits().saturating_sub(53)).as_u64() as f64).log2()
+            + 52.0
     }
 
     #[test]
-    fn lwma_holds_difficulty_steady_on_target_and_reads_fast_blocks() {
-        // On-target blocks (spaced exactly target_block_time) must not drift the
-        // difficulty: the LWMA of all-on-target solvetimes returns the same target,
-        // so mining stays at pow_limit (and the test stays fast). This exercises
-        // the per-block LWMA walk over a full window.
-        let mut chain = Chain::new(REGTEST);
-        let n = REGTEST.lwma_window;
-        let t0 = REGTEST.genesis_timestamp;
-        for i in 1..=(n + 2) {
-            let b = mine_from_context(
-                &chain,
-                REGTEST.initial_reward,
-                t0 + i * REGTEST.target_block_time,
-            );
-            assert!(matches!(chain.accept(b), Accept::Stored { .. }));
-        }
-        // Past a full window of on-target blocks, difficulty is unchanged.
-        assert_eq!(chain.next_context().target, REGTEST.pow_limit);
+    fn lwma_is_steady_on_target_and_bounded_at_the_limits() {
+        let p = adjusting(60);
+        let limit = U256::from_big_endian(&p.pow_limit);
+        let at = |target: U256, solvetime: u64| Sample { target, solvetime };
+        let next = |samples: &[Sample]| U256::from_big_endian(&lwma_next_target(&p, samples));
 
-        // And the LWMA reads a fast window as harder: feed the helper a weighted
-        // average well under target and confirm it tightens below the limit.
-        let faster = retarget(
-            &REGTEST,
-            &REGTEST.pow_limit,
-            REGTEST.target_block_time / 2,
-            REGTEST.target_block_time,
-        );
-        assert!(U256::from_big_endian(&faster) < U256::from_big_endian(&REGTEST.pow_limit));
+        // No history: the limit. On-target history at one target: that target.
+        assert_eq!(next(&[]), limit);
+        let hard = limit / 1000;
+        assert_eq!(next(&vec![at(hard, 300); 60]), hard);
+
+        // Twice as fast: half the target. Twice as slow: double.
+        assert_eq!(next(&vec![at(hard, 150); 60]), hard / 2);
+        assert_eq!(next(&vec![at(hard, 600); 60]), hard * 2);
+
+        // Never easier than the limit, never zero, and a solve time counts
+        // for at most the cap (6 x 300 s) and at least 1 s.
+        assert_eq!(next(&vec![at(limit, 100_000); 60]), limit);
+        assert_eq!(next(&vec![at(hard, 100_000); 60]), next(&vec![at(hard, 1800); 60]));
+        assert_eq!(next(&vec![at(hard, 0); 60]), next(&vec![at(hard, 1); 60]));
+        assert_eq!(next(&vec![at(U256::one(), 1); 60]), U256::one());
+
+        // A window of 0 turns adjustment off.
+        assert_eq!(lwma_next_target(&REGTEST, &vec![at(hard, 1); 60]), REGTEST.pow_limit);
+    }
+
+    #[test]
+    fn one_block_moves_the_difficulty_a_little_and_the_newest_counts_most() {
+        let p = adjusting(60);
+        let hard = U256::from_big_endian(&p.pow_limit) / 1000;
+        let steady = vec![Sample { target: hard, solvetime: 300 }; 60];
+        let next = |samples: &[Sample]| U256::from_big_endian(&lwma_next_target(&p, samples));
+
+        // One instant block as the newest of 60: about 2/61 harder, not 4x.
+        let mut lucky = steady.clone();
+        lucky[0].solvetime = 1;
+        let moved = next(&lucky);
+        assert!(moved < hard && moved > hard * 96 / 100, "{moved} vs {hard}");
+
+        // The same block as the oldest matters far less.
+        let mut old = steady.clone();
+        old[59].solvetime = 1;
+        assert!(next(&old) > moved);
+    }
+
+    /// A deterministic pseudo-random source for the simulations.
+    struct Rng(u64);
+    impl Rng {
+        /// Uniform in (0, 1].
+        fn unit(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 11) as f64 + 1.0) / (1u64 << 53) as f64
+        }
+    }
+
+    /// Mine `blocks` blocks under the rule with hash rate `rate(time, height)`
+    /// (hashes per second), with exponentially distributed solve times, as
+    /// real mining has. Returns each block's (solve time, target).
+    fn simulate(
+        p: &Params,
+        blocks: usize,
+        seed: u64,
+        rate: impl Fn(u64, usize) -> f64,
+    ) -> Vec<(u64, U256)> {
+        simulate_easing(p, blocks, seed, rate, None)
+    }
+
+    /// `simulate`, with a candidate stall fallback: once a block is `grace`
+    /// seconds after its parent its target doubles, and doubles again every
+    /// `period` seconds after that, up to the limit. `None` is no fallback.
+    fn simulate_easing(
+        p: &Params,
+        blocks: usize,
+        seed: u64,
+        rate: impl Fn(u64, usize) -> f64,
+        easing: Option<(u64, u64)>,
+    ) -> Vec<(u64, U256)> {
+        let limit = U256::from_big_endian(&p.pow_limit);
+        let mut rng = Rng(seed);
+        let mut samples: std::collections::VecDeque<Sample> = Default::default();
+        let (mut time, mut out) = (0u64, Vec::new());
+        for height in 1..=blocks {
+            let window: Vec<Sample> = samples.iter().copied().collect();
+            let base = U256::from_big_endian(&lwma_next_target(p, &window));
+            // Expected hashes = 2^256 / target = 2^(leading zero bits).
+            let hash_rate = rate(time, height);
+            let (mut target, mut solve) = (base, 0f64);
+            // Mine through the stretches of constant target until a hit.
+            let mut stretch = easing.map(|(grace, _)| grace as f64);
+            loop {
+                let wait = 2f64.powf(bits(target)) / hash_rate * -rng.unit().ln();
+                match stretch {
+                    Some(length) if wait > length && target < limit => {
+                        solve += length;
+                        target = target.saturating_mul(U256::from(2u8)).min(limit);
+                        stretch = easing.map(|(_, period)| period as f64);
+                    }
+                    _ => {
+                        solve += wait;
+                        break;
+                    }
+                }
+            }
+            let solve = solve.round() as u64;
+            time += solve;
+            samples.push_front(Sample { target, solvetime: solve });
+            samples.truncate(p.lwma_window as usize);
+            out.push((solve, target));
+        }
+        out
+    }
+
+    fn mean_solve(run: &[(u64, U256)]) -> f64 {
+        run.iter().map(|(s, _)| *s as f64).sum::<f64>() / run.len() as f64
+    }
+
+    /// The hardest difficulty in `run`, as leading zero bits.
+    fn peak_bits(run: &[(u64, U256)]) -> f64 {
+        run.iter().map(|(_, t)| bits(*t)).fold(0.0, f64::max)
+    }
+
+    // The v2 failure: a miner far faster than the starting difficulty. The
+    // rule must find the right difficulty and stay there, on every seed.
+    #[test]
+    fn a_miner_far_faster_than_the_floor_settles_without_running_away() {
+        let p = adjusting(60);
+        // 8-bit floor = 256 hashes; 2^20 hashes/s is 4096 times too fast, as
+        // if the first blocks took 0.07 s. Equilibrium: 300 * 2^20 hashes,
+        // about 28.2 bits.
+        let rate = 2f64.powi(20);
+        let equilibrium = (300.0 * rate).log2();
+        for seed in 1..=20 {
+            let run = simulate(&p, 600, seed, |_, _| rate);
+            let settled = mean_solve(&run[200..]);
+            assert!((240.0..=375.0).contains(&settled), "seed {seed}: mean {settled}");
+            // Never more than 1.5 bits (about 3x) past equilibrium.
+            let peak = peak_bits(&run);
+            assert!(peak < equilibrium + 1.5, "seed {seed}: peak {peak} vs {equilibrium}");
+        }
+    }
+
+    #[test]
+    fn hash_rate_steps_up_and_down_are_followed() {
+        let p = adjusting(60);
+        let base = 2f64.powi(20);
+        // 16x more hash power joins at block 500 and leaves at block 900. Each
+        // part is measured over 250 blocks, after 150 blocks to settle.
+        let rate = move |_, height: usize| if (500..900).contains(&height) { base * 16.0 } else { base };
+        for seed in 1..=20 {
+            let run = simulate(&p, 1300, seed, rate);
+            for (name, part) in [("before", &run[250..500]), ("during", &run[650..900]), ("after", &run[1050..])] {
+                let mean = mean_solve(part);
+                assert!((225.0..=400.0).contains(&mean), "seed {seed} {name}: mean {mean}");
+            }
+            // The step up must not overshoot the new equilibrium by much.
+            let peak = peak_bits(&run);
+            assert!(peak < (300.0 * base * 16.0).log2() + 1.5, "seed {seed}: peak {peak}");
+        }
+    }
+
+    // Not a pass/fail test: prints how long the chain takes to recover when
+    // most hash power leaves, for several settings. Run with
+    // `cargo test --release stall_report -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a report for choosing parameters, not a check"]
+    fn stall_report() {
+        let base = 2f64.powi(20);
+        println!("hash power falls to 1/drop at block 800; medians over 25 seeds");
+        println!("window cap fallback        drop | first block  10 blocks  back to <2T | steady mean  spread   longest gap");
+        let settings: [(u64, u64, Option<(u64, u64)>); 8] = [
+            (60, 6, None),
+            (60, 12, None),
+            (30, 6, None),
+            (60, 6, Some((1200, 600))),
+            (60, 6, Some((1800, 900))),
+            (60, 6, Some((3600, 1800))),
+            (30, 6, Some((1200, 600))),
+            (30, 6, Some((1800, 900))),
+        ];
+        for (window, cap, easing) in settings {
+            for drop in [4.0f64, 15.0, 100.0] {
+                let p = Params { solvetime_cap_factor: cap, ..adjusting(window) };
+                let (mut first, mut ten, mut recover, mut means, mut sds, mut gaps) =
+                    (vec![], vec![], vec![], vec![], vec![], vec![]);
+                for seed in 1..=25 {
+                    let rate = |_, h: usize| if h >= 800 { base / drop } else { base };
+                    let run = simulate_easing(&p, 1100, seed, rate, easing);
+                    let after = &run[799..];
+                    first.push(after[0].0 as f64 / 3600.0);
+                    ten.push(after[..10].iter().map(|(s, _)| *s as f64).sum::<f64>() / 3600.0);
+                    // Hours until a block starts a run of 10 that averages under 2T.
+                    let mut elapsed = 0.0;
+                    for i in 0..after.len() - 10 {
+                        if mean_solve(&after[i..i + 10]) < 600.0 {
+                            break;
+                        }
+                        elapsed += after[i].0 as f64 / 3600.0;
+                    }
+                    recover.push(elapsed);
+                    let steady = &run[400..799];
+                    means.push(mean_solve(steady));
+                    // Spread of the difficulty, in bits, while hash power is constant.
+                    let b: Vec<f64> = steady.iter().map(|(_, t)| bits(*t)).collect();
+                    let bm = b.iter().sum::<f64>() / b.len() as f64;
+                    sds.push((b.iter().map(|x| (x - bm).powi(2)).sum::<f64>() / b.len() as f64).sqrt());
+                    gaps.push(steady.iter().map(|(s, _)| *s).max().unwrap() as f64 / 60.0);
+                }
+                let median = |v: &mut Vec<f64>| {
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    v[v.len() / 2]
+                };
+                let fallback = match easing {
+                    Some((g, per)) => format!("x2 at {}m, each {}m", g / 60, per / 60),
+                    None => "none".to_string(),
+                };
+                println!(
+                    "{window:6} {cap:3} {fallback:<19} {drop:4} | {:8.1} h {:8.1} h {:10.1} h | {:9.0} s {:5.2} bits {:7.0} min",
+                    median(&mut first), median(&mut ten), median(&mut recover),
+                    median(&mut means), median(&mut sds), median(&mut gaps)
+                );
+            }
+        }
+    }
+
+    // The rule on a real chain: `target_for_child` must feed the same history
+    // to `lwma_next_target`, through `accept`, as the simulation does.
+    #[test]
+    fn a_real_chain_follows_the_rule() {
+        let p = adjusting(12);
+        let mut chain = Chain::new(p);
+        let limit = U256::from_big_endian(&p.pow_limit);
+        let mut samples: Vec<Sample> = Vec::new();
+        let mut time = p.genesis_timestamp;
+        // Solve times well under the 300 s target: difficulty must rise.
+        for solve in [300u64, 300, 100, 100, 50, 50, 50, 20, 20, 20, 20, 20, 400, 900, 5000] {
+            let expected = lwma_next_target(&p, &samples);
+            let ctx = chain.next_context();
+            assert_eq!(ctx.target, expected, "at height {}", ctx.height);
+            time += solve;
+            let (block, _) = build_and_mine(
+                &chain.tip_header(),
+                chain.tip_state(),
+                p.initial_reward,
+                [1u8; 32],
+                None,
+                ctx.target,
+                time,
+            )
+            .unwrap();
+            assert!(matches!(chain.accept(block), Accept::Stored { .. }));
+            samples.insert(0, Sample { target: U256::from_big_endian(&expected), solvetime: solve });
+        }
+        assert!(U256::from_big_endian(&chain.next_context().target) < limit);
+        // A block mined at the wrong target is refused.
+        let (wrong, _) = build_and_mine(
+            &chain.tip_header(),
+            chain.tip_state(),
+            p.initial_reward,
+            [1u8; 32],
+            None,
+            p.pow_limit,
+            time + 300,
+        )
+        .unwrap();
+        assert!(matches!(chain.accept(wrong), Accept::Invalid(_)));
     }
 
     #[test]
