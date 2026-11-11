@@ -17,6 +17,104 @@ How to use this file:
 Status values: `planned` (agreed, not started), `in progress`, `done` (merged
 to `main`, waiting for the release).
 
+## 2.1.3
+
+Theme: make the Sentry logs answer a question in one query. Since 2.1.1 the
+app sends every log line, and `tools/sentry-logs` and the `sentry-logs` skill
+read them. Reading them on 2026-11-11 showed what is missing. None of this
+changes consensus.
+
+### Name the computer on first run
+
+- Status: planned
+- Consensus: no
+- Problem: no node had a device label, because the field is inside the
+  Developer section. Nodes had to be told apart by peer id and operating
+  system.
+- Planned change: on first run, ask "What should this computer be called?"
+  with a short text field and a "Skip" button. The answer is the `device`
+  label. The field in the Developer section stays, for changing it.
+
+### A status line once a minute
+
+- Status: planned
+- Consensus: no
+- Problem: to learn whether a node is connected, synced, and mining, its whole
+  history has to be read.
+- Planned change: log a `status` line every minute with the state in
+  attributes: `height`, `peers`, `reservation` (yes or no), `mining` (yes or
+  no), `hash_rate`, `gpu_limit`, `pending` (count of pending transfers),
+  `balance`. One row then answers "what state is this node in".
+- The line's text stays short, so the log file is not flooded.
+
+### Log the events that are missing
+
+- Status: planned
+- Consensus: no
+- Problem: the log has no record of several things that had to be worked out
+  by hand on 2026-11-11.
+- Planned change: add lines, each with its own `event`:
+  - `transfer_sent` (id, amount, fee, nonce, recipient) and
+    `transfer_confirmed` (id, height).
+  - `transfer_received` when the balance of the key in use rises by a
+    transfer (not by a mined block).
+  - `block_received` (height, from which peer) and `sync_done` (height, block
+    count) when a node catches up from a peer.
+  - `reorg` (old tip, new tip, depth).
+  - `update_started`, `update_installed`, `update_failed` (versions, reason),
+    and `installed` / `uninstalled` from the install flow.
+  - `pending_dropped` when a pending transfer leaves the mempool without being
+    confirmed.
+
+### Stop sending lines that say nothing
+
+- Status: planned
+- Consensus: no
+- Problem: about half of a node's lines are failed dials to addresses that can
+  never be reached (loopback, link-local, addresses of old test nodes) and
+  "already connected or dialing" notices.
+- Planned change:
+  - Do not pass on or dial loopback and link-local addresses of other
+    machines. This removes the cause, not only the lines.
+  - Do not log "already connected or dialing"; it is not a failure.
+  - Send a failed dial to Sentry only the first time for each peer in a run;
+    keep every one in the local log file.
+
+### Attributes that make a line cheap to read
+
+- Status: planned
+- Consensus: no
+- Problem: the reader has to fetch a line's full text to learn which peer it
+  is about, why something failed, or what height a node is at. One failed-dial
+  line is 300 to 800 characters.
+- Planned change: put those facts in attributes, so a query can ask for the
+  attributes and leave the text out.
+  - `run`: a short random id made at each app start. Selects one run of one
+    node without a time window.
+  - `peer`: the 6 characters after `12D3KooW` of the other node a line is
+    about (dials, connections, hole punches, streams).
+  - `reason`: a short class for a failure: `timeout`, `refused`,
+    `no_reservation`, `address_in_use`, `handshake`, `other`.
+  - `via`: `relay` or `direct`, for dials and connections.
+  - `height`: the block height a line is about.
+- Where: `telemetry::classify` in the app takes these from the line's text
+  today. Cleaner is for the node to log structured fields; decide when
+  building.
+
+### Reader and skill follow-up
+
+- Status: planned
+- Consensus: no
+- After the changes above, update `tools/sentry-logs` and the `sentry-logs`
+  skill:
+  - `sentry-logs status NODE`: the latest `status` row for a node (or for all
+    nodes), as one line each.
+  - `sentry-logs peers NODE`: who a node connected to, by `peer` and `via`,
+    without fetching text.
+  - `timeline` and `lines` use `run` to show the latest run by default.
+  - Verify the reader's request to Sentry with a real token. It has only been
+    tested without one.
+
 ## 2.3
 
 ### Graphical overhaul of the desktop app
@@ -55,35 +153,6 @@ to `main`, waiting for the release).
   at startup; keep the sent list across restarts.
 
 Problems that have been observed and have no version yet.
-
-### Log attributes that make the logs cheaper to read
-
-- Consensus: no
-- Found: 2026-11-11, while building the log reader (`tools/sentry-logs`) and
-  the `sentry-logs` skill. The reader has to fetch the full text of a line to
-  learn which peer it is about, why a dial failed, or what height a node is
-  at. One failed-dial line is 300 to 800 characters, and a node logs dozens on
-  each start.
-- Planned change: put those facts in attributes, so a query can ask for the
-  attributes and leave the text out.
-  - `run`: a short random id made at each app start. Selects one run of one
-    node without a time window.
-  - `peer`: the 6 characters after `12D3KooW` of the other node a line is
-    about (dials, connections, hole punches, streams).
-  - `reason`: a short class for a failure, for example `timeout`, `refused`,
-    `no_reservation`, `address_in_use`, `already_dialing`, `handshake`.
-  - `via`: `relay` or `direct`, for dials and connections.
-  - `height`: the block height a line is about (blocks, replay, sync).
-- Planned change: a `status` line once a minute with the node's state in
-  attributes (`height`, `peers`, `reservation` yes/no, `mining` yes/no,
-  `hash_rate`, `pending`). One row then answers "what state is this node in"
-  without reading its history.
-- Planned change: log a sent transfer (`transfer_sent`, with its id, amount,
-  and nonce) and its confirmation (`transfer_confirmed`). The log has no
-  record of sends today.
-- Planned change: send failed dials to addresses that can never be reached
-  (loopback, link-local) at a lower level or not at all. See "Log noise from
-  addresses that cannot be reached".
 
 ### Two copies of the app can run on the same data folder
 
@@ -143,6 +212,16 @@ Problems that have been observed and have no version yet.
   transfer is in a block.
 
 ## Operations (no release needed)
+
+- Create a Sentry user auth token (scopes `org:read`, `project:read`,
+  `event:read`) and save it to `~/.config/jeffycoin/sentry-token`, so
+  `tools/sentry-logs` can read the logs.
+- Set up Sentry alerts: one for any crash, one for `reservation_lost` with no
+  `reservation_ok` after it. Nothing notifies anyone today.
+- Check the Sentry plan's log quota against the volume once several nodes run
+  all day.
+- The relay and the iMac node do not report to Sentry; they log locally only.
+  Decide whether the command-line node and the relay should report too.
 
 - Deploy the 2.1.1 relay program to the Lightsail relay, so that refused
   reservations appear in its log.
