@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Release the current work branch: push it, fast-forward main to it, tag main,
+# and wait for the build. Prints a few lines, not the build log.
+#
+#   tools/release 2.2.1 --yes        do it
+#   tools/release 2.2.1              show what would happen (nothing is changed)
+#   tools/release 2.2.1 --yes --no-check    skip tools/check (it was just run)
+#
+# Run this only when Jonathan has said to release. It refuses unless:
+# the working tree is clean, the branch is not main, app/Cargo.toml has this
+# version, CHANGELOG.md has a "## <version>" section, and main can be
+# fast-forwarded to the branch.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"; cd "$root"
+version="${1:-}"; shift || true
+yes=0; check=1
+for arg in "$@"; do
+  case "$arg" in --yes) yes=1 ;; --no-check) check=0 ;; *) echo "unknown argument: $arg" >&2; exit 2 ;; esac
+done
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+tag="v$version"
+fail() { echo "refused: $*" >&2; exit 1; }
+
+branch="$(git branch --show-current)"
+[ -n "$branch" ] && [ "$branch" != main ] || fail "be on a work branch, not main"
+[ -z "$(git status --porcelain)" ] || fail "the working tree has uncommitted changes"
+app_version="$(grep -m1 '^version = ' app/Cargo.toml | cut -d'"' -f2)"
+[ "$app_version" = "$version" ] || fail "app/Cargo.toml is version $app_version, not $version"
+grep -q "^## $version " CHANGELOG.md || fail "CHANGELOG.md has no '## $version' section"
+git fetch -q origin
+git rev-parse -q --verify "refs/tags/$tag" >/dev/null && fail "tag $tag already exists"
+git merge-base --is-ancestor origin/main HEAD || fail "main has commits this branch lacks; merge main into the branch first"
+
+echo "release $tag from branch $branch at $(git rev-parse --short HEAD)"
+if [ $yes -eq 0 ]; then
+  echo "dry run: would run tools/check, push $branch, fast-forward main, tag $tag, and wait for the build. Add --yes to do it."
+  exit 0
+fi
+if [ $check -eq 1 ]; then tools/check; fi
+git push -q -u origin "$branch"
+git fetch -q . "$branch:main"
+git push -q origin main
+git tag -a "$tag" origin/main -m "JeffyCoin $version"
+git push -q origin "$tag"
+echo "pushed; main and $tag are at $(git rev-parse --short origin/main). Waiting for the build..."
+
+run=""
+for _ in $(seq 1 20); do
+  run="$(gh run list --branch "$tag" --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
+  [ -n "$run" ] && break; sleep 5
+done
+[ -n "$run" ] || { echo "the build did not appear; check 'gh run list'"; exit 1; }
+gh run watch "$run" --exit-status --interval 30 >/dev/null 2>&1 && result=ok || result=failed
+gh run view "$run" --json jobs --jq '.jobs[] | "  \(.name): \(.conclusion)"'
+if [ "$result" = ok ]; then
+  echo "built: $(gh release view "$tag" --json assets --jq '[.assets[].name | select(startswith("JeffyCoin"))] | join(", ")')"
+  echo "https://github.com/$(gh repo view --json nameWithOwner --jq .nameWithOwner)/releases/tag/$tag"
+else
+  echo "the build FAILED; the end of the failed step:"
+  gh run view "$run" --log-failed 2>/dev/null | tail -25 | cut -c1-200
+  exit 1
+fi

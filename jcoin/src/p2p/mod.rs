@@ -1,6 +1,6 @@
 //! Peer-to-peer networking for JeffyCoin.
 //!
-//! See `docs/p2p-protocol.md` for the wire protocol. Two layers:
+//! See `jcoin/src/p2p/README.md` for the wire protocol. Two layers:
 //! - the JeffyCoin protocol: the frame codec (`frame`), the message set
 //!   (`message`), addresses (`addr`), per-peer sessions (`peer`), and the
 //!   shared peer registry and address book (`network`). It runs over any

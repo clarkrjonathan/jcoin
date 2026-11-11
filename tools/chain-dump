@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Print a chain file (blocks.dat) as a short table.
+
+  tools/chain-dump                 the desktop app's chain on this computer
+  tools/chain-dump PATH            another blocks.dat
+  tools/chain-dump --all           every block (default: first 3, last 15, every 10th)
+  tools/chain-dump --tail N        the last N blocks
+
+Columns: height, time (UTC), seconds since the block before, difficulty in
+leading zero bits, miner (first 6 hex characters of the address), transfers.
+Then: block count, forks, average block time over the last 30 blocks, and the
+time since the newest block.
+"""
+import datetime, hashlib, math, os, struct, sys, time
+
+HEADER = 156
+TX = 153
+
+
+def default_path():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "jeffycoin", "blocks.dat")
+
+
+def load(path):
+    data = open(path, "rb").read()
+    blocks, pos = {}, 0
+    while pos + 4 <= len(data):
+        n = struct.unpack(">I", data[pos:pos + 4])[0]
+        raw = data[pos + 4:pos + 4 + n]
+        pos += 4 + n
+        if len(raw) < HEADER + 2:
+            break
+        h = raw[:HEADER]
+        count = struct.unpack(">H", raw[HEADER:HEADER + 2])[0]
+        body = raw[HEADER + 2:]
+        blocks[hashlib.sha256(h).digest()] = {
+            "version": struct.unpack(">I", h[0:4])[0],
+            "height": struct.unpack(">Q", h[4:12])[0],
+            "prev": h[12:44],
+            "time": struct.unpack(">Q", h[108:116])[0],
+            "target": int.from_bytes(h[116:148], "big"),
+            # The coinbase is first: type (1), sender (32), recipient (32).
+            "miner": body[33:65].hex()[:6] if len(body) >= TX else "?",
+            "transfers": max(count - 1, 0),
+        }
+    return blocks
+
+
+def canonical(blocks):
+    """The chain with the most work, oldest block first."""
+    work = {}
+    for key in sorted(blocks, key=lambda k: blocks[k]["height"]):
+        b = blocks[key]
+        work[key] = work.get(b["prev"], 0) + (1 << 256) // (b["target"] + 1)
+    if not work:
+        return []
+    tip, chain = max(work, key=work.get), []
+    while tip in blocks:
+        chain.append(blocks[tip])
+        tip = blocks[tip]["prev"]
+    return chain[::-1]
+
+
+def main():
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(__doc__)
+        return
+    show_all = "--all" in args
+    tail = int(args[args.index("--tail") + 1]) if "--tail" in args else None
+    paths = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] != "--tail")]
+    path = paths[0] if paths else default_path()
+    if not os.path.exists(path):
+        sys.exit(f"no chain file at {path}")
+    blocks = load(path)
+    chain = canonical(blocks)
+    if not chain:
+        print(f"{path}: empty")
+        return
+    last = len(chain) - 1
+    for i, b in enumerate(chain):
+        if tail is not None:
+            shown = i > last - tail
+        else:
+            shown = show_all or i < 3 or i > last - 15 or b["height"] % 10 == 0
+        if not shown:
+            continue
+        solve = b["time"] - chain[i - 1]["time"] if i else 0
+        when = datetime.datetime.fromtimestamp(b["time"], datetime.timezone.utc).strftime("%m-%d %H:%M:%S")
+        bits = 256 - math.log2(b["target"])
+        print(f"{b['height']:6d}  {when}  {solve:7d}s  {bits:6.2f} bits  {b['miner']}  {b['transfers']} tx")
+    recent = chain[-31:]
+    average = (recent[-1]["time"] - recent[0]["time"]) / max(len(recent) - 1, 1)
+    age = int(time.time()) - chain[-1]["time"]
+    print(
+        f"{len(chain)} blocks on the chain (version {chain[-1]['version']}), "
+        f"{len(blocks) - len(chain)} on forks; average of the last {len(recent) - 1}: {average:.0f} s; "
+        f"newest block {age // 3600} h {age % 3600 // 60} min ago"
+    )
+
+
+if __name__ == "__main__":
+    main()

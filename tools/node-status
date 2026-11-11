@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""One line on the state of a local node.
+
+  tools/node-status            the desktop app's node on this computer
+  tools/node-status PORT       a node whose REST server is on 127.0.0.1:PORT
+  tools/node-status PORT ADDR  also the balance of an address (64 hex)
+
+Prints height, difficulty, peers (and how many exchange blocks), the
+newer-rules signal, and for the app its key's balance and pending amount.
+"""
+import json, math, os, re, sys, urllib.request
+
+
+def get(port, path):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=3) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+
+def app_log():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    path = os.path.join(base, "jeffycoin", "jeffycoin.log")
+    return open(path, errors="replace").read() if os.path.exists(path) else ""
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if len(args) != len(sys.argv) - 1:
+        print(__doc__)
+        return
+    port = args[0] if args else None
+    address = args[1] if len(args) > 1 else None
+    if port is None:
+        log = app_log()
+        ports = re.findall(r"REST on 127\.0\.0\.1:(\d+)", log)
+        keys = re.findall(r"key '[^']+' ([0-9a-f]{64})", log)
+        if not ports:
+            sys.exit("no app log found; give a port")
+        port, address = ports[-1], (keys[-1] if keys else None)
+    chain = get(port, "/chain")
+    if chain is None:
+        sys.exit(f"no node answers on 127.0.0.1:{port}")
+    bits = 256 - math.log2(int(chain["target"], 16))
+    parts = [f"height {chain['height']}", f"tip {bits:.1f} bits"]
+    peers = get(port, "/peers")
+    if peers:
+        conns = peers["connections"]
+        sessions = sum(1 for c in conns if c["session"])
+        relayed = sum(1 for c in conns if c["relayed"])
+        parts.append(f"{len(conns)} connections ({sessions} exchanging blocks, {relayed} through the relay)")
+    else:
+        parts.append(f"{chain.get('peers', '?')} peers")
+    signal = get(port, "/network/signal")
+    if signal and signal["level"] != "none":
+        parts.append(f"newer rules: {signal['level']} (version {signal['newest_version']}, {signal['blocks']} blocks)")
+    if address:
+        account = get(port, f"/balance/{address}")
+        if account:
+            parts.append(f"balance {account['balance'] / 1e8:g} JEF, pending {account['pending'] / 1e8:g}, nonce {account['nonce']}")
+    print(f"127.0.0.1:{port}: " + "; ".join(parts))
+
+
+if __name__ == "__main__":
+    main()

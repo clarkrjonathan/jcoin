@@ -3,7 +3,7 @@
 //! The transaction is a single type-tagged format: a normal transfer or an
 //! unsigned coinbase. Fields are fixed-width and serialize to raw hex (no `0x`
 //! prefix) so the wire format matches the canonical byte layout used for hashing
-//! and signing. See `docs/p2p-protocol.md` and the vault design notes.
+//! and signing. See `jcoin/src/p2p/README.md` and the vault design notes.
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};

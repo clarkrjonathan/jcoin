@@ -13,7 +13,7 @@ use libp2p::Multiaddr;
 use super::addr::{decode_addrs, encode_addrs};
 use super::frame::{read_frame, write_frame, FrameError, RawFrame};
 
-/// Message type codes, matching `docs/p2p-protocol.md`.
+/// Message type codes, matching `jcoin/src/p2p/README.md`.
 pub mod type_code {
     pub const HELLO: u16 = 0x0001;
     pub const HELLO_ACK: u16 = 0x0002;

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Start the desktop app in isolation and save a picture of its window, to
+# check a user-interface change without touching the real data folder.
+#
+#   tools/app-shot [OUT.png] [--dev] [--tall] [--mainnet] [--keep]
+#
+# The app runs with a temporary home folder, no relay, and reporting off, on
+# regtest unless --mainnet (the install box only shows on mainnet settings).
+# --dev opens the Developer section; --tall makes the window 1000 px high;
+# --keep leaves the app running (its pid is printed). Linux with X11 only.
+# Buttons cannot be clicked from here: test behaviour through the backend tests.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+out="$root/.local-net/app.png"; dev=0; tall=0; mainnet=0; keep=0
+for arg in "$@"; do
+  case "$arg" in
+    --dev) dev=1 ;; --tall) tall=1 ;; --mainnet) mainnet=1 ;; --keep) keep=1 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) out="$arg" ;;
+  esac
+done
+app="$root/app/target/release/jcoin-app"
+[ -x "$app" ] || { echo "build the app first: tools/check app --build" >&2; exit 1; }
+home="$(mktemp -d)"; mkdir -p "$(dirname "$out")"
+env XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" HOME="$home" XDG_DATA_HOME="$home/share" \
+  JCOIN_APP_NO_TELEMETRY=1 JCOIN_APP_RELAY=none \
+  JCOIN_APP_DEV=$dev $([ $mainnet -eq 1 ] || echo JCOIN_APP_REGTEST=1) \
+  setsid nohup "$app" > "$home/out.log" 2>&1 < /dev/null &
+sleep 8
+pid="$(for p in $(pgrep -x jcoin-app); do if tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -q "^HOME=$home$"; then echo "$p"; fi; done | head -1)"
+[ -n "$pid" ] || { echo "the app did not start; see $home/out.log" >&2; exit 1; }
+window="$(for w in $(xwininfo -root -tree 2>/dev/null | grep '"JeffyCoin"' | awk '{print $1}'); do if xprop -id "$w" _NET_WM_PID 2>/dev/null | grep -q "= $pid$"; then echo "$w"; fi; done | head -1)"
+[ -n "$window" ] || { kill "$pid"; echo "no window found" >&2; exit 1; }
+if [ $tall -eq 1 ]; then
+  python3 -c "
+from Xlib import display
+d = display.Display(); d.create_resource_object('window', int('$window', 16)).configure(width=560, height=1000); d.sync()"
+  sleep 3
+fi
+xwd -id "$window" -out "$home/shot.xwd"
+python3 - "$home/shot.xwd" "$out" <<'PY'
+import struct, sys
+from PIL import Image
+data = open(sys.argv[1], "rb").read()
+h = struct.unpack(">25I", data[:100])
+header, width, height, line, colors = h[0], h[4], h[5], h[12], h[19]
+start = header + colors * 12
+Image.frombuffer("RGBA", (width, height), data[start:start + line * height], "raw", "BGRA", line, 1).convert("RGB").save(sys.argv[2])
+print(f"{sys.argv[2]} ({width}x{height})")
+PY
+if [ $keep -eq 1 ]; then echo "left running: pid $pid, home $home"; else kill "$pid"; rm -rf "$home"; fi

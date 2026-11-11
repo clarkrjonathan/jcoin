@@ -8,7 +8,7 @@ description: Read the JeffyCoin desktop app's Sentry logs without spending many 
 The desktop app (2.1.1 and later) sends every log line to Sentry project
 `iowa-state-pe/jcoin-app`. Each line has attributes: `component`, `event`,
 `device`, `install_id`, `peer_id`, `network`, `address`, `gpu`, `installed`
-(see `docs/app.md`, "Reporting").
+(see `app/README.md`, "Reporting").
 
 A raw log query is expensive: one failed-dial line is 300 to 800 characters,
 a node logs dozens on every start, and the MCP tool adds an id and two links

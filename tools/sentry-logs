@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read the JeffyCoin app's Sentry logs as compact text.
 
-The app sends every log line to Sentry with attributes (see docs/app.md,
+The app sends every log line to Sentry with attributes (see app/README.md,
 "Reporting"). This tool asks Sentry's API for them and prints as little text as
 answers the question: counts first, then short lines with peer ids and
 addresses shortened and repeated lines collapsed.

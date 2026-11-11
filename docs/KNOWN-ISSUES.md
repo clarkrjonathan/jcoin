@@ -21,10 +21,14 @@ connection stays open. There is no blacklist (the vault notes call for one). A
 single malicious peer can keep a node busy.
 
 ### V3. Time-warp / difficulty manipulation
-Difficulty retargets from block timestamps. Median-time-past blocks backward
-timestamps, but a miner can still stretch timestamps near epoch boundaries to
-hold difficulty artificially low and mine a cheaper-than-intended chain. No
-time-warp-specific guard (e.g. bounding an epoch's first-block timestamp).
+Difficulty comes from block timestamps (since 2.2.0: an LWMA over the last 30
+blocks, plus a stall fallback that eases a block whose timestamp is 20 minutes
+after its parent's). Guards: median-time-past bounds timestamps from below,
+one solve time counts for at most 30 minutes, and a node accepts a timestamp
+at most 10 minutes ahead of its clock, which is shorter than the fallback's
+20 minutes. A miner with a large share of hash power can still shade
+timestamps to lower difficulty somewhat. Not analysed beyond the simulations
+in `jcoin/src/chain.rs`.
 
 ### V4. No finality, no max-reorg-depth, no checkpoints
 A node will reorg to any heavier valid chain at any depth, so a long network
@@ -34,7 +38,7 @@ is no safety rail (no checkpoint, no maximum reorg depth, no confirmation-depth
 guidance surfaced to clients).
 
 ### V5. Local-only future-time bound
-The 2-hour future-timestamp bound is checked against the receiving node's wall
+The 10-minute future-timestamp bound (2 hours before 2.2.0) is checked against the receiving node's wall
 clock only (not network-adjusted time). A node with a badly wrong clock can
 mis-accept or mis-reject blocks until its clock corrects. Non-consensus by
 design, but worth noting.
@@ -80,14 +84,13 @@ Two sessions can still appear when two nodes dial each other at the same
 moment. Harmless (gossip dedups).
 
 ### O6. Machine-specific difficulty floor
-`MAINNET.pow_limit` (the easy start/cap and genesis target) was calibrated from one
-machine's debug-build hash rate. The retarget adapts from it, but the floor and
-genesis hash are environment-specific.
+Resolved in 2.2.0. `MAINNET.pow_limit` is 28 bits, about 300 s for a CPU at
+1 MH/s. The difficulty rule adjusts from the first block, so the value only
+sets the start and the easiest difficulty the stall fallback can reach.
 
 ### O7. Genesis-timestamp epoch lag
-The first retarget epoch includes genesis; because the genesis timestamp is not
-close to real "now", that epoch's span clamps and difficulty hardening begins one
-epoch late. Harmless, converges anyway, but surprising.
+Resolved in 2.2.0: there are no epochs. Block 1's solve time is measured from
+the genesis timestamp and counts for at most 30 minutes.
 
 ### O8. Queued transactions that arrive out of order are rejected
 A sender may queue transactions with consecutive nonces, and the mempool

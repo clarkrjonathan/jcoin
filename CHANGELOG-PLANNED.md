@@ -43,6 +43,26 @@ Since 2.1.1 the app sends every log line to Sentry, and `tools/sentry-logs`
 and the `sentry-logs` skill read them. Reading them on 2026-11-11 showed what
 is missing. None of this changes consensus.
 
+### "Install and restart" stays disabled after "Check again"
+
+- Status: planned
+- Consensus: no
+- Source: Jonathan, 2026-11-11
+- Found: after "Check again" listed the new version, "Install and restart"
+  was still grey. Closing and reopening the program made it usable.
+- Likely cause, not confirmed: the button is disabled on purpose in two cases
+  and says why only in a hover text. (1) Mining is running. (2) The program
+  is not the installed copy; at the time a second copy was running from the
+  build folder (`./jcoin-app`), and reopening started the installed one.
+  A third possibility is a real fault in how the selection is kept after the
+  list is read again.
+- Planned change:
+  - Show the reason next to the button whenever it is disabled, not only on
+    hover.
+  - When mining is the reason, offer "Stop mining and install".
+  - Add a test that reads the release list twice and checks that a newer
+    release is selected and installable afterwards.
+
 ### Name the computer on first run
 
 - Status: planned
