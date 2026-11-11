@@ -10,6 +10,7 @@
 
 mod applog;
 mod backend;
+mod telemetry;
 mod update;
 
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,11 @@ use jcoin::amount::format_jef;
 use backend::{connection_kind, display_path, short, zero_bits, Backend, MiningState, Settings};
 
 fn main() -> eframe::Result {
+    // Start reporting before the window and the backend's threads, so a
+    // panic anywhere is reported. The guard sends what is queued at exit.
+    let settings = Settings::from_env();
+    let _telemetry = telemetry::init(&settings.data_dir, settings.regtest);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([520.0, 720.0])
@@ -30,7 +36,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "JeffyCoin",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(move |_cc| Ok(Box::new(App::new(settings)))),
     )
 }
 
@@ -46,6 +52,9 @@ struct App {
     send_result: Option<Result<String, String>>,
     keys: KeysForm,
     updates: Updates,
+    /// The label for this computer, as typed in the Developer section.
+    device: String,
+    device_result: Option<Result<String, String>>,
 }
 
 /// What the update check or an install is doing.
@@ -112,9 +121,10 @@ struct KeysForm {
 }
 
 impl App {
-    fn new() -> App {
+    fn new(settings: Settings) -> App {
+        let device = telemetry::device_name(&settings.data_dir);
         App {
-            backend: Backend::start(Settings::from_env()),
+            backend: Backend::start(settings),
             adapter: None,
             recipient: String::new(),
             amount: String::new(),
@@ -122,6 +132,8 @@ impl App {
             send_result: None,
             keys: KeysForm::default(),
             updates: Updates::start(),
+            device,
+            device_result: None,
         }
     }
 }
@@ -166,7 +178,7 @@ impl eframe::App for App {
                 ui.add_space(12.0);
                 updates_section(ui, &mut self.updates, backend);
                 ui.add_space(12.0);
-                developer_section(ui, backend);
+                developer_section(ui, backend, &mut self.device, &mut self.device_result);
                 ui.add_space(12.0);
                 ui.separator();
                 ui.small(format!("Data folder: {}", display_path(&backend.settings.data_dir)));
@@ -476,7 +488,12 @@ fn age(since: u64) -> String {
     }
 }
 
-fn developer_section(ui: &mut egui::Ui, backend: &mut Backend) {
+fn developer_section(
+    ui: &mut egui::Ui,
+    backend: &mut Backend,
+    device: &mut String,
+    device_result: &mut Option<Result<String, String>>,
+) {
     // JCOIN_APP_DEV=1 starts with the section open.
     let open = std::env::var("JCOIN_APP_DEV").is_ok_and(|v| v == "1");
     egui::CollapsingHeader::new("Developer").default_open(open).show(ui, |ui| {
@@ -494,6 +511,33 @@ fn developer_section(ui: &mut egui::Ui, backend: &mut Backend) {
             "Copies the node state, connections, and recent log as text, to paste into a bug report. It holds no secret keys.",
         ).clicked() {
             ui.ctx().copy_text(backend.diagnostics());
+        }
+
+        ui.add_space(6.0);
+        ui.strong("Reporting");
+        ui.label("This app sends its log and crash reports to the developer, to find problems. They hold addresses and network details, never secret keys.");
+        ui.horizontal(|ui| {
+            ui.label("Label for this computer");
+            ui.add(egui::TextEdit::singleline(device).desired_width(160.0).hint_text("for example: Noah desktop"));
+            if ui.button("Save").clicked() {
+                *device_result = Some(telemetry::set_device_name(&backend.settings.data_dir, device));
+                if let Some(Ok(saved)) = device_result {
+                    *device = saved.clone();
+                    backend.log.push(false, &format!("[app] device label set to '{saved}'"));
+                }
+            }
+        });
+        match device_result {
+            Some(Ok(saved)) if saved.is_empty() => {
+                ui.small("Label removed.");
+            }
+            Some(Ok(saved)) => {
+                ui.small(format!("Reports from this computer are now labeled '{saved}'."));
+            }
+            Some(Err(e)) => {
+                ui.colored_label(ui.visuals().error_fg_color, e.as_str());
+            }
+            None => {}
         }
 
         ui.add_space(6.0);

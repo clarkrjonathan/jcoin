@@ -95,6 +95,14 @@ pub async fn run_relay(
                 relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id } => {
                     crate::log_info!("[relay] circuit {src_peer_id} -> {dst_peer_id}");
                 }
+                // Refusals explain a node that is connected but cannot be
+                // reached or cannot reach another node.
+                relay::Event::ReservationReqDenied { src_peer_id, .. } => {
+                    crate::log_error!("[relay] reservation REFUSED for {src_peer_id}");
+                }
+                relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id, .. } => {
+                    crate::log_error!("[relay] circuit REFUSED {src_peer_id} -> {dst_peer_id}");
+                }
                 _ => {}
             },
             SwarmEvent::Behaviour(RelayBehaviourEvent::Rendezvous(

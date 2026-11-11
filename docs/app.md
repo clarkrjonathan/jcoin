@@ -48,6 +48,54 @@ Collapsed by default (`JCOIN_APP_DEV=1` starts with it open). It shows:
 The library logs through `jcoin::log` (`log_info!`, `log_error!`), which prints
 as before and passes each line to a sink the app sets.
 
+## Reporting (Sentry)
+
+The app sends every log line to Sentry Logs and reports crashes, so problems on
+another person's computer can be read without asking for files. The Developer
+section says so and lets the user label the computer. `app/src/telemetry.rs`
+holds all of it.
+
+Each log line carries attributes for sorting and filtering in Sentry:
+
+| Attribute | Meaning |
+| --- | --- |
+| `component` | The part that logged: `app`, `p2p`, `work`, `gpu`, `store` |
+| `event` | The kind of line, for example `dial_failed`, `reservation_ok`, `reservation_lost`, `peer_connected`, `block_won`, `block_accepted`, `startup` |
+| `device` | The label set in the Developer section (also `user.name`) |
+| `install_id` | A random id made on first run, stored in the data folder (also `user.id`) |
+| `peer_id` | The node's libp2p peer id; it matches the relay's log |
+| `network` | `mainnet` or `regtest` (also the Sentry environment) |
+| `address` | The address of the key in use |
+| `gpu` | The GPU in use while mining |
+
+Example searches in Sentry Logs: `device:"Noah desktop" component:p2p`,
+`event:reservation_lost`, `event:dial_failed peer_id:12D3KooW...`.
+
+Failed dials, failed protocol streams, and failed hole punches are routine on a
+peer-to-peer network; they are sent as warnings, not errors. Everything else the
+node logs as an error is sent as an error.
+
+`telemetry::classify` maps a line's text to `component` and `event`. A new kind
+of log line gets its own `event` by adding a rule there (and a case to its
+test). `telemetry::set_tag` adds a tag to all later lines and crash reports.
+
+- `JCOIN_APP_NO_TELEMETRY=1` turns reporting off.
+- `JCOIN_APP_TELEMETRY_DEBUG=1` prints what the SDK sends to stderr.
+- Secret keys are never logged. Addresses, peer ids, and IP addresses in log
+  lines are sent.
+- The release workflow uploads the app's debug files to Sentry when the
+  repository secret `SENTRY_AUTH_TOKEN` is set, so crash reports show function
+  names and lines. Without the secret the step is skipped.
+
+## Relay reservation
+
+A node behind NAT can be found and dialed only while it holds a reservation on
+the relay. The host connects to the relay, requests the reservation on that
+connection, and requests it again every tick if it is lost; a loss is logged as
+`relay reservation lost`. On Windows, outgoing connections do not reuse the
+listen port (that fails there with os error 10048), so hole punching is not
+expected to work from Windows; such nodes stay on the relay.
+
 ## Updates
 
 The app reads the GitHub release list of the repository named in

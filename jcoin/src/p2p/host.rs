@@ -198,14 +198,20 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
     let mut pending: HashMap<ConnectionId, Multiaddr> = HashMap::new();
 
     // The relay: reserve a slot (listen on a circuit) and use it for discovery.
+    // The host first connects to the relay itself, then asks for the
+    // reservation on that connection (`reserve`), and asks again whenever the
+    // reservation's listener closes. Letting the relay client open its own
+    // connection instead races with the host's dial; on Windows the loser
+    // fails with "address in use", and if that is the reservation's dial the
+    // node stays unreachable for the rest of the run.
     let relay_peer = match &config.relay {
         Some(addr) => {
             let peer = peer_of(addr).ok_or("--relay must end in /p2p/<relay peer id>")?;
-            swarm.listen_on(addr.clone().with(Protocol::P2pCircuit))?;
             Some((peer, addr.clone()))
         }
         None => None,
     };
+    let mut circuit_listener: Option<libp2p::core::transport::ListenerId> = None;
     let namespace = rendezvous::Namespace::from_static(NAMESPACE);
     let mut circuit_addr: Option<Multiaddr> = None;
     let mut registered_at: Option<Instant> = None;
@@ -249,6 +255,9 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                         }
                     }
                     let is_relay = relay_peer.as_ref().map(|(p, _)| *p) == Some(peer_id);
+                    if let (true, None, Some((_, relay_addr))) = (is_relay, circuit_listener, &relay_peer) {
+                        circuit_listener = reserve(&mut swarm, relay_addr);
+                    }
                     let remote = endpoint.get_remote_address();
                     network.connection_opened(
                         connection_id.to_string(),
@@ -284,6 +293,24 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                     if num_established == 0 {
                         network.set_connected(peer_id, false);
                     }
+                }
+                SwarmEvent::ListenerClosed { listener_id, reason, .. } if Some(listener_id) == circuit_listener => {
+                    // The reservation is gone (the relay refused it, or the
+                    // connection to the relay dropped). The next tick asks again.
+                    let why = match reason {
+                        Ok(()) => "closed".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    crate::log_error!("[p2p] relay reservation lost ({why}); this node cannot be reached until it is renewed");
+                    circuit_listener = None;
+                    if let Some(addr) = circuit_addr.take() {
+                        swarm.remove_external_address(&addr);
+                        network.remove_advertised(&addr);
+                    }
+                    registered_at = None;
+                }
+                SwarmEvent::ListenerError { listener_id, error } if Some(listener_id) == circuit_listener => {
+                    crate::log_error!("[p2p] relay reservation error: {error}");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
                     relay::client::Event::ReservationReqAccepted { relay_peer_id, renewal, .. },
@@ -339,10 +366,7 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
             },
 
             Some(addr) = dial_rx.recv() => {
-                let opts = match peer_of(&addr) {
-                    Some(peer) => DialOpts::peer_id(peer).addresses(vec![addr.clone()]).build(),
-                    None => DialOpts::unknown_peer_id().address(addr.clone()).build(),
-                };
+                let opts = dial_opts(&addr);
                 let id = opts.connection_id();
                 match swarm.dial(opts) {
                     Ok(()) => { pending.insert(id, addr); }
@@ -368,13 +392,16 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                 for (addr, known) in &bootstrap {
                     let connected = known.map(|p| swarm.is_connected(&p)).unwrap_or(false);
                     if !connected {
-                        let _ = swarm.dial(addr.clone());
+                        let _ = swarm.dial(dial_opts(addr));
                     }
                 }
                 if let Some((relay_id, relay_addr)) = &relay_peer {
                     if !swarm.is_connected(relay_id) {
-                        let _ = swarm.dial(relay_addr.clone());
+                        let _ = swarm.dial(dial_opts(relay_addr));
                         continue;
+                    }
+                    if circuit_listener.is_none() {
+                        circuit_listener = reserve(&mut swarm, relay_addr);
                     }
                     let due = registered_at.is_none_or(|t| t.elapsed() >= REREGISTER_EVERY);
                     if circuit_addr.is_some() && due {
@@ -448,6 +475,38 @@ fn release(sessions: &Sessions, peer: PeerId) {
         *count = count.saturating_sub(1);
         if *count == 0 {
             map.remove(&peer);
+        }
+    }
+}
+
+/// Ask the relay at `relay_addr` for a reservation by listening on a circuit
+/// through it. The host must already be connected to the relay. Returns the
+/// listener, or `None` (logged) if the request could not be made.
+fn reserve(swarm: &mut libp2p::Swarm<Behaviour>, relay_addr: &Multiaddr) -> Option<libp2p::core::transport::ListenerId> {
+    match swarm.listen_on(relay_addr.clone().with(Protocol::P2pCircuit)) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            crate::log_error!("[p2p] cannot request a relay reservation: {e}");
+            None
+        }
+    }
+}
+
+/// Options for dialing `addr`.
+///
+/// By default libp2p dials from the listen port, which hole punching relies
+/// on. Windows does not allow a second socket to connect from a port that is
+/// in use the way Unix does, and such dials fail with "Only one usage of each
+/// socket address" (os error 10048), so on Windows every dial gets a new port.
+fn dial_opts(addr: &Multiaddr) -> DialOpts {
+    match peer_of(addr) {
+        Some(peer) => {
+            let opts = DialOpts::peer_id(peer).addresses(vec![addr.clone()]);
+            if cfg!(windows) { opts.allocate_new_port().build() } else { opts.build() }
+        }
+        None => {
+            let opts = DialOpts::unknown_peer_id().address(addr.clone());
+            if cfg!(windows) { opts.allocate_new_port().build() } else { opts.build() }
         }
     }
 }

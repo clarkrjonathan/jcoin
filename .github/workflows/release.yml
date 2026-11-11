@@ -51,6 +51,12 @@ jobs:
             label: windows-x86_64
             ext: ".exe"
     runs-on: ${{ matrix.os }}
+    # Sentry debug-file upload for the desktop app. The upload step is skipped
+    # when SENTRY_AUTH_TOKEN is not set, so the release still builds without it.
+    env:
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: iowa-state-pe
+      SENTRY_PROJECT: jcoin-app
     steps:
       - uses: actions/checkout@v4
 
@@ -77,6 +83,16 @@ jobs:
       - name: Build desktop app
         run: cargo build --release --manifest-path app/Cargo.toml --bin jcoin-app
 
+      # Upload the desktop app's debug info and source files to Sentry so
+      # production panics symbolicate to real functions, files, and lines.
+      # Runs before the binary is stripped. Skipped if the secret is absent.
+      - name: Upload jcoin-app debug files to Sentry
+        if: ${{ env.SENTRY_AUTH_TOKEN != '' }}
+        shell: bash
+        run: |
+          npm install -g @sentry/cli
+          sentry-cli debug-files upload --include-sources app/target/release
+
       - name: Stage binaries and checksums
         shell: bash
         run: |
@@ -87,6 +103,12 @@ jobs:
           done
           cp "gpu-miner/target/release/gpu-miner${{ matrix.ext }}" "dist/jcoin-gpu-miner-${{ matrix.label }}${{ matrix.ext }}"
           cp "app/target/release/jcoin-app${{ matrix.ext }}" "dist/JeffyCoin-${{ matrix.label }}${{ matrix.ext }}"
+          # The app keeps debug info for Sentry; strip the shipped Linux binary
+          # now that its debug files are uploaded. The Windows .exe holds no
+          # debug info (it lives in a separate .pdb), so nothing to strip there.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            strip "dist/JeffyCoin-${{ matrix.label }}"
+          fi
           cd dist
           sha256sum * > "SHA256SUMS-${{ matrix.label }}.txt"
           echo "=== checksums (${{ matrix.label }}) ==="

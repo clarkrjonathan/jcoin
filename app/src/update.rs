@@ -192,6 +192,7 @@ pub fn restart() -> Result<(), String> {
     std::process::Command::new(exe)
         .spawn()
         .map_err(|e| format!("the update is installed, but the program could not be restarted: {e}"))?;
+    crate::telemetry::flush();
     std::process::exit(0);
 }
 

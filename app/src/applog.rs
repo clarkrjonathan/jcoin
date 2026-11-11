@@ -64,6 +64,8 @@ impl AppLog {
                 text: text.to_string(),
             });
         }
+        // Also report the line, filed by component and event.
+        crate::telemetry::log(error, text);
     }
 
     /// The most recent lines, oldest first.

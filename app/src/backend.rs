@@ -227,6 +227,8 @@ impl Backend {
             ),
         );
 
+        crate::telemetry::set_tag("address", &address);
+
         let rest_port = free_port("127.0.0.1", 3000);
         let p2p_port = free_port("0.0.0.0", 8333);
         let node_url = format!("http://127.0.0.1:{rest_port}");
@@ -333,6 +335,7 @@ impl Backend {
         // The figures on screen belong to the old key; clear them until the
         // poller has read the new account.
         *self.polled_address.lock().unwrap() = self.address.clone();
+        crate::telemetry::set_tag("address", &self.address);
         {
             let mut v = self.view.lock().unwrap();
             v.account_known = false;
@@ -443,6 +446,7 @@ impl Backend {
                         return;
                     }
                 };
+                crate::telemetry::set_tag("gpu", &gpu.description);
                 *opened.lock().unwrap() = Some(Ok(gpu.description.clone()));
                 let batch = ((1u32 << 22) / WORKGROUP * WORKGROUP).min(gpu.max_batch());
                 mine(&gpu, &node, &miner, batch, Duration::from_secs(20), &control);
