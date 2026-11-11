@@ -108,6 +108,10 @@ node logs as an error is sent as an error.
 of log line gets its own `event` by adding a rule there (and a case to its
 test). `telemetry::set_tag` adds a tag to all later lines and crash reports.
 
+To read the logs from a terminal as compact text, use `tools/sentry-logs`
+(`tools/sentry-logs --help`). The `sentry-logs` skill in `.claude/skills/`
+describes how to read them in the fewest steps.
+
 - `JCOIN_APP_NO_TELEMETRY=1` turns reporting off.
 - `JCOIN_APP_TELEMETRY_DEBUG=1` prints what the SDK sends to stderr.
 - Secret keys are never logged. Addresses, peer ids, and IP addresses in log

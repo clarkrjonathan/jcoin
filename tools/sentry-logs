@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Read the JeffyCoin app's Sentry logs as compact text.
+
+The app sends every log line to Sentry with attributes (see docs/app.md,
+"Reporting"). This tool asks Sentry's API for them and prints as little text as
+answers the question: counts first, then short lines with peer ids and
+addresses shortened and repeated lines collapsed.
+
+  sentry-logs nodes   [-p 2h]                    who reported, how much, last seen
+  sentry-logs events  NODE [-p 2h]               count of each kind of line for a node
+  sentry-logs timeline NODE [-p 2h] [-n 60]      the lines that tell the story
+  sentry-logs lines   NODE [-e EVENT]... [-n 40] chosen lines (add --noise for failed dials)
+  sentry-logs query   'SENTRY QUERY' [-f FIELD]...   anything else
+
+NODE picks one computer: a device label, an install id (16 hex), or a peer id
+(or the 6 characters after `12D3KooW`). Use `all` for every node.
+
+It needs a Sentry user auth token with the scopes org:read, project:read, and
+event:read, in the environment variable SENTRY_READ_TOKEN or in the file
+~/.config/jeffycoin/sentry-token (one line). Run `sentry-logs --self-test` to
+check the text handling without a token.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ORG = "iowa-state-pe"
+PROJECT_ID = "4512410839351296"
+API = f"https://us.sentry.io/api/0/organizations/{ORG}/events/"
+TOKEN_FILE = os.path.expanduser("~/.config/jeffycoin/sentry-token")
+
+# Lines that are routine on a peer-to-peer network. Left out unless asked for.
+NOISE = ["dial_failed", "stream_failed", "listening", "block_candidate", "handshake_failed"]
+# The lines that say what a node did, in order.
+STORY = [
+    "startup", "install", "store_replayed", "identity", "reservation_ok", "reservation_lost",
+    "rendezvous_registered", "rendezvous_failed", "peer_connected", "peer_disconnected",
+    "hole_punch_ok", "hole_punch_failed", "mining_started", "mining_stopped", "gpu_unavailable",
+    "gpu_limit_set", "block_won", "block_not_accepted", "work_unavailable", "submit_failed",
+    "host_stopped", "update", "other",
+]
+
+
+def node_filter(node):
+    """The Sentry query term that selects one node."""
+    if node == "all":
+        return ""
+    if re.fullmatch(r"[0-9a-f]{16}", node):
+        return f"install_id:{node}"
+    if node.startswith("12D3KooW"):
+        return f"peer_id:{node}*" if len(node) < 52 else f"peer_id:{node}"
+    if re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{6}", node):
+        return f"peer_id:12D3KooW{node}*"
+    return f'device:"{node}"'
+
+
+def shorten(text):
+    """Make a log line short: peer ids to 6 characters, addresses to host:port."""
+    text = re.sub(r"12D3KooW([1-9A-HJ-NP-Za-km-z]{6})[1-9A-HJ-NP-Za-km-z]{38}", r"<\1>", text)
+    text = re.sub(r"/ip[46]/([0-9a-fA-F.:]+)/tcp/(\d+)", r"\1:\2", text)
+    text = text.replace("/p2p-circuit", "~relay~").replace("/p2p/", "/")
+    # libp2p repeats its own error text; keep the first copy.
+    text = re.sub(r"(.{12,}?)(?:: \1)+", r"\1", text)
+    text = text.replace("Failed to negotiate transport protocol(s): ", "")
+    text = re.sub(
+        r"Dial error: dial condition was configured.*", "already connected or dialing", text
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def collapse(rows, width):
+    """Rows of (time, severity, event, message) as text lines. Lines that are
+    the same after shortening (and ignoring digits) become one line with a
+    count."""
+    out, last_key, count = [], None, 0
+    for time, severity, event, message in rows:
+        short = shorten(message or "")
+        if width and len(short) > width:
+            short = short[: width - 1] + "…"
+        key = (event, re.sub(r"\d+", "#", short))
+        if key == last_key:
+            count += 1
+            continue
+        if count > 1:
+            out[-1] += f"  (x{count})"
+        mark = {"error": "E", "warn": "W", "warning": "W", "fatal": "E"}.get(severity or "", " ")
+        out.append(f"{(time or '')[11:19]} {mark} {event or '-':<20} {short}")
+        last_key, count = key, 1
+    if count > 1:
+        out[-1] += f"  (x{count})"
+    return out
+
+
+def token():
+    value = os.environ.get("SENTRY_READ_TOKEN", "").strip()
+    if not value and os.path.exists(TOKEN_FILE):
+        value = open(TOKEN_FILE).read().strip()
+    if not value:
+        sys.exit(
+            "No Sentry token. Put a user auth token (scopes org:read, project:read, event:read)\n"
+            f"in SENTRY_READ_TOKEN or in {TOKEN_FILE}. Without one, use the Sentry MCP tools."
+        )
+    return value
+
+
+def fetch(fields, query, period, limit, sort):
+    """Ask the events API for log rows. Returns a list of dicts."""
+    last_error = None
+    # The logs dataset has had two names; try the current one first.
+    for dataset in ("logs", "ourlogs"):
+        params = [("dataset", dataset), ("project", PROJECT_ID), ("statsPeriod", period),
+                  ("per_page", str(limit)), ("query", query), ("sort", sort)]
+        params += [("field", f) for f in fields]
+        request = urllib.request.Request(
+            API + "?" + urllib.parse.urlencode(params),
+            headers={"Authorization": f"Bearer {token()}", "User-Agent": "jeffycoin-sentry-logs"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as reply:
+                return json.load(reply).get("data", [])
+        except urllib.error.HTTPError as e:
+            last_error = f"HTTP {e.code}: {e.read().decode(errors='replace')[:300]}"
+            if e.code in (401, 403):
+                break
+    sys.exit(f"Sentry refused the request ({last_error})")
+
+
+def join(*terms):
+    return " ".join(t for t in terms if t)
+
+
+def table(rows, columns):
+    """Rows of dicts as an aligned text table."""
+    cells = [[str(r.get(c) if r.get(c) is not None else "-") for c in columns] for r in rows]
+    heads = [c.replace("sentry.", "").replace("()", "") for c in columns]
+    widths = [max(len(h), *(len(row[i]) for row in cells)) if cells else len(h)
+              for i, h in enumerate(heads)]
+    lines = ["  ".join(h.ljust(w) for h, w in zip(heads, widths))]
+    lines += ["  ".join(v.ljust(w) for v, w in zip(row, widths)) for row in cells]
+    return lines
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--self-test", action="store_true")
+    sub = parser.add_subparsers(dest="command")
+
+    def common(p, node=True):
+        if node:
+            p.add_argument("node")
+        p.add_argument("-p", "--period", default="2h", help="how far back: 30m, 2h, 7d (default 2h)")
+
+    common(sub.add_parser("nodes"), node=False)
+    common(sub.add_parser("events"))
+    for name in ("timeline", "lines"):
+        p = sub.add_parser(name)
+        common(p)
+        p.add_argument("-n", "--limit", type=int, default=60 if name == "timeline" else 40)
+        p.add_argument("-w", "--width", type=int, default=150, help="longest message; 0 for all")
+        p.add_argument("--oldest", action="store_true", help="start from the oldest line")
+        if name == "lines":
+            p.add_argument("-e", "--event", action="append", default=[])
+            p.add_argument("--errors", action="store_true", help="errors and warnings only")
+            p.add_argument("--noise", action="store_true", help="include failed dials and the like")
+    p = sub.add_parser("query")
+    p.add_argument("query")
+    common(p, node=False)
+    p.add_argument("-f", "--field", action="append", default=[])
+    p.add_argument("-n", "--limit", type=int, default=30)
+    args = parser.parse_args()
+
+    if args.self_test:
+        return self_test()
+    if args.command == "nodes":
+        columns = ["device", "install_id", "os.name", "sentry.release", "sentry.environment",
+                   "count()", "max(timestamp)"]
+        rows = fetch(columns, "", args.period, 50, "-count()")
+        # peer_id is absent on a node's first lines, so it is asked for apart.
+        print("\n".join(table(rows, columns)))
+    elif args.command == "events":
+        columns = ["event", "severity", "count()"]
+        rows = fetch(columns, node_filter(args.node), args.period, 60, "-count()")
+        print("\n".join(table(rows, columns)))
+    elif args.command in ("timeline", "lines"):
+        if args.command == "timeline":
+            terms = "event:[" + ",".join(STORY) + "]"
+        else:
+            terms = join(
+                "event:[" + ",".join(args.event) + "]" if args.event else "",
+                "" if args.noise or args.event else " ".join(f"!event:{e}" for e in NOISE),
+                "severity:[error,warn,fatal]" if args.errors else "",
+            )
+        rows = fetch(["timestamp", "severity", "event", "message"],
+                     join(node_filter(args.node), terms), args.period, args.limit,
+                     "timestamp" if args.oldest else "-timestamp")
+        rows.sort(key=lambda r: r.get("timestamp") or "")
+        lines = collapse([(r.get("timestamp"), r.get("severity"), r.get("event"), r.get("message"))
+                          for r in rows], args.width)
+        print("\n".join(lines) if lines else "no lines")
+        if len(rows) == args.limit:
+            print(f"(limit of {args.limit} reached; narrow the period or raise -n)")
+    elif args.command == "query":
+        columns = args.field or ["timestamp", "severity", "event", "message"]
+        rows = fetch(columns, args.query, args.period, args.limit, "-timestamp")
+        for row in rows:
+            if "message" in row:
+                row["message"] = shorten(row["message"] or "")[:200]
+        print("\n".join(table(rows, columns)))
+    else:
+        parser.print_help()
+
+
+def self_test():
+    long_dial = (
+        "[p2p] dial to 12D3KooWD7E4NNaHRzL76eu83xZe6eytxJVE1cTLidHZYvcQxVBC failed: Failed to negotiate "
+        "transport protocol(s): [(/ip4/69.5.138.4/tcp/46397/p2p/12D3KooWD7E4NNaHRzL76eu83xZe6eytxJVE1cTLidHZYvcQxVBC: "
+        ": Only one usage of each socket address (protocol/network address/port) is normally permitted. "
+        "(os error 10048): Only one usage of each socket address (protocol/network address/port) is "
+        "normally permitted. (os error 10048))]"
+    )
+    short = shorten(long_dial)
+    assert "<D7E4NN>" in short and "12D3KooW" not in short, short
+    assert "69.5.138.4:46397" in short, short
+    assert short.count("Only one usage") == 1, short
+    assert len(short) < len(long_dial) / 2, (len(short), len(long_dial))
+    relay = shorten("reachable at /ip4/3.14.123.27/tcp/9000/p2p/12D3KooWRGZbiiQPP4XRPttimhHQVGEAfkEokYoPRPE3g6feKL1v"
+                    "/p2p-circuit/p2p/12D3KooWPwbBoqWSB6zS3JuYvBcejaVSEgr2pD7bZKpv6vBUfBMa")
+    assert relay == "reachable at 3.14.123.27:9000/<RGZbii>~relay~/<PwbBoq>", relay
+
+    rows = [
+        ("2026-11-11T03:53:36+00:00", "info", "startup", "[app] JeffyCoin 2.1.1 starting"),
+        ("2026-11-11T03:53:47+00:00", "warn", "dial_failed", "[p2p] dial to x failed: Timeout 1"),
+        ("2026-11-11T03:53:57+00:00", "warn", "dial_failed", "[p2p] dial to x failed: Timeout 2"),
+        ("2026-11-11T03:54:07+00:00", "warn", "dial_failed", "[p2p] dial to x failed: Timeout 3"),
+        ("2026-11-11T03:54:08+00:00", "error", "reservation_lost", "[p2p] relay reservation lost (closed)"),
+    ]
+    lines = collapse(rows, 150)
+    assert len(lines) == 3, lines
+    assert lines[0].startswith("03:53:36   startup"), lines[0]
+    assert lines[1].startswith("03:53:47 W dial_failed") and lines[1].endswith("(x3)"), lines[1]
+    assert lines[2].startswith("03:54:08 E reservation_lost"), lines[2]
+    assert collapse([("2026-11-11T03:53:36+00:00", "info", "other", "x" * 300)], 50)[0].endswith("…")
+
+    assert node_filter("all") == ""
+    assert node_filter("9816292cc79df51a") == "install_id:9816292cc79df51a"
+    assert node_filter("PwbBoq") == "peer_id:12D3KooWPwbBoq*"
+    assert node_filter("Noah desktop") == 'device:"Noah desktop"'
+    assert table([{"a": 1, "count()": None}], ["a", "count()"]) == ["a  count", "1  -    "]
+    print("self-test passed")
+
+
+if __name__ == "__main__":
+    main()
