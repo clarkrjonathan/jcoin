@@ -10,21 +10,31 @@ How to use this file:
 - Put the entry under the version it is planned for, or under "Unscheduled" if
   no version is chosen.
 - Mark each entry **Consensus: yes** or **Consensus: no**. A consensus change
-  needs every node to update and must be planned around an activation height.
-- When the version is released, move its section to the top of
-  `CHANGELOG.md`, reworded as what changed, and delete it here.
+  makes old and new nodes disagree on which blocks are valid.
+- A consensus change ships only in a minor version (`2.x.0`), with a higher
+  block version, either at an activation height or with a chain restart. Every
+  open consensus question is listed in "Consensus backlog" near the end of
+  this file, also when its work is planned for a version.
+- When a version is released, move its section to the top of `CHANGELOG.md`,
+  reworded as what changed, and delete it here.
 
 Status values: `planned` (agreed, not started), `in progress`, `done` (merged
-to `main`, waiting for the release).
+to `main`, waiting for the release), `to design` (the problem is agreed, the
+change is not).
 
-## 2.2.0 (consensus change)
+The next release is **2.2.0**. Nothing ships as 2.1.3 or later in the 2.1
+line.
+
+## 2.2.0: chain restart
+
+A consensus release. The chain restarts with a new genesis and block version
+3. Coins mined on the stalled chain are not carried over. Key files stay
+valid.
 
 ### The difficulty rule compounds and stalls the chain
 
 - Status: planned. Urgent: the chain is stalled.
-- Consensus: **yes**. Every node must update. The fix activates at a block
-  height through the version-by-height rule (`consensus_version`), or the
-  chain is restarted.
+- Consensus: **yes**
 - Found: 2026-11-11. The chain reached height 69 at 05:33 UTC and produced no
   block for more than 8 hours, with about 2.1 GH/s mining. Difficulty went
   from 28 to 44.8 leading zero bits (about 110,000 times harder) in 9 blocks.
@@ -53,56 +63,70 @@ to `main`, waiting for the release).
   - Tests that simulate a chain: a miner far faster than the floor, a hash
     rate step up and down, and a miner leaving. Each must settle near 300 s
     and never run away. The current tests only check one adjustment step.
-- Decided 2026-11-11: **restart the chain** with a new genesis. Coins mined on
-  the stalled chain are not carried over. Key files stay valid.
-- Open point: the floor value. Also see "Consensus backlog" under 2.1.4:
-  behavior when hash power leaves, and a safe fallback against long stalls,
-  are to be designed together with this rule.
+- Decided 2026-11-11: restart the chain, in place of activating the fix at a
+  height on the stalled chain.
+- Open points: see "Consensus backlog" for the questions that are designed
+  together with this rule (hash power leaving, a fallback against stalls, the
+  window size, the starting difficulty).
 
-### Moving every client to the restarted chain
+### Tell the user when the network has moved on
 
-- Status: planned, part of 2.2.0
-- Consensus: no (it is about how clients learn of a consensus change)
-- Problem: a client on 2.1.2 cannot follow a restart. It keeps its old chain,
-  rejects every block of the new one, and says so nowhere. Its only hint is
-  the line "A newer version is available" in the Updates section, checked
-  once at startup. A client left open never checks again.
-- What 2.1.2 clients will do when 2.2.0 nodes appear: nothing by themselves.
-  Their owners have to be told to update. This cannot be changed after the
-  fact; the points below make the *next* change announce itself.
-- Planned change, in 2.2.0:
-  - **Required updates.** A release can be marked as required (a small
-    `release.json` asset: the chain it is for and the oldest version that
-    still works). The app checks the release list at startup and every 30
-    minutes. When its own version is too old it shows a banner across the top
-    that cannot be dismissed ("This version can no longer take part in the
-    network"), with the update button in it, and stops mining so no power is
-    spent on a dead chain. This uses the same trust as the updater: the
-    project's own release page.
-  - **Chain identity in the handshake.** Peers exchange the genesis hash and
-    consensus version when they connect. A peer on another chain is refused
-    with that reason, and the app shows "N nodes you reached are on a
-    different chain; you probably need to update". Today such peers connect
-    and silently reject each other's blocks.
-  - **Separate discovery per chain.** The rendezvous name and the protocol id
-    include the chain, so nodes of the old and new chain do not find each
-    other at all. An old client then shows "Looking for other nodes".
-  - **Old chain data.** On first start, 2.2.0 moves the old `blocks.dat` aside
-    (`blocks-v2-stalled.dat`) and starts the new chain. Keys are untouched.
-- Considered, from the user's note under 2.1.4: prompt for an update when a
-  conflicting fork has much more proof of work. A client can check the proof
-  of work of headers it cannot otherwise validate, so this is possible. It is
-  weaker than the two signals above: on a small chain anyone with one GPU can
-  build a heavier chain and trigger the prompt, and "more work" does not say
-  which side is right. Keep it as a hint only ("a heavier chain exists that
-  this version cannot read") and never as the trigger that blocks mining.
+- Status: planned
+- Consensus: no (it is about how a client learns of a consensus change)
+- Source: Jonathan's notes, 2026-11-11
+- Problem: a client on an older version cannot follow a consensus change. It
+  keeps its own chain, refuses every block of the new one, and says so
+  nowhere. Its only hint is the line "A newer version is available" in the
+  Updates section, checked once at startup. A client left open never checks
+  again.
+- Decided 2026-11-11: **no required updates.** The app never refuses to run
+  or to mine because of its version. A flag on the release page that stops
+  old clients would make one party decide consensus. A client on old rules
+  that keeps mining is the system working as designed. The app prompts more
+  strongly as the evidence grows; it does not force.
+- Planned change: take the evidence from the network.
+  - **Higher block version.** The block version rises on every consensus
+    change and is never reused (see "Consensus backlog"). When a client
+    refuses a block because its version is higher than any it knows, and the
+    block's header meets the target the header states, that is proof of work
+    spent on newer rules. The client can check this without knowing the newer
+    rules, for a fork of its own chain and for a chain with another genesis.
+  - **Weight by proof of work.** The client adds up the work of those
+    headers and compares it with the recent work on its own chain. Any such
+    block gives a notice in the Updates section. Once the work is comparable
+    to or larger than its own chain's, the app shows a banner at the top of
+    the window: newer rules are in use and carry more work than this chain;
+    update. The banner has the update button, can be dismissed for the
+    session, and never stops mining.
+  - **Heavier chain without a higher version.** A refused chain that carries
+    much more work but no higher version gets a weaker notice ("a heavier
+    chain exists that this version cannot read"). More work alone does not
+    say which side is right, and on a small chain one GPU can produce it.
+  - **Update check on a timer.** The app checks the release list at startup
+    and every 30 minutes, as information for the notices above.
+  - **Peers' rule version in the connections list**, so the Developer section
+    shows which peers run other rules. Lower priority.
+- Not done on purpose: separate discovery for each chain. It would hide the
+  new chain's blocks from old clients, and then they would never see the
+  signal. Nodes of the old and new chain keep connecting to each other.
+- Limit: 2.1.2 and earlier cannot show any of this. For this restart, the
+  people running them have to be told to update.
 
-## 2.1.3
+### Old chain data is moved aside
 
-Theme: make the Sentry logs answer a question in one query. Since 2.1.1 the
-app sends every log line, and `tools/sentry-logs` and the `sentry-logs` skill
-read them. Reading them on 2026-11-11 showed what is missing. None of this
-changes consensus.
+- Status: planned
+- Consensus: no
+- Problem: 2.2.0 starts a new chain, and the data folder holds the stalled
+  chain's `blocks.dat`.
+- Planned change: on first start, 2.2.0 renames the old file
+  (`blocks-v2-stalled.dat`) and starts the new chain. Key files are not
+  touched. Balances start at zero.
+
+## 2.2.1: logs that answer a question in one query
+
+Since 2.1.1 the app sends every log line to Sentry, and `tools/sentry-logs`
+and the `sentry-logs` skill read them. Reading them on 2026-11-11 showed what
+is missing. None of this changes consensus.
 
 ### Name the computer on first run
 
@@ -114,6 +138,19 @@ changes consensus.
 - Planned change: on first run, ask "What should this computer be called?"
   with a short text field and a "Skip" button. The answer is the `device`
   label. The field in the Developer section stays, for changing it.
+
+### Show device labels in the connections list
+
+- Status: planned
+- Consensus: no
+- Source: Jonathan's note, 2026-11-11
+- Problem: the connections list in the Developer section shows peer ids only.
+  It does not say whose node each one is.
+- Planned change: show each peer's device label next to its peer id.
+- Open point: how a node learns another node's label. The label is sent to
+  Sentry today, not to peers. Sending it to peers is a protocol addition
+  (a field a node may send after the handshake) and makes the label public to
+  every node it connects to.
 
 ### A status line once a minute
 
@@ -150,12 +187,15 @@ changes consensus.
 
 - Status: planned
 - Consensus: no
-- Problem: about half of a node's lines are failed dials to addresses that can
-  never be reached (loopback, link-local, addresses of old test nodes) and
-  "already connected or dialing" notices.
+- Found: 2026-11-11. About half of a node's lines are failed dials to
+  addresses that can never be reached and "already connected or dialing"
+  notices. Nodes pass on loopback and private addresses of other machines
+  (`127.0.0.1`, `172.17.0.1`, `::1`) and stale records of old test nodes;
+  each node then tries to dial them and logs a failure.
 - Planned change:
   - Do not pass on or dial loopback and link-local addresses of other
     machines. This removes the cause, not only the lines.
+  - Drop addresses of peers that have not been reachable for some time.
   - Do not log "already connected or dialing"; it is not a failure.
   - Send a failed dial to Sentry only the first time for each peer in a run;
     keep every one in the local log file.
@@ -195,36 +235,89 @@ changes consensus.
   - Verify the reader's request to Sentry with a real token. It has only been
     tested without one.
 
-## 2.1.4
+## 2.2.2: network health and mining view
 
-NOTE THIS IS A USER ADDED FEEL FREE TO MODIFY THE FORMAT TO FIT THE REST WHEN YOU NEXT TOUCH THIS
+### A block tracker and the average block time
 
-I would like to add a block tracker and average block time so I can see the health of the network
+- Status: planned
+- Consensus: no
+- Source: Jonathan's note, 2026-11-11
+- Problem: the app shows only the current block height. It does not show
+  whether blocks are arriving on time, so a stalled or racing chain is not
+  visible. The stall on 2026-11-11 was found by reading the chain file.
+- Planned change: a view of recent blocks (height, time, time since the block
+  before it, difficulty, miner) and the average block time over the last
+  blocks, next to the 300-second target, plus the time since the last block.
 
-Additionally add some projections for time assuming this nodes hash rate is the only one hashing, eg. what is the current nodes expected time to block?
+### Expected time to a block for this node
 
-Also look into the node gossip protocol for discovery, I would like for even indirect relay connections to be gossipped if possible
+- Status: planned
+- Consensus: no
+- Source: Jonathan's note, 2026-11-11
+- Problem: a miner cannot tell what to expect from their own GPU.
+- Planned change: show the expected time for this node to find a block if it
+  were the only one mining: current difficulty divided by this node's hash
+  rate. State that it is an average and that a block can take much less or
+  much more.
 
-And what is the gpu thing actually doing? Because when I go to 100% it spikes like 10x, but everything below 100% is practically the same
+### The GPU use limit has no effect below 100%
 
-Include device label in the node connections
+- Status: planned
+- Consensus: no
+- Source: Jonathan's note, 2026-11-11
+- Found: in the app, every setting below 100% gives about the same hash rate,
+  and 100% is about ten times higher.
+- Likely cause, from reading `gpu-miner/src/miner.rs`: the rest between GPU
+  dispatches goes through `MinerControl::pause`, which sleeps in steps of
+  100 ms. A dispatch takes about 30 ms, so any limit below 100% rests at
+  least 100 ms for each 30 ms of work, about 20% to 25% use at every setting.
+  `--bench` sleeps for the exact time, which is why the benchmark numbers in
+  the 2.1.2 notes were proportional and the app is not. Not yet confirmed by
+  a measurement in the app.
+- Planned change: rest for the computed time, in steps no longer than what
+  remains. Add a test of the rest loop's timing, and measure the hash rate
+  through the mining loop, not only through `--bench`.
 
-### Consensus backlog
-ANOTHER IMPORTANT NOTE, I WOULD LIKE TO BACKLOG THE FOLLOWING MAKE A SEPERATE STRUCTURE FOR CONESENSUS BACKLOG
-I would like to readdress the consensus for the limit to target scaling, my friends had their gpus on and then turned them off and completely stalled the block chain because my gpu is less powerful than theirs and couldn't keep up
-Additionally I believe the singular block model may have made it even worse, even with all gpus contributing that would be a expected block time of 1.6 hours so something clearly went wrong. This algorithm needs more work
-is there a **safe** way to implement some sort of 20 minute fall back where we are able to revert to a lower target or just have some other fall back system for this to prevent complete stalls for hours
+### Pass on relayed addresses, and reach nodes on the same network directly
 
-Imediate consensus needs to be made to change away from singular block adjustment I think. The problem is a particularly lucky block shifts target, but if we expand to larger epoch it means a drop in network compute power means we have to fight for longer. Is there a better solution?
+- Status: planned; needs investigation first
+- Consensus: no
+- Source: Jonathan's note, 2026-11-11
+- Problem: discovery depends on the relay's rendezvous list. Jonathan wants
+  nodes to tell each other about nodes they reach through the relay as well,
+  so a node can be found through any node that knows it.
+- Related finding, 2026-11-11: two nodes on the same LAN (192.168.0.x)
+  connected to each other through the relay. Neither tried the other's LAN
+  address.
+- To investigate: what the address exchange (`ADDR`, `GETADDR`) passes on
+  today, whether relayed (`/p2p-circuit`) addresses are included, and why a
+  LAN address was not tried.
+- This interacts with "Stop sending lines that say nothing" in 2.2.1: pass on
+  addresses that can be reached, not every address a node has.
 
-Also this may fit somewhere else but maybe a large conflicting fork with much higher pow strongly prompts for a client upgrade? If this is a good idea it should be pushed very soon
+## 2.2.3: wallet and block detail
 
-## 2.1.5
+### Saved addresses for sending
 
-saved addresses for outgoing transactions
-More detailed block view for the developer view, eg full block view just expands out as you click through it
+- Status: planned
+- Consensus: no
+- Source: Jonathan's note, 2026-11-11
+- Problem: sending needs a 64-character address pasted in each time.
+- Planned change: an address book in the app: save an address under a name,
+  pick it when sending. Stored in the data folder.
 
-## 2.3
+### Full block view in the Developer section
+
+- Status: planned
+- Consensus: no
+- Source: Jonathan's note, 2026-11-11
+- Problem: the Developer section lists only blocks this node mined, with a
+  few fields.
+- Planned change: any block can be expanded to show all of it: header fields,
+  the coinbase, each transfer. Click through to open more detail. This needs
+  a node endpoint that returns a block by height or hash.
+
+## 2.3: graphical overhaul
 
 ### Graphical overhaul of the desktop app
 
@@ -248,7 +341,112 @@ More detailed block view for the developer view, eg full block view just expands
   - Whether the GPU use limit lowers itself while the computer is in use
     (carried over from 2.1.2).
 
+## Consensus backlog
+
+Every open question about the consensus rules, in one place. A change here
+makes old and new nodes disagree, so it ships only in a `2.x.0` release with
+a higher block version. Work that is planned for a version has its entry
+under that version; this list says where each question stands.
+
+| Question | Stands |
+| --- | --- |
+| The difficulty rule compounds | Planned for 2.2.0 (entry under 2.2.0) |
+| Hash power leaves and the chain stalls | To design, with 2.2.0 |
+| A fallback against stalls of hours | To design, with 2.2.0 |
+| Adjust every block or by epoch | To design, with 2.2.0 |
+| Starting difficulty | Open, with 2.2.0 |
+| Block version rises on every change | Planned for 2.2.0 |
+| Merkle root for transfers | Deferred |
+
+### Hash power leaves and the chain stalls
+
+- Status: to design, with 2.2.0
+- Consensus: **yes**
+- Source: Jonathan's note, 2026-11-11
+- Problem: friends mined with strong GPUs and then turned them off. The
+  difficulty stayed at the level their GPUs had reached, and the remaining,
+  weaker GPU could not find a block. Any rule that tracks hash power has this
+  weakness to some degree: the difficulty can only come down as blocks are
+  found, and blocks are slow exactly when it needs to come down.
+- Note: on 2026-11-11 most of the stall came from the compounding bug, not
+  from hash power leaving. Jonathan's estimate was that the difficulty meant
+  about 1.6 hours per block with every GPU mining, so the rule was wrong even
+  before anyone left. The corrected rule must still be tested for this case.
+- To design: how fast the difficulty must fall when most hash power leaves,
+  and what the cost is in the other direction (see the fallback entry).
+
+### A fallback against stalls of hours
+
+- Status: to design, with 2.2.0
+- Consensus: **yes**
+- Source: Jonathan's note, 2026-11-11
+- Question: is there a safe way to fall back to a lower difficulty when no
+  block has been found for some time, for example 20 minutes, so the chain
+  cannot stall for hours?
+- Known hazard: a rule that drops to the easiest difficulty after a fixed
+  wait is easy to abuse. A miner sets a block's timestamp far enough ahead to
+  claim the easy difficulty, and can then mine many easy blocks. Bitcoin's
+  test network has this rule and has block storms because of it. "Safe" here
+  means the easing is small for each block and cannot be claimed by a
+  timestamp alone.
+- Candidates to evaluate, none decided:
+  - Let one slow block count for more in the average (a larger solve-time
+    cap than 4 x 300 s), so the difficulty falls faster after a stall. This
+    stays inside the LWMA and has no new attack.
+  - Ease the target by a bounded step for each period the block's own
+    timestamp is past its parent's. The timestamp limits (after the median of
+    the last 11 blocks, at most 2 hours ahead of the clock) bound what a
+    miner can claim.
+- Each candidate goes through the chain simulation tests planned under 2.2.0
+  before one is chosen.
+
+### Adjust every block or by epoch
+
+- Status: to design, with 2.2.0
+- Consensus: **yes**
+- Source: Jonathan's note, 2026-11-11
+- Question: adjusting from a single block lets one lucky block move the
+  difficulty. Adjusting by a long epoch means a drop in hash power is fought
+  for a whole epoch. Is there something better?
+- Answer so far: the two are not the only choices. A correct LWMA adjusts on
+  every block, from the average over the last N blocks, with recent blocks
+  weighted more. One lucky block then moves the difficulty by about 2/N of
+  the gap, and a real change in hash power is followed within a part of the
+  window. What the chain ran in 2.0.0 to 2.1.2 was neither: it applied a
+  window average to the parent's difficulty on every block, which compounds.
+- Open point: the window size N. A smaller N follows changes faster and is
+  moved more by luck. 60 was the value in use.
+
+### Starting difficulty
+
+- Status: open, with 2.2.0
+- Consensus: **yes** (it is part of the genesis)
+- Problem: the floor has been wrong in both directions. 35 bits was hours of
+  work for the weakest node; 28 bits was 2 seconds for a laptop GPU.
+- With a rule that adjusts from the first block, the starting value matters
+  much less. Choose it for the hash power expected at the restart.
+
+### Block version rises on every consensus change
+
+- Status: planned for 2.2.0
+- Consensus: **yes**
+- The block version is the signal other clients read (see "Tell the user when
+  the network has moved on"). It rises with every consensus change, also when
+  the chain restarts, and is never reused. The restarted chain is version 3.
+  `consensus_version` in `jcoin/src/consensus.rs` already selects the version
+  by height.
+
+### Merkle root for transfers
+
+- Status: deferred
+- Consensus: **yes**
+- A block commits to its transfers with one hash over all of them. A Merkle
+  root is needed only for a light client that checks one transfer without the
+  whole block. No such client exists. See `docs/adr/0001-restart-consensus-v2.md`.
+
 ## Unscheduled
+
+Problems and wanted changes that have no version yet.
 
 ### Pending transfers are lost when the node restarts
 
@@ -261,8 +459,6 @@ More detailed block view for the developer view, eg full block view just expands
 - Possible change: store pending transfers in the data folder and reload them
   at startup; keep the sent list across restarts.
 
-Problems that have been observed and have no version yet.
-
 ### Two copies of the app can run on the same data folder
 
 - Consensus: no
@@ -271,23 +467,6 @@ Problems that have been observed and have no version yet.
   downloaded copy and the installed copy make this easier to do by accident.
 - Possible change: a lock in the data folder; a second copy brings the first
   one's window forward and exits.
-
-### Nodes on the same local network connect through the relay
-
-- Consensus: no
-- Found: 2026-11-11. Two nodes on the same LAN (192.168.0.x) connected to each
-  other through the relay. Neither tried the other's LAN address.
-- Not yet investigated.
-
-### Log noise from addresses that cannot be reached
-
-- Consensus: no
-- Found: 2026-11-11. Nodes pass on loopback and private addresses of other
-  machines (`127.0.0.1`, `172.17.0.1`, `::1`) and stale records of old test
-  nodes. Each node then tries to dial them and logs a failure. Most log lines
-  on a fresh start are these failures.
-- Possible change: do not pass on or dial loopback addresses, and drop
-  addresses of peers that have not been reachable for some time.
 
 ### The miner puts at most one transfer in a block
 
@@ -301,9 +480,9 @@ Problems that have been observed and have no version yet.
 - Consensus: no
 - Since 2.1.1, a Windows node dials from a new port, because dialing from the
   listen port fails there (os error 10048). The library's hole-punch dials
-  still use the listen port, so a direct connection from Windows is expected
-  to fail and the node stays on the relay. A fix would be in how the Windows
-  sockets are set up.
+  still use the listen port. A friend's Windows node logged four failed hole
+  punches and one that succeeded, so it works some of the time. A fix would
+  be in how the Windows sockets are set up.
 
 ### The app does not show a transfer that is on its way in
 
@@ -316,16 +495,16 @@ Problems that have been observed and have no version yet.
 - Create a Sentry user auth token (scopes `org:read`, `project:read`,
   `event:read`) and save it to `~/.config/jeffycoin/sentry-token`, so
   `tools/sentry-logs` can read the logs.
+- Add the `SENTRY_AUTH_TOKEN` repository secret, so that crash reports show
+  function names and line numbers.
 - Set up Sentry alerts: one for any crash, one for `reservation_lost` with no
   `reservation_ok` after it. Nothing notifies anyone today.
 - Check the Sentry plan's log quota against the volume once several nodes run
   all day.
-- The relay and the iMac node do not report to Sentry; they log locally only.
-  Decide whether the command-line node and the relay should report too.
-
-- Deploy the 2.1.1 relay program to the Lightsail relay, so that refused
+- Deploy a current relay program to the Lightsail relay, so that refused
   reservations appear in its log.
 - Deploy a current node to the iMac reference node. It still runs a build with
-  the earlier 35-bit genesis and cannot sync with 2.x nodes.
-- Add the `SENTRY_AUTH_TOKEN` repository secret, so that crash reports show
-  function names and line numbers.
+  the earlier 35-bit genesis and cannot sync with 2.x nodes. After 2.2.0 it
+  needs that version.
+- The relay and the iMac node do not report to Sentry; they log locally only.
+  Decide whether the command-line node and the relay should report too.

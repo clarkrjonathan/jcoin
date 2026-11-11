@@ -22,8 +22,8 @@ current sources are `CHANGELOG.md` (what is released), `CHANGELOG-PLANNED.md`
 - Released: `v2.1.2` (tag on `main`, built for Windows and Linux).
 - `main` = `sentry-log-tooling` = `8c09ecd` on GitHub (2.1.2 plus the Sentry
   log reader and skill). The repository is public.
-- Local only, not pushed: branch `logging-plan-2.1.3` (planned-changelog and
-  handoff edits).
+- Local only, not pushed: branch `plan-2.2` (planned-changelog and handoff
+  edits).
 - `initial-vertical` is an old branch name, no longer used. Work goes on a
   descriptive branch, is merged into `main`, and a `v*` tag on `main` starts
   the release build. The tag must equal the version in `app/Cargo.toml`.
@@ -32,8 +32,16 @@ current sources are `CHANGELOG.md` (what is released), `CHANGELOG-PLANNED.md`
 
 - Mainnet (consensus v2, genesis 2026-11-11 00:52 UTC, 28-bit floor) is at
   height 69 since 05:33 UTC. The difficulty rule compounds; see
-  `CHANGELOG-PLANNED.md`, "2.2.0". This needs a consensus fix (activate at
-  height 70, or restart the chain). Jonathan has not decided which.
+  `CHANGELOG-PLANNED.md`, "2.2.0: chain restart" and "Consensus backlog".
+- Decided: **restart the chain** in 2.2.0 (new genesis, block version 3).
+- Decided: **no required updates.** The app never refuses to run or mine
+  because of its version. It prompts harder as evidence from the network
+  grows: refused blocks with a higher version and real proof of work.
+- The next release is 2.2.0. The logging work is planned as 2.2.1, the
+  network and mining view as 2.2.2, wallet and block detail as 2.2.3.
+- Not built yet: any of 2.2.0. The stall questions in "Consensus backlog"
+  (hash power leaving, a fallback, the window size) are to be designed with
+  the difficulty fix, and checked with chain simulation tests.
 
 **What exists now**
 
