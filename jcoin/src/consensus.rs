@@ -41,11 +41,11 @@ pub struct Params {
 
 /// The real network (consensus v2).
 ///
-/// `pow_limit` (top 35 bits zero) is the easy starting point and genesis target.
-/// It was set from a release-build hash-rate measurement (2026-11-10): the launch
-/// field (laptop GPU ~100 MH/s plus CPUs) at 300 s/block needs ~35 leading-zero
-/// bits (ADR 0001). The LWMA retarget absorbs later hash-rate changes, so this
-/// only has to be close.
+/// `pow_limit` (top 28 bits zero) is the easy starting point and genesis target.
+/// It is sized for the weakest launch miner mining alone: the reference node's
+/// CPU (~1 MH/s) at 300 s/block needs ~28 leading-zero bits. Stronger miners
+/// (GPUs measure ~100 MH/s, ~35 bits) are absorbed by the LWMA retarget when
+/// they join, so this only has to be a sane floor (ADR 0001).
 /// `genesis_timestamp` is pinned to the launch time (the v2 genesis cut,
 /// 2026-11-11 00:52 UTC). Every node must build from this exact value or it
 /// derives a different genesis block and rejects the shared chain.
@@ -54,7 +54,7 @@ pub struct Params {
 /// supply is just under `2 * initial_reward * halving_interval` (3,200,000
 /// JEF), about 89% of it minted in year 1.
 pub const MAINNET: Params = Params {
-    pow_limit: limit_with_zero_bits(35),
+    pow_limit: limit_with_zero_bits(28),
     genesis_timestamp: 1_794_358_345, // 2026-11-11 00:52 UTC, the v2 genesis cut
     target_block_time: 300,
     lwma_window: 60,
@@ -141,9 +141,9 @@ mod tests {
     #[test]
     fn limits_have_the_stated_zero_bits() {
         let main = MAINNET.pow_limit;
-        // 35 leading zero bits: bytes 0..4 zero, byte 4 = 0xff >> 3 = 0x1f.
-        assert_eq!(&main[..5], &[0x00, 0x00, 0x00, 0x00, 0x1f]);
-        assert!(main[5..].iter().all(|&b| b == 0xff));
+        // 28 leading zero bits: bytes 0..3 zero, byte 3 = 0xff >> 4 = 0x0f.
+        assert_eq!(&main[..4], &[0x00, 0x00, 0x00, 0x0f]);
+        assert!(main[4..].iter().all(|&b| b == 0xff));
         let reg = REGTEST.pow_limit;
         assert_eq!(&reg[..3], &[0x00, 0x00, 0xff]);
         assert_eq!(limit_with_zero_bits(0), [0xffu8; 32]);

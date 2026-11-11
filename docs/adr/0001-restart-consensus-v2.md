@@ -124,6 +124,11 @@ zero bits, byte 4 = `0x1f`) rather than the hand-written array above, which was
 the raw `hashbench` output for ~34.8 bits. The clean constant matches this ADR's
 pinned "35 bits" decision; the sub-bit difference is absorbed by LWMA.
 
+Launch amendment (2026-11-11): the chain launched at **28 bits**, not 35. The
+reference node (iMac CPU, ~1 MH/s) mines alone at first, and 35 bits would be
+about 9 hours per block for it. 28 bits is about 300 s per block at ~1 MH/s; the
+LWMA retarget hardens it as GPUs join.
+
 The desktop GPU and friends' GPUs are not in the launch field and were not
 reachable to benchmark from here. They do not change `pow_limit`: the LWMA
 retarget (item 1) absorbs them when they join. Each doubling of total hashrate
@@ -175,7 +180,7 @@ set and is not carried forward.
 
 | Parameter | Where | How to decide |
 | --- | --- | --- |
-| `pow_limit` | `consensus::MAINNET` | **pinned: 35 bits** (measured ~100 MH/s launch field) |
+| `pow_limit` | `consensus::MAINNET` | **pinned: 28 bits** (reference node CPU alone, ~1 MH/s; see launch amendment) |
 | LWMA window `N` | new `Params` field | pick in the 60 to 90 range |
 | `MAX_TXS` | body rule in `split_body` | suggest 64 |
 | `genesis_timestamp` | `consensus::MAINNET` | the launch time |
