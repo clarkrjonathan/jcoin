@@ -11,7 +11,7 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
-## 2.2.0 (unreleased)
+## 2.2.0 (2026-11-11)
 
 **The chain restarts.** This release has a new genesis (2026-11-11 19:05 UTC)
 and block version 3. Blocks and coins of the earlier chain are not carried

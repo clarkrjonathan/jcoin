@@ -19,29 +19,27 @@ current sources are `CHANGELOG.md` (what is released), `CHANGELOG-PLANNED.md`
 
 **State of the code**
 
-- Released: `v2.1.2` (tag on `main`, built for Windows and Linux).
-- `main` = `sentry-log-tooling` = `8c09ecd` on GitHub (2.1.2 plus the Sentry
-  log reader and skill). The repository is public.
-- Local only, not pushed: branch `plan-2.2` (planned-changelog and handoff
-  edits).
-- `initial-vertical` is an old branch name, no longer used. Work goes on a
-  descriptive branch, is merged into `main`, and a `v*` tag on `main` starts
-  the release build. The tag must equal the version in `app/Cargo.toml`.
+- Released: `v2.2.0` (tag on `main`): the chain restart. New genesis
+  2026-11-11 19:05 UTC, block version 3, corrected difficulty rule (window
+  30), stall fallback (target doubles 20 minutes after the parent, then every
+  10 minutes), timestamps at most 10 minutes ahead, newer-rules banner.
+- Work goes on a descriptive branch, is merged into `main`, and a `v*` tag on
+  `main` starts the release build. The tag must equal the version in
+  `app/Cargo.toml`. `initial-vertical` is an old branch name, no longer used.
+- Decided by Jonathan: **no required updates.** The app never refuses to run
+  or mine because of its version; it only prompts harder from network
+  evidence.
 
-**The chain is stalled (most urgent)**
+**After the restart**
 
-- Mainnet (consensus v2, genesis 2026-11-11 00:52 UTC, 28-bit floor) is at
-  height 69 since 05:33 UTC. The difficulty rule compounds; see
-  `CHANGELOG-PLANNED.md`, "2.2.0: chain restart" and "Consensus backlog".
-- Decided: **restart the chain** in 2.2.0 (new genesis, block version 3).
-- Decided: **no required updates.** The app never refuses to run or mine
-  because of its version. It prompts harder as evidence from the network
-  grows: refused blocks with a higher version and real proof of work.
-- The next release is 2.2.0. The logging work is planned as 2.2.1, the
-  network and mining view as 2.2.2, wallet and block detail as 2.2.3.
-- Not built yet: any of 2.2.0. The stall questions in "Consensus backlog"
-  (hash power leaving, a fallback, the window size) are to be designed with
-  the difficulty fix, and checked with chain simulation tests.
+- The chain of 2.0.0 to 2.1.2 stalled at height 69 (its difficulty rule
+  compounded). It is abandoned. Clients on 2.1.2 or earlier stay on it and
+  are not prompted; their owners have to be told to update.
+- Next planned: 2.2.1 (logs), 2.2.2 (network and mining view), 2.2.3 (wallet
+  and block detail), 2.3 (graphical overhaul). See `CHANGELOG-PLANNED.md`,
+  including "Consensus backlog".
+- `cargo test --release stall_report -- --ignored --nocapture` in `jcoin/`
+  prints the stall simulations the settings were chosen from.
 
 **What exists now**
 

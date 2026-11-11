@@ -22,23 +22,20 @@ Status values: `planned` (agreed, not started), `in progress`, `done` (merged
 to `main`, waiting for the release), `to design` (the problem is agreed, the
 change is not).
 
-The next release is **2.2.0**. Nothing ships as 2.1.3 or later in the 2.1
-line.
+2.2.0 is released. The next planned release is **2.2.1**.
 
-## 2.2.0: chain restart
+## After 2.2.0 (released 2026-11-11)
 
-Built on branch `consensus-2.2-restart`; not released. The full description
-is in `CHANGELOG.md` under "2.2.0 (unreleased)". Left to do before the tag:
+2.2.0 restarted the chain; see `CHANGELOG.md`. Follow-up that needs no code:
 
-- Status: done, waiting for the release
-- Consensus: **yes**
-- Run the Windows build once (nothing in 2.2.0 has run on Windows).
 - Tell everyone on 2.1.2 or earlier to update; those versions cannot show the
   newer-rules banner.
+- Confirm on a Windows PC: the app starts on the new chain, mines, and the
+  install and update flows work. Nothing in 2.2.0 ran on Windows before the
+  release.
+- Watch the live chain's block times against the simulations (window 30,
+  fallback at 20 minutes).
 - Redeploy the relay and the iMac node (see "Operations").
-- Not built, moved to "Unscheduled": the weaker notice for a heavier chain
-  that has no higher block version, and peers' rule version in the
-  connections list.
 
 ## 2.2.1: logs that answer a question in one query
 
