@@ -23,6 +23,10 @@ KEYS=(noah jon holden imac gpu)
 # noah's REST endpoint. Build it first: (cd ../gpu-miner && cargo build --release)
 GPU_MINER="$D/../gpu-miner/target/release/gpu-miner"
 IMAC_PEER="${IMAC_PEER:-10.0.0.88:8333}"
+# REGTEST=1 runs every node on the regtest network (easy proof of work, blocks in
+# milliseconds) for a fast local test. Default (unset) is MAINNET.
+REGFLAG=""
+[ "${REGTEST:-0}" = 1 ] && REGFLAG="--regtest"
 
 for n in "${KEYS[@]}"; do
   [ -f "$D/keys/${n}_ed25519" ] || $W key new "$n" >/dev/null
@@ -51,7 +55,7 @@ fi
 start_node() { # name rest-port args...
   local n=$1 port=$2; shift 2
   setsid nohup "$BIN/node" --rest-addr "127.0.0.1:$port" --data-dir "$D/data-$n" \
-    --mine --miner "$(addr_of "$n")" --relay "$RELAY" "$@" \
+    --mine --miner "$(addr_of "$n")" --relay "$RELAY" $REGFLAG "$@" \
     > "$D/node-$n.log" 2>&1 < /dev/null &
   echo $! >> "$D/pids"
   sleep 1

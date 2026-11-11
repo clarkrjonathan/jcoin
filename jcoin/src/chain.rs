@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn lwma_holds_difficulty_steady_on_target_and_reads_fast_blocks() {
         // On-target blocks (spaced exactly target_block_time) must not drift the
-        // difficulty: the LWMA of all-300 s solvetimes returns the same target,
+        // difficulty: the LWMA of all-on-target solvetimes returns the same target,
         // so mining stays at pow_limit (and the test stays fast). This exercises
         // the per-block LWMA walk over a full window.
         let mut chain = Chain::new(REGTEST);
@@ -489,7 +489,12 @@ mod tests {
 
         // And the LWMA reads a fast window as harder: feed the helper a weighted
         // average well under target and confirm it tightens below the limit.
-        let faster = retarget(&REGTEST, &REGTEST.pow_limit, 10, REGTEST.target_block_time);
+        let faster = retarget(
+            &REGTEST,
+            &REGTEST.pow_limit,
+            REGTEST.target_block_time / 2,
+            REGTEST.target_block_time,
+        );
         assert!(U256::from_big_endian(&faster) < U256::from_big_endian(&REGTEST.pow_limit));
     }
 

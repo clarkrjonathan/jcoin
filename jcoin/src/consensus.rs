@@ -46,15 +46,16 @@ pub struct Params {
 /// field (laptop GPU ~100 MH/s plus CPUs) at 300 s/block needs ~35 leading-zero
 /// bits (ADR 0001). The LWMA retarget absorbs later hash-rate changes, so this
 /// only has to be close.
-/// `genesis_timestamp` is set to the actual launch time at the genesis cut; the
-/// value here is a placeholder near the planned launch and MUST be refreshed then.
+/// `genesis_timestamp` is pinned to the launch time (the v2 genesis cut,
+/// 2026-11-11 00:52 UTC). Every node must build from this exact value or it
+/// derives a different genesis block and rejects the shared chain.
 /// `halving_interval` = 32,000 blocks, about 111 days at 5-minute blocks, puts
 /// the 33rd halving (where the subsidy reaches zero) at about 10 years. Total
 /// supply is just under `2 * initial_reward * halving_interval` (3,200,000
 /// JEF), about 89% of it minted in year 1.
 pub const MAINNET: Params = Params {
     pow_limit: limit_with_zero_bits(35),
-    genesis_timestamp: 1_763_000_000, // placeholder; set to launch time at the genesis cut
+    genesis_timestamp: 1_794_358_345, // 2026-11-11 00:52 UTC, the v2 genesis cut
     target_block_time: 300,
     lwma_window: 60,
     max_adjust_factor: 4,
@@ -65,12 +66,14 @@ pub const MAINNET: Params = Params {
 
 /// A local test network: the same rules as `MAINNET` with an easy proof of
 /// work (top 16 bits zero, so blocks mine in milliseconds), a zero genesis
-/// timestamp (so tests can use small increasing timestamps), and a short
-/// halving interval (so a test can cross a halving on a real chain).
+/// timestamp (so tests can use small increasing timestamps), a short
+/// `target_block_time` (so a local run settles to a watchable block cadence
+/// instead of ramping up to the 5-minute mainnet target), and a short halving
+/// interval (so a test can cross a halving on a real chain).
 pub const REGTEST: Params = Params {
     pow_limit: limit_with_zero_bits(16),
     genesis_timestamp: 0,
-    target_block_time: 300,
+    target_block_time: 10,
     lwma_window: 12,
     max_adjust_factor: 4,
     median_time_span: 11,
