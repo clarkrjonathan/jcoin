@@ -11,6 +11,66 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.2.0 (unreleased)
+
+**The chain restarts.** This release has a new genesis (2026-11-11 19:05 UTC)
+and block version 3. Blocks and coins of the earlier chain are not carried
+over. Key files stay valid. Every node must update to take part; 2.1.2 and
+earlier stay on the old chain.
+
+### Changed (consensus)
+
+- **Difficulty rule replaced.** The earlier rule scaled the previous block's
+  difficulty by a 60-block average on every block. That compounds: on
+  2026-11-11 the difficulty rose from 28 to 44.8 bits in nine blocks and the
+  chain stalled at height 69. The new rule (`chain::lwma_next_target`) scales
+  the **average** difficulty of the last 30 blocks by their weighted average
+  solve time, so it cannot compound. It adjusts from the first block. One
+  block's solve time counts for at most 30 minutes.
+- **Stall fallback.** If a block's timestamp is 20 minutes after its
+  parent's, its difficulty is halved, and halved again for every 10 minutes
+  after that, down to the starting difficulty. When hash power leaves, the
+  next block arrives in about an hour at worst, in place of hours or days. An
+  eased block carries less work, so a block at normal difficulty at the same
+  height wins.
+- **Timestamps at most 10 minutes ahead.** A node accepts a block only if its
+  timestamp is no more than 10 minutes ahead of the node's clock (it was 2
+  hours). This keeps a miner from claiming the stall fallback with a false
+  timestamp. A computer whose clock is more than 10 minutes slow will refuse
+  current blocks.
+- **Block version 3.** The version rises with every consensus change and is
+  never reused.
+- Starting difficulty stays at 28 leading zero bits.
+
+### Added
+
+- **A banner when the network has moved to newer rules.** A node counts the
+  blocks it refuses that carry a newer block version and real proof of work,
+  and compares their work over 24 hours with its own chain's
+  (`GET /network/signal`). The app shows a notice when any are seen, and a
+  stronger banner when they carry at least as much work as its own chain. The
+  banner can be hidden. Nothing is stopped: there are no required updates.
+- The app reads the release list every 30 minutes while open, not only at
+  startup.
+- Blocks of the earlier chain in the data folder are kept as
+  `blocks-previous-chain.dat`, and the new chain starts empty.
+
+### Fixed
+
+- **The GPU use limit had almost no effect below 100%.** The rest between GPU
+  runs happened in steps of 100 ms, so every setting under 100% rested at
+  least 100 ms per run. It now rests for the computed time.
+
+### Tested
+
+- Simulated chains, 20 random seeds each: a miner 4,096 times faster than the
+  starting difficulty; hash power stepping up 16 times and back; hash power
+  falling to 1/15 and 1/100. Block time settles near 300 s, the difficulty
+  never passes equilibrium by more than about 3 times, and after a 100-fold
+  drop the first block comes within 3 hours and ten blocks within 12 on every
+  seed.
+- Not run on Windows before this release.
+
 ## 2.1.2 (2026-11-11)
 
 ### Fixed

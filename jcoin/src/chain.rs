@@ -155,6 +155,20 @@ impl Chain {
         self.tip
     }
 
+    /// The work of the canonical blocks whose timestamp is `since` or later.
+    pub fn work_since(&self, since: u64) -> U256 {
+        let mut work = U256::zero();
+        let mut cur = &self.blocks[&self.tip];
+        while cur.height > 0 && cur.block.header.timestamp >= since {
+            work = work.saturating_add(block_work(&cur.block.header.target));
+            match self.blocks.get(&cur.block.header.previous_block_hash) {
+                Some(parent) => cur = parent,
+                None => break,
+            }
+        }
+        work
+    }
+
     pub fn tip_height(&self) -> u64 {
         self.blocks[&self.tip].height
     }
@@ -191,6 +205,10 @@ impl Chain {
             target: self.target_for_child(parent_hash),
             // Strictly greater than median-time-past.
             min_timestamp: self.median_time_past(parent_hash).saturating_add(1),
+            parent_timestamp: self.blocks[&parent_hash].block.header.timestamp,
+            stall_grace: self.params.stall_grace,
+            stall_step: self.params.stall_step,
+            pow_limit: self.params.pow_limit,
         }
     }
 
@@ -488,6 +506,16 @@ mod tests {
         }
     }
 
+    /// The real network's difficulty settings (window, cap, stall fallback)
+    /// on a floor that is trivial to mine and simulate.
+    fn mainnet_rule() -> Params {
+        Params {
+            pow_limit: adjusting(1).pow_limit,
+            genesis_timestamp: 0,
+            ..crate::consensus::MAINNET
+        }
+    }
+
     fn bits(target: U256) -> f64 {
         256.0 - (target.bits() as f64 - 1.0)
             - ((target >> target.bits().saturating_sub(53)).as_u64() as f64).log2()
@@ -553,25 +581,16 @@ mod tests {
     /// Mine `blocks` blocks under the rule with hash rate `rate(time, height)`
     /// (hashes per second), with exponentially distributed solve times, as
     /// real mining has. Returns each block's (solve time, target).
+    /// The stall fallback (`p.stall_grace`, `p.stall_step`) applies as it
+    /// does on a real chain: the target a miner works on eases as time passes
+    /// without a block.
     fn simulate(
         p: &Params,
         blocks: usize,
         seed: u64,
         rate: impl Fn(u64, usize) -> f64,
     ) -> Vec<(u64, U256)> {
-        simulate_easing(p, blocks, seed, rate, None)
-    }
-
-    /// `simulate`, with a candidate stall fallback: once a block is `grace`
-    /// seconds after its parent its target doubles, and doubles again every
-    /// `period` seconds after that, up to the limit. `None` is no fallback.
-    fn simulate_easing(
-        p: &Params,
-        blocks: usize,
-        seed: u64,
-        rate: impl Fn(u64, usize) -> f64,
-        easing: Option<(u64, u64)>,
-    ) -> Vec<(u64, U256)> {
+        let easing = (p.stall_grace > 0 && p.stall_step > 0).then_some((p.stall_grace, p.stall_step));
         let limit = U256::from_big_endian(&p.pow_limit);
         let mut rng = Rng(seed);
         let mut samples: std::collections::VecDeque<Sample> = Default::default();
@@ -581,6 +600,7 @@ mod tests {
             let base = U256::from_big_endian(&lwma_next_target(p, &window));
             // Expected hashes = 2^256 / target = 2^(leading zero bits).
             let hash_rate = rate(time, height);
+            #[allow(unused_assignments)]
             let (mut target, mut solve) = (base, 0f64);
             // Mine through the stretches of constant target until a hit.
             let mut stretch = easing.map(|(grace, _)| grace as f64);
@@ -599,6 +619,16 @@ mod tests {
                 }
             }
             let solve = solve.round() as u64;
+            // What the chain would require of a block with this gap.
+            let mut base_bytes = [0u8; 32];
+            base.to_big_endian(&mut base_bytes);
+            let target = U256::from_big_endian(&crate::consensus::eased_target(
+                &base_bytes,
+                &p.pow_limit,
+                p.stall_grace,
+                p.stall_step,
+                solve,
+            ));
             time += solve;
             samples.push_front(Sample { target, solvetime: solve });
             samples.truncate(p.lwma_window as usize);
@@ -620,7 +650,7 @@ mod tests {
     // rule must find the right difficulty and stay there, on every seed.
     #[test]
     fn a_miner_far_faster_than_the_floor_settles_without_running_away() {
-        let p = adjusting(60);
+        let p = mainnet_rule();
         // 8-bit floor = 256 hashes; 2^20 hashes/s is 4096 times too fast, as
         // if the first blocks took 0.07 s. Equilibrium: 300 * 2^20 hashes,
         // about 28.2 bits.
@@ -638,7 +668,7 @@ mod tests {
 
     #[test]
     fn hash_rate_steps_up_and_down_are_followed() {
-        let p = adjusting(60);
+        let p = mainnet_rule();
         let base = 2f64.powi(20);
         // 16x more hash power joins at block 500 and leaves at block 900. Each
         // part is measured over 250 blocks, after 150 blocks to settle.
@@ -676,12 +706,18 @@ mod tests {
         ];
         for (window, cap, easing) in settings {
             for drop in [4.0f64, 15.0, 100.0] {
-                let p = Params { solvetime_cap_factor: cap, ..adjusting(window) };
+                let (grace, step) = easing.unwrap_or((0, 0));
+                let p = Params {
+                    solvetime_cap_factor: cap,
+                    stall_grace: grace,
+                    stall_step: step,
+                    ..adjusting(window)
+                };
                 let (mut first, mut ten, mut recover, mut means, mut sds, mut gaps) =
                     (vec![], vec![], vec![], vec![], vec![], vec![]);
                 for seed in 1..=25 {
                     let rate = |_, h: usize| if h >= 800 { base / drop } else { base };
-                    let run = simulate_easing(&p, 1100, seed, rate, easing);
+                    let run = simulate(&p, 1100, seed, rate);
                     let after = &run[799..];
                     first.push(after[0].0 as f64 / 3600.0);
                     ten.push(after[..10].iter().map(|(s, _)| *s as f64).sum::<f64>() / 3600.0);
@@ -717,6 +753,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    // The case that stalled v2 for hours: most hash power leaves. With the
+    // stall fallback, blocks keep coming and the chain recovers.
+    #[test]
+    fn the_chain_keeps_moving_when_hash_power_leaves() {
+        let p = mainnet_rule();
+        assert!(p.stall_grace > 0, "the real network has the fallback on");
+        let base = 2f64.powi(20);
+        for drop in [15.0f64, 100.0] {
+            let (mut first, mut ten) = (Vec::new(), Vec::new());
+            for seed in 1..=20 {
+                let run = simulate(&p, 1000, seed, |_, h| if h >= 600 { base / drop } else { base });
+                let after = &run[599..];
+                first.push(after[0].0 as f64 / 3600.0);
+                ten.push(after[..10].iter().map(|(s, _)| *s as f64).sum::<f64>() / 3600.0);
+                // And it is back to normal by 250 blocks later.
+                let late = mean_solve(&after[250..]);
+                assert!((225.0..=400.0).contains(&late), "drop {drop} seed {seed}: mean {late}");
+            }
+            let worst = |v: &Vec<f64>| v.iter().cloned().fold(0.0, f64::max);
+            // No single wait of many hours, on any seed. Without the fallback
+            // a 100x drop means about 5 hours to the first block and 2 days
+            // to the tenth.
+            assert!(worst(&first) < 3.0, "drop {drop}: first block after {} h", worst(&first));
+            assert!(worst(&ten) < 12.0, "drop {drop}: ten blocks after {} h", worst(&ten));
+        }
+    }
+
+    // The fallback on a real chain, through `accept`.
+    #[test]
+    fn a_late_block_must_carry_the_eased_target_and_an_early_one_may_not() {
+        let p = Params { stall_grace: 1200, stall_step: 600, ..adjusting(12) };
+        let mut chain = Chain::new(p);
+        let mine = |chain: &Chain, target: [u8; 32], time: u64| {
+            build_and_mine(&chain.tip_header(), chain.tip_state(), p.initial_reward, [1u8; 32], None, target, time)
+                .unwrap()
+                .0
+        };
+        // Fast blocks first, so the base target is harder than the limit and
+        // easing has room.
+        let mut time = p.genesis_timestamp;
+        for _ in 0..12 {
+            time += 5;
+            let ctx = chain.next_context();
+            let block = mine(&chain, ctx.target_at(time), time);
+            assert!(matches!(chain.accept(block), Accept::Stored { .. }));
+        }
+        let ctx = chain.next_context();
+        let base = U256::from_big_endian(&ctx.target);
+        assert!(base * 8 < U256::from_big_endian(&p.pow_limit));
+        assert_eq!(ctx.parent_timestamp, time);
+
+        // 100 s after the parent: only the base target is valid.
+        assert_eq!(ctx.target_at(time + 100), ctx.target);
+        let eased_once = ctx.target_at(time + 1200);
+        assert_eq!(U256::from_big_endian(&eased_once), base * 2);
+        let early_claim = mine(&chain, eased_once, time + 100);
+        assert!(matches!(chain.accept(early_claim), Accept::Invalid(BlockError::WrongTarget)));
+
+        // 30 minutes after the parent: two doublings are required, and the
+        // base target is no longer valid for that timestamp.
+        let late = time + 1800;
+        assert_eq!(U256::from_big_endian(&ctx.target_at(late)), base * 4);
+        let not_eased = mine(&chain, ctx.target, late);
+        assert!(matches!(chain.accept(not_eased), Accept::Invalid(BlockError::WrongTarget)));
+        let eased = mine(&chain, ctx.target_at(late), late);
+        assert!(matches!(chain.accept(eased), Accept::Stored { new_tip: true, .. }));
+
+        // An eased block carries less work than a block at the base target
+        // would, so a normal block at the same height wins the fork.
+        let normal_parent = chain.tip_header().previous_block_hash;
+        let eased_tip = chain.tip_hash();
+        let ctx_again = chain.context_for_child(normal_parent);
+        let parent = chain.blocks[&normal_parent].block.header.clone();
+        let parent_state = chain.blocks[&normal_parent].state.clone();
+        let (normal, _) = build_and_mine(&parent, &parent_state, p.initial_reward, [2u8; 32], None, ctx_again.target, time + 300)
+            .unwrap();
+        assert!(matches!(chain.accept(normal), Accept::Stored { new_tip: true, .. }));
+        assert_ne!(chain.tip_hash(), eased_tip);
     }
 
     // The rule on a real chain: `target_for_child` must feed the same history

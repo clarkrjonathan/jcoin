@@ -18,6 +18,7 @@ pub mod mempool;
 pub mod node;
 pub mod p2p;
 pub mod service;
+pub mod signal;
 pub mod state;
 pub mod store;
 pub mod wallet;

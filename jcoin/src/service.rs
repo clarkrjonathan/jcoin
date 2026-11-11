@@ -165,6 +165,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), String> {
         .route("/balance/{address}", get(balance))
         .route("/chain", get(chain_info))
         .route("/peers", get(peers))
+        .route("/network/signal", get(network_signal))
         .route("/mining/work/{miner}", get(mining_work))
         .route("/mining/submit", post(mining_submit))
         .with_state(state);
@@ -204,6 +205,7 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
             }
         };
         let target_height = header.height;
+        let started = std::time::Instant::now();
 
         // Mine in chunks off the runtime; between chunks, give up if someone
         // else already extended the chain to our target height.
@@ -243,9 +245,18 @@ async fn mine_loop(network: Network, miner: [u8; 32]) {
                     break;
                 }
             }
+            // A template's timestamp fixes its target. Take a new one now and
+            // then, so pending transfers are picked up and, when blocks are
+            // slow, the stall fallback's easier target is used.
+            if started.elapsed() >= TEMPLATE_MAX_AGE {
+                break;
+            }
         }
     }
 }
+
+/// How long the built-in miner works on one template before taking a new one.
+const TEMPLATE_MAX_AGE: Duration = Duration::from_secs(20);
 
 /// A block ready to mine: a header (nonce 0) and the transactions it commits to.
 #[derive(Clone)]
@@ -286,7 +297,9 @@ async fn new_template(
             context.reward,
             miner,
             normal,
-            context.target,
+            // The stall fallback makes the required target depend on the
+            // block's own timestamp.
+            context.target_at(timestamp),
             timestamp,
         )
         .map(|(mut header, transactions, _state)| {
@@ -481,6 +494,42 @@ async fn mining_submit(
         }
     };
     (StatusCode::OK, Json(body))
+}
+
+/// GET /network/signal
+///
+/// Whether blocks with a newer version than this build knows have been seen,
+/// and how their work compares with this node's own chain (see `signal`).
+async fn network_signal(State(state): State<AppState>) -> impl IntoResponse {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .node
+        .send(NodeRequest::GetSignal { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "node core unavailable" })),
+        );
+    }
+    match reply_rx.await {
+        Ok(s) => (
+            StatusCode::OK,
+            Json(json!({
+                "level": s.level.as_str(),
+                "known_version": crate::consensus::LATEST_VERSION,
+                "newest_version": s.newest_version,
+                "blocks": s.blocks,
+                "work_ratio": s.work_ratio,
+                "window_hours": crate::signal::WINDOW / 3600,
+            })),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "no response from node core" })),
+        ),
+    }
 }
 
 /// GET /peers

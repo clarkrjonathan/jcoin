@@ -12,6 +12,8 @@
 //! checks a block against it, and the miner builds from the same value. No
 //! caller derives a consensus input on its own.
 
+use primitive_types::U256;
+
 use crate::amount::COIN;
 
 /// Consensus parameters. Two nodes agree on blocks only if they use the same
@@ -34,6 +36,13 @@ pub struct Params {
     /// can move the difficulty, and sets how fast difficulty falls after hash
     /// power leaves.
     pub solvetime_cap_factor: u64,
+    /// Stall fallback: once a block's timestamp is this many seconds after its
+    /// parent's, its target is doubled (see `eased_target`). `0` turns the
+    /// fallback off.
+    pub stall_grace: u64,
+    /// Stall fallback: after `stall_grace`, the target doubles again every
+    /// this many seconds.
+    pub stall_step: u64,
     /// Number of recent blocks whose median timestamp a new block must exceed.
     pub median_time_span: usize,
     /// Block subsidy at height 1, before any halving (base units).
@@ -42,15 +51,18 @@ pub struct Params {
     pub halving_interval: u64,
 }
 
-/// The real network (consensus v2).
+/// The real network (consensus v3, the chain restarted in release 2.2.0).
 ///
-/// `pow_limit` (top 28 bits zero) is the easy starting point and genesis target.
-/// It is sized for the weakest launch miner mining alone: the reference node's
-/// CPU (~1 MH/s) at 300 s/block needs ~28 leading-zero bits. Stronger miners
-/// (GPUs measure ~100 MH/s, ~35 bits) are absorbed by the LWMA retarget when
-/// they join, so this only has to be a sane floor (ADR 0001).
-/// `genesis_timestamp` is pinned to the launch time (the v2 genesis cut,
-/// 2026-11-11 00:52 UTC). Every node must build from this exact value or it
+/// `pow_limit` (top 28 bits zero) is the easiest difficulty: the starting
+/// point, and the floor the stall fallback can ease down to. It is about 300 s
+/// of work for the weakest node mining alone (a CPU at ~1 MH/s). The
+/// difficulty rule adjusts from the first block (`chain::lwma_next_target`),
+/// so GPUs far faster than this are absorbed within the first window.
+/// `lwma_window` 30, `solvetime_cap_factor` 6, and the stall fallback (target
+/// doubles 20 minutes after the parent, then every 10 minutes) were chosen
+/// from chain simulations; see `CHANGELOG.md`, 2.2.0.
+/// `genesis_timestamp` is pinned to the restart (2026-11-11 19:05 UTC).
+/// Every node must build from this exact value or it
 /// derives a different genesis block and rejects the shared chain.
 /// `halving_interval` = 32,000 blocks, about 111 days at 5-minute blocks, puts
 /// the 33rd halving (where the subsidy reaches zero) at about 10 years. Total
@@ -58,10 +70,12 @@ pub struct Params {
 /// JEF), about 89% of it minted in year 1.
 pub const MAINNET: Params = Params {
     pow_limit: limit_with_zero_bits(28),
-    genesis_timestamp: 1_794_358_345, // 2026-11-11 00:52 UTC, the v2 genesis cut
+    genesis_timestamp: 1_794_423_946, // 2026-11-11 19:05 UTC, the v3 genesis (release 2.2.0)
     target_block_time: 300,
-    lwma_window: 60,
+    lwma_window: 30,
     solvetime_cap_factor: 6,
+    stall_grace: 20 * 60,
+    stall_step: 10 * 60,
     median_time_span: 11,
     initial_reward: 50 * COIN,
     halving_interval: 32_000,
@@ -80,16 +94,26 @@ pub const REGTEST: Params = Params {
     target_block_time: 10,
     lwma_window: 0,
     solvetime_cap_factor: 6,
+    stall_grace: 0,
+    stall_step: 0,
     median_time_span: 11,
     initial_reward: 50 * COIN,
     halving_interval: 150,
 };
 
+/// The newest consensus version this build knows. The version rises with
+/// every consensus change, also when the chain restarts, and is never reused:
+/// other nodes read a higher version in a block as "newer rules exist" (see
+/// `signal`). Version 1 was the first demo chain, version 2 the chain of
+/// releases 2.0.0 to 2.1.2 (its difficulty rule compounded), version 3 the
+/// restarted chain of 2.2.0.
+pub const LATEST_VERSION: u32 = 3;
+
 /// The consensus version a block at `height` must carry. A future rule change
-/// bumps this at a chosen activation height, so nodes validate by the version the
-/// height selects and no restart is needed. v2 is the current (genesis) rule set.
+/// raises this at a chosen activation height, so nodes validate by the version
+/// the height selects and no restart is needed.
 pub const fn consensus_version(_height: u64) -> u32 {
-    2
+    LATEST_VERSION
 }
 
 /// A target whose top `bits` bits are zero and the rest one.
@@ -132,10 +156,65 @@ pub struct BlockContext {
     pub version: u32,
     /// The largest subsidy the coinbase may claim, excluding fees.
     pub reward: u64,
-    /// The exact target the header must carry.
+    /// The target the header must carry if its timestamp is less than
+    /// `stall_grace` after the parent's. A later block may carry an easier
+    /// one: use `target_at` for the exact requirement.
     pub target: [u8; 32],
+    /// The parent block's timestamp.
+    pub parent_timestamp: u64,
+    /// `Params::stall_grace`, `Params::stall_step`, and `Params::pow_limit`,
+    /// carried here so `target_at` needs nothing else.
+    pub stall_grace: u64,
+    pub stall_step: u64,
+    pub pow_limit: [u8; 32],
     /// The smallest allowed timestamp (median-time-past + 1).
     pub min_timestamp: u64,
+}
+
+impl BlockContext {
+    /// The exact target a block with this `timestamp` must carry.
+    pub fn target_at(&self, timestamp: u64) -> [u8; 32] {
+        eased_target(
+            &self.target,
+            &self.pow_limit,
+            self.stall_grace,
+            self.stall_step,
+            timestamp.saturating_sub(self.parent_timestamp),
+        )
+    }
+}
+
+/// The stall fallback. `base` is the target the difficulty rule gives. A
+/// block whose timestamp is `gap` seconds after its parent's must carry:
+///
+/// - `base`, while `gap < grace`;
+/// - `base` doubled once at `gap == grace`, and once more for every `step`
+///   seconds after that, never easier than `limit`.
+///
+/// So when hash power leaves and no block is found, the next block becomes
+/// easier as time passes, and the chain cannot stall for long. With
+/// `grace == 0` (or `step == 0`) the fallback is off.
+///
+/// The gap comes from the block's own timestamp. A node accepts a block only
+/// if that timestamp is at most `block::MAX_FUTURE_DRIFT` ahead of its clock,
+/// and that limit is shorter than `grace` on the real network, so a miner
+/// cannot claim easing for time that has not passed. An eased block also
+/// carries less work, so a block at `base` at the same height wins.
+pub fn eased_target(base: &[u8; 32], limit: &[u8; 32], grace: u64, step: u64, gap: u64) -> [u8; 32] {
+    if grace == 0 || step == 0 || gap < grace {
+        return *base;
+    }
+    let doublings = 1 + (gap - grace) / step;
+    let (base, limit) = (U256::from_big_endian(base), U256::from_big_endian(limit));
+    // Past 255 doublings any target is at the limit.
+    let eased = if doublings > 255 || base.leading_zeros() < doublings as u32 {
+        limit
+    } else {
+        (base << doublings as usize).min(limit)
+    };
+    let mut bytes = [0u8; 32];
+    eased.to_big_endian(&mut bytes);
+    bytes
 }
 
 #[cfg(test)]
@@ -151,6 +230,42 @@ mod tests {
         let reg = REGTEST.pow_limit;
         assert_eq!(&reg[..3], &[0x00, 0x00, 0xff]);
         assert_eq!(limit_with_zero_bits(0), [0xffu8; 32]);
+    }
+
+    #[test]
+    fn the_stall_fallback_doubles_the_target_as_time_passes() {
+        let limit = [0x0fu8; 32];
+        let mut base = [0u8; 32];
+        base[4] = 0x10; // far harder than the limit
+        let at = |gap| U256::from_big_endian(&eased_target(&base, &limit, 1200, 600, gap));
+        let b = U256::from_big_endian(&base);
+        assert_eq!(at(0), b);
+        assert_eq!(at(1199), b);
+        assert_eq!(at(1200), b * 2);
+        assert_eq!(at(1799), b * 2);
+        assert_eq!(at(1800), b * 4);
+        assert_eq!(at(1200 + 600 * 9), b * 1024);
+        // Never easier than the limit, however long the gap.
+        assert_eq!(at(1200 + 600 * 40), U256::from_big_endian(&limit));
+        assert_eq!(at(u64::MAX), U256::from_big_endian(&limit));
+        // Off when either setting is zero.
+        assert_eq!(eased_target(&base, &limit, 0, 600, 99_999), base);
+        assert_eq!(eased_target(&base, &limit, 1200, 0, 99_999), base);
+
+        let ctx = BlockContext {
+            height: 5,
+            version: 3,
+            reward: 0,
+            target: base,
+            min_timestamp: 0,
+            parent_timestamp: 10_000,
+            stall_grace: 1200,
+            stall_step: 600,
+            pow_limit: limit,
+        };
+        assert_eq!(ctx.target_at(10_500), base);
+        assert_eq!(U256::from_big_endian(&ctx.target_at(11_200)), b * 2);
+        assert_eq!(ctx.target_at(9_000), base, "a timestamp before the parent's claims nothing");
     }
 
     #[test]

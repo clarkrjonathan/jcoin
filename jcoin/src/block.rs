@@ -17,7 +17,7 @@ pub const HEADER_LEN: usize = 156;
 /// version that `consensus::consensus_version(height)` selects (via
 /// `BlockContext::version`), so a future rule change activates by height without
 /// a restart. v2 is the current (genesis) rule set.
-pub const BLOCK_VERSION: u32 = 2;
+pub const BLOCK_VERSION: u32 = crate::consensus::LATEST_VERSION;
 
 /// Maximum number of normal transactions in a block body (besides the coinbase).
 /// A v2 body is a coinbase followed by up to `MAX_TXS` normal transactions.
@@ -30,7 +30,12 @@ pub const GENESIS_MARKER: &[u8; 32] = b"I am 21 years old, I love Jeffy!";
 /// receiving node's clock. This is a local admission rule, not consensus: a
 /// block briefly in the future is accepted once the clock catches up, so it is
 /// enforced on receipt, never during deterministic validation or replay.
-pub const MAX_FUTURE_DRIFT: u64 = 2 * 60 * 60;
+///
+/// It is 10 minutes, shorter than the real network's `stall_grace`
+/// (20 minutes), so that a timestamp set ahead of the clock cannot claim the
+/// stall fallback's easier target (see `consensus::eased_target`). A node
+/// whose clock is more than 10 minutes slow will refuse current blocks.
+pub const MAX_FUTURE_DRIFT: u64 = 10 * 60;
 
 /// A block header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,7 +259,7 @@ impl Block {
         if self.header.previous_block_hash != parent.block_hash() {
             return Err(BlockError::BadParentHash);
         }
-        if self.header.target != ctx.target {
+        if self.header.target != ctx.target_at(self.header.timestamp) {
             return Err(BlockError::WrongTarget);
         }
         if self.header.timestamp < ctx.min_timestamp {
@@ -400,6 +405,10 @@ mod tests {
             reward,
             target: *target,
             min_timestamp: 0,
+            parent_timestamp: 0,
+            stall_grace: 0,
+            stall_step: 0,
+            pow_limit: *target,
         };
         block.validate_and_apply(parent, state, &ctx)
     }
@@ -552,6 +561,10 @@ mod tests {
             reward: REGTEST.initial_reward,
             target: REGTEST.pow_limit,
             min_timestamp,
+            parent_timestamp: 0,
+            stall_grace: 0,
+            stall_step: 0,
+            pow_limit: [0xff; 32],
         };
         assert!(block.validate_and_apply(&genesis.header, &state, &ctx(50)).is_ok());
         assert_eq!(

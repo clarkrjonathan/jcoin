@@ -27,111 +27,18 @@ line.
 
 ## 2.2.0: chain restart
 
-A consensus release. The chain restarts with a new genesis and block version
-3. Coins mined on the stalled chain are not carried over. Key files stay
-valid.
+Built on branch `consensus-2.2-restart`; not released. The full description
+is in `CHANGELOG.md` under "2.2.0 (unreleased)". Left to do before the tag:
 
-### The difficulty rule compounds and stalls the chain
-
-- Status: in progress on branch `consensus-2.2-restart`. The rule and its
-  tests are written; the genesis is not cut. Urgent: the chain is stalled.
+- Status: done, waiting for the release
 - Consensus: **yes**
-- Found: 2026-11-11. The chain reached height 69 at 05:33 UTC and produced no
-  block for more than 8 hours, with about 2.1 GH/s mining. Difficulty went
-  from 28 to 44.8 leading zero bits (about 110,000 times harder) in 9 blocks.
-  Two GPUs joining explains about 4 bits, not 17.
-- Cause: the rule in `chain.rs` `target_for_child` is not an LWMA. It
-  multiplies the **parent's** target by (weighted average solve time of the
-  last 60 blocks / 300 s), every block. The 60-block average changes slowly,
-  so while it is below 300 s the difficulty is multiplied again on every
-  block, by up to 4. The first 60 blocks were mined at the 28-bit floor in a
-  second or two each, so the average stayed under 300 s for 12 more blocks and
-  the difficulty rose 4x per block: 30, 32, 34, 36, 38, 40, 42, 43.6, 44.8
-  bits. Blocks 63 to 69 took 128 s to 5,672 s each, far over the target, and
-  the difficulty still rose.
-- It also does not settle. Once slow blocks fill the window the same rule
-  divides the difficulty by up to 4 per block until it hits the floor, then
-  the cycle repeats. The regtest demo stalled at height 99 the same way.
-- Contributing: blocks 1 to 60 use the floor with no adjustment
-  (`height <= lwma_window`), and the 28-bit floor is about 2 seconds of work
-  for a laptop GPU, so the window filled with near-zero solve times.
-- Planned change:
-  - Use the real LWMA: next target = (average of the **targets** of the last
-    N blocks) x (weighted sum of their solve times) / (N(N+1)/2 x 300 s). The
-    average target anchors the result, so it does not compound.
-  - Adjust from the first blocks, with a window that grows up to N, in place
-    of 60 blocks at the floor.
-  - Tests that simulate a chain: a miner far faster than the floor, a hash
-    rate step up and down, and a miner leaving. Each must settle near 300 s
-    and never run away. The current tests only check one adjustment step.
-- Built: `chain::lwma_next_target` (the rule as a function of recent targets
-  and solve times) and `target_for_child` feeding it. Missing history counts
-  as blocks at the limit that took 300 s, so the rule works from block 1. A
-  solve time counts for at most 6 x 300 s. Tests: exact cases, a simulated
-  miner 4,096 times faster than the floor, a 16x step up and down (20 seeds
-  each), and a real chain through `accept`. In simulation the block time
-  settles at 302 s and the difficulty never passes equilibrium by more than
-  1.5 bits.
-- `REGTEST` now has no adjustment (`lwma_window` 0), like Bitcoin's regtest,
-  so tests can mine at the limit with any timestamps.
-- Decided 2026-11-11: restart the chain, in place of activating the fix at a
-  height on the stalled chain.
-- Open points: see "Consensus backlog" for the questions that are designed
-  together with this rule (hash power leaving, a fallback against stalls, the
-  window size, the starting difficulty).
-
-### Tell the user when the network has moved on
-
-- Status: planned
-- Consensus: no (it is about how a client learns of a consensus change)
-- Source: Jonathan's notes, 2026-11-11
-- Problem: a client on an older version cannot follow a consensus change. It
-  keeps its own chain, refuses every block of the new one, and says so
-  nowhere. Its only hint is the line "A newer version is available" in the
-  Updates section, checked once at startup. A client left open never checks
-  again.
-- Decided 2026-11-11: **no required updates.** The app never refuses to run
-  or to mine because of its version. A flag on the release page that stops
-  old clients would make one party decide consensus. A client on old rules
-  that keeps mining is the system working as designed. The app prompts more
-  strongly as the evidence grows; it does not force.
-- Planned change: take the evidence from the network.
-  - **Higher block version.** The block version rises on every consensus
-    change and is never reused (see "Consensus backlog"). When a client
-    refuses a block because its version is higher than any it knows, and the
-    block's header meets the target the header states, that is proof of work
-    spent on newer rules. The client can check this without knowing the newer
-    rules, for a fork of its own chain and for a chain with another genesis.
-  - **Weight by proof of work.** The client adds up the work of those
-    headers and compares it with the recent work on its own chain. Any such
-    block gives a notice in the Updates section. Once the work is comparable
-    to or larger than its own chain's, the app shows a banner at the top of
-    the window: newer rules are in use and carry more work than this chain;
-    update. The banner has the update button, can be dismissed for the
-    session, and never stops mining.
-  - **Heavier chain without a higher version.** A refused chain that carries
-    much more work but no higher version gets a weaker notice ("a heavier
-    chain exists that this version cannot read"). More work alone does not
-    say which side is right, and on a small chain one GPU can produce it.
-  - **Update check on a timer.** The app checks the release list at startup
-    and every 30 minutes, as information for the notices above.
-  - **Peers' rule version in the connections list**, so the Developer section
-    shows which peers run other rules. Lower priority.
-- Not done on purpose: separate discovery for each chain. It would hide the
-  new chain's blocks from old clients, and then they would never see the
-  signal. Nodes of the old and new chain keep connecting to each other.
-- Limit: 2.1.2 and earlier cannot show any of this. For this restart, the
-  people running them have to be told to update.
-
-### Old chain data is moved aside
-
-- Status: planned
-- Consensus: no
-- Problem: 2.2.0 starts a new chain, and the data folder holds the stalled
-  chain's `blocks.dat`.
-- Planned change: on first start, 2.2.0 renames the old file
-  (`blocks-v2-stalled.dat`) and starts the new chain. Key files are not
-  touched. Balances start at zero.
+- Run the Windows build once (nothing in 2.2.0 has run on Windows).
+- Tell everyone on 2.1.2 or earlier to update; those versions cannot show the
+  newer-rules banner.
+- Redeploy the relay and the iMac node (see "Operations").
+- Not built, moved to "Unscheduled": the weaker notice for a heavier chain
+  that has no higher block version, and peers' rule version in the
+  connections list.
 
 ## 2.2.1: logs that answer a question in one query
 
@@ -273,7 +180,8 @@ is missing. None of this changes consensus.
 
 ### The GPU use limit has no effect below 100%
 
-- Status: planned
+- Status: fixed in 2.2.0 (the rest loop now sleeps for the computed time).
+  Still to do here: measure the hash rate through the mining loop in the app
 - Consensus: no
 - Source: Jonathan's note, 2026-11-11
 - Found: in the app, every setting below 100% gives about the same hash rate,
@@ -361,17 +269,17 @@ under that version; this list says where each question stands.
 
 | Question | Stands |
 | --- | --- |
-| The difficulty rule compounds | Planned for 2.2.0 (entry under 2.2.0) |
-| Hash power leaves and the chain stalls | To design, with 2.2.0 |
-| A fallback against stalls of hours | To design, with 2.2.0 |
-| Adjust every block or by epoch | To design, with 2.2.0 |
-| Starting difficulty | Open, with 2.2.0 |
-| Block version rises on every change | Planned for 2.2.0 |
+| The difficulty rule compounds | Fixed in 2.2.0 |
+| Hash power leaves and the chain stalls | Addressed in 2.2.0 by the fallback |
+| A fallback against stalls of hours | Decided and built in 2.2.0 |
+| Adjust every block or by epoch | Decided in 2.2.0: every block, window of 30 |
+| Starting difficulty | Decided in 2.2.0: 28 bits |
+| Block version rises on every change | Built in 2.2.0 (version 3) |
 | Merkle root for transfers | Deferred |
 
 ### Hash power leaves and the chain stalls
 
-- Status: to design, with 2.2.0
+- Status: addressed in 2.2.0 by the stall fallback; watch on the live chain
 - Consensus: **yes**
 - Source: Jonathan's note, 2026-11-11
 - Problem: friends mined with strong GPUs and then turned them off. The
@@ -388,7 +296,7 @@ under that version; this list says where each question stands.
 
 ### A fallback against stalls of hours
 
-- Status: to design, with 2.2.0
+- Status: decided 2026-11-11 and built in 2.2.0
 - Consensus: **yes**
 - Source: Jonathan's note, 2026-11-11
 - Question: is there a safe way to fall back to a lower difficulty when no
@@ -431,12 +339,16 @@ under that version; this list says where each question stands.
   the limit below the 20-minute grace period (for example 10 minutes) a
   timestamp alone claims nothing. An eased block also carries less work, so
   a block at normal difficulty at the same height wins.
-- Recommendation, not yet decided: window 30, fallback "x2 at 20 min, then
-  each 10 min", future-drift limit 10 minutes.
+- Decided 2026-11-11 (Jonathan): window 30; the target doubles 20 minutes
+  after the parent and again every 10 minutes; nodes accept a timestamp at
+  most 10 minutes ahead of their clock. Built as `consensus::eased_target`,
+  `Params::stall_grace` / `stall_step`, and `block::MAX_FUTURE_DRIFT`.
+- Known cost: a node whose clock is more than 10 minutes slow refuses current
+  blocks.
 
 ### Adjust every block or by epoch
 
-- Status: to design, with 2.2.0
+- Status: decided in 2.2.0: every block, from a window of 30
 - Consensus: **yes**
 - Source: Jonathan's note, 2026-11-11
 - Question: adjusting from a single block lets one lucky block move the
@@ -448,21 +360,24 @@ under that version; this list says where each question stands.
   the gap, and a real change in hash power is followed within a part of the
   window. What the chain ran in 2.0.0 to 2.1.2 was neither: it applied a
   window average to the parent's difficulty on every block, which compounds.
-- Open point: the window size N. A smaller N follows changes faster and is
-  moved more by luck. 60 was the value in use.
+- Window size: 30, chosen from the stall simulations (faster recovery; the
+  difficulty wanders about 0.28 bits with constant hash power, against 0.18
+  at 60).
 
 ### Starting difficulty
 
-- Status: open, with 2.2.0
+- Status: decided in 2.2.0: 28 leading zero bits
 - Consensus: **yes** (it is part of the genesis)
 - Problem: the floor has been wrong in both directions. 35 bits was hours of
   work for the weakest node; 28 bits was 2 seconds for a laptop GPU.
 - With a rule that adjusts from the first block, the starting value matters
-  much less. Choose it for the hash power expected at the restart.
+  much less. It is also the easiest difficulty the stall fallback can reach,
+  so it is set for the weakest node mining alone: 28 bits is about 300 s for
+  a CPU at 1 MH/s.
 
 ### Block version rises on every consensus change
 
-- Status: planned for 2.2.0
+- Status: built in 2.2.0
 - Consensus: **yes**
 - The block version is the signal other clients read (see "Tell the user when
   the network has moved on"). It rises with every consensus change, also when
@@ -481,6 +396,23 @@ under that version; this list says where each question stands.
 ## Unscheduled
 
 Problems and wanted changes that have no version yet.
+
+### A notice for a heavier chain without a higher block version
+
+- Consensus: no
+- Source: Jonathan's note, 2026-11-11
+- 2.2.0 counts refused blocks that carry a **higher version**. A refused
+  chain with much more work and the same version gets no notice yet. The
+  difficulty: a block whose parent is unknown is also what a node sees
+  during ordinary sync, so it cannot be counted as evidence by itself.
+- Possible change: count such blocks only when they stay unconnected after a
+  sync attempt, and show a weaker notice.
+
+### Peers' rule version in the connections list
+
+- Consensus: no
+- Show which peers run other rules. Needs the version in the handshake (a
+  protocol addition).
 
 ### Pending transfers are lost when the node restarts
 

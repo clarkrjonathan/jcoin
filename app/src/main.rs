@@ -57,6 +57,8 @@ struct App {
     device: String,
     device_result: Option<Result<String, String>>,
     install: Install,
+    /// The "newer rules" banner was hidden for this session.
+    rules_banner_hidden: bool,
 }
 
 /// Where this copy of the program stands relative to the installed one.
@@ -122,7 +124,13 @@ struct Updates {
     state: Arc<Mutex<UpdateState>>,
     /// Index of the selected release in the list.
     selected: usize,
+    /// When the release list was last asked for.
+    checked: std::cell::Cell<std::time::Instant>,
 }
+
+/// How often the release list is read again while the app stays open. The
+/// result is information for the user; nothing is installed or stopped by it.
+const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
 
 impl Updates {
     fn start() -> Updates {
@@ -130,12 +138,33 @@ impl Updates {
         let updates = Updates {
             state: Arc::new(Mutex::new(UpdateState::Checking)),
             selected: 0,
+            checked: std::cell::Cell::new(std::time::Instant::now()),
         };
         updates.check();
         updates
     }
 
+    /// Read the release list again if it is due and nothing is in progress.
+    fn check_if_due(&self) {
+        let idle = matches!(
+            *self.state.lock().unwrap(),
+            UpdateState::Listed(_) | UpdateState::Failed(_)
+        );
+        if idle && self.checked.get().elapsed() >= UPDATE_CHECK_EVERY {
+            self.check();
+        }
+    }
+
+    /// The newest release, if it is newer than this build.
+    fn newer_release(&self) -> Option<String> {
+        match &*self.state.lock().unwrap() {
+            UpdateState::Listed(list) => list.first().filter(|r| r.is_newer()).map(|r| r.tag.clone()),
+            _ => None,
+        }
+    }
+
     fn check(&self) {
+        self.checked.set(std::time::Instant::now());
         let state = self.state.clone();
         *state.lock().unwrap() = UpdateState::Checking;
         std::thread::spawn(move || {
@@ -186,6 +215,7 @@ impl App {
             device,
             device_result: None,
             install,
+            rules_banner_hidden: false,
         }
     }
 }
@@ -207,6 +237,13 @@ impl eframe::App for App {
                     }
                 };
                 backend.pump_miner();
+                self.updates.check_if_due();
+                newer_rules_banner(
+                    ui,
+                    &backend.view().signal,
+                    self.updates.newer_release(),
+                    &mut self.rules_banner_hidden,
+                );
                 install_banner(ui, &mut self.install);
                 if backend.settings.regtest {
                     ui.colored_label(ui.visuals().warn_fg_color, "Test network (regtest)");
@@ -249,6 +286,54 @@ impl eframe::App for App {
             });
         });
     }
+}
+
+/// Shown at the top when other nodes mine blocks with a newer version than
+/// this build knows. It advises; it never stops mining or anything else.
+/// `notice`: some such blocks were seen. `strong`: they carry at least as much
+/// work as this node's own chain did in the last 24 hours.
+fn newer_rules_banner(
+    ui: &mut egui::Ui,
+    signal: &backend::NewerRules,
+    newer_release: Option<String>,
+    hidden: &mut bool,
+) {
+    let strong = signal.level == "strong";
+    if !(strong || signal.level == "notice") || *hidden {
+        return;
+    }
+    let update = match &newer_release {
+        Some(tag) => format!("Version {tag} is available in the Updates section below."),
+        None => "No newer release is listed yet; check the Updates section later.".to_string(),
+    };
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        if strong {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                egui::RichText::new("Most of the network has moved to newer rules").strong(),
+            );
+            ui.label(format!(
+                "In the last 24 hours, blocks with rule version {} carried {} the work of the chain this app follows. This version (rules {}) cannot read them, so it is on a different chain from those nodes. Update to rejoin them. Mining continues on this chain until you do.",
+                signal.newest_version,
+                if signal.work_ratio >= 100.0 {
+                    "over 100 times".to_string()
+                } else {
+                    format!("{:.1} times", signal.work_ratio)
+                },
+                signal.known_version,
+            ));
+        } else {
+            ui.label(format!(
+                "Some nodes are using newer rules: {} block(s) with rule version {} were seen in the last 24 hours, and this version knows rules up to {}. An update may be needed soon.",
+                signal.blocks, signal.newest_version, signal.known_version,
+            ));
+        }
+        ui.label(update);
+        if ui.small_button("Hide for now").clicked() {
+            *hidden = true;
+        }
+    });
+    ui.add_space(8.0);
 }
 
 /// Shown at the top when this copy is not the installed one: offers to

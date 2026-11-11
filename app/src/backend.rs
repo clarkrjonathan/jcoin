@@ -126,8 +126,25 @@ pub struct NodeView {
     /// This node's own addresses, as it advertises them.
     pub advertised: Vec<String>,
     pub connections: Vec<Connection>,
+    /// Evidence that the network follows newer rules than this build knows.
+    pub signal: NewerRules,
     /// Set if the node stopped (for example, its ports could not be opened).
     pub fatal: Option<String>,
+}
+
+/// What `GET /network/signal` reports: blocks with a newer version than this
+/// build knows, seen in the last 24 hours.
+#[derive(Clone, Default, PartialEq)]
+pub struct NewerRules {
+    /// `none`, `notice`, or `strong` (empty before the first reply).
+    pub level: String,
+    /// The highest block version seen.
+    pub newest_version: u64,
+    /// The version this build knows.
+    pub known_version: u64,
+    pub blocks: u64,
+    /// Their work divided by this node's own chain's work in the window.
+    pub work_ratio: f64,
 }
 
 /// One open connection, as `GET /peers` reports it.
@@ -679,6 +696,7 @@ fn spawn_poller(
         let chain = get("/chain".to_string());
         let account = get(format!("/balance/{polled}"));
         let peers = get("/peers".to_string());
+        let signal = get("/network/signal".to_string());
         {
             let mut v = view.lock().unwrap();
             if let Some(c) = &chain {
@@ -686,6 +704,15 @@ fn spawn_poller(
                 v.height = c["height"].as_u64().unwrap_or(0);
                 v.peers = c["peers"].as_u64().unwrap_or(0);
                 v.target = c["target"].as_str().unwrap_or_default().to_string();
+            }
+            if let Some(g) = &signal {
+                v.signal = NewerRules {
+                    level: g["level"].as_str().unwrap_or_default().to_string(),
+                    newest_version: g["newest_version"].as_u64().unwrap_or(0),
+                    known_version: g["known_version"].as_u64().unwrap_or(0),
+                    blocks: g["blocks"].as_u64().unwrap_or(0),
+                    work_ratio: g["work_ratio"].as_f64().unwrap_or(0.0),
+                };
             }
             if let Some(p) = &peers {
                 let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();

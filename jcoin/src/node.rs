@@ -50,6 +50,10 @@ pub enum NodeRequest {
     GetChainInfo {
         reply: oneshot::Sender<ChainInfo>,
     },
+    /// Evidence that the network follows newer rules (see `signal`).
+    GetSignal {
+        reply: oneshot::Sender<crate::signal::Summary>,
+    },
     /// A block locator for the canonical tip (for syncing from a peer).
     GetLocator {
         reply: oneshot::Sender<Vec<[u8; 32]>>,
@@ -129,6 +133,8 @@ pub async fn run_node(
     let mut chain = Chain::new(params);
     let mut mempool = Mempool::new(MAX_MEMPOOL);
     let mut seen_tx = SeenCache::new(SEEN_CAPACITY);
+    let mut signals = crate::signal::Signals::default();
+    let mut signal_level = crate::signal::Level::None;
 
     // Replay persisted blocks (if any) and open the log for appending.
     let mut log: Option<BlockLog> = None;
@@ -157,13 +163,33 @@ pub async fn run_node(
                         }
                     }
                 }
-                if rejected > 0 {
+                if count > 0 && rejected == count {
+                    // Nothing in the file belongs to this chain: it was
+                    // written under other rules (a chain restart). Keep it
+                    // under another name and start this chain's file empty.
+                    let aside = (0..)
+                        .map(|i| match i {
+                            0 => dir.join("blocks-previous-chain.dat"),
+                            i => dir.join(format!("blocks-previous-chain-{i}.dat")),
+                        })
+                        .find(|candidate| !candidate.exists())
+                        .expect("an unused file name exists");
+                    match std::fs::rename(&path, &aside) {
+                        Ok(()) => crate::log_info!(
+                            "[store] {count} stored blocks are from another chain; kept as {} and starting empty",
+                            aside.display()
+                        ),
+                        Err(e) => crate::log_error!(
+                            "[store] {count} stored blocks are from another chain and could not be moved aside: {e}"
+                        ),
+                    }
+                } else if rejected > 0 {
                     crate::log_error!(
                         "[store] replay rejected {rejected} of {count} blocks \
                          (consensus rules changed since they were written?)"
                     );
                 }
-                if count > 0 {
+                if count > 0 && rejected < count {
                     crate::log_info!("[store] replayed {count} blocks; tip height {}", chain.tip_height());
                 }
             }
@@ -231,6 +257,30 @@ pub async fn run_node(
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
+                // A block with a newer version and real proof of work says
+                // the network has rules this build does not know. Note it,
+                // then handle the block as usual (it will be refused).
+                if signals.observe(chain.params(), &block.header, now) {
+                    let since = now.saturating_sub(crate::signal::WINDOW);
+                    let summary = signals.summary(now, chain.work_since(since));
+                    if summary.blocks == 1 {
+                        crate::log_info!(
+                            "[chain] saw a block with version {} (this build knows up to {}); newer rules are in use",
+                            block.header.version,
+                            crate::consensus::LATEST_VERSION
+                        );
+                    }
+                    if summary.level == crate::signal::Level::Strong
+                        && signal_level != crate::signal::Level::Strong
+                    {
+                        crate::log_error!(
+                            "[chain] newer rules (version {}) carried {:.1} times this chain's work in the last 24 hours; this build should be updated",
+                            summary.newest_version,
+                            summary.work_ratio
+                        );
+                    }
+                    signal_level = summary.level;
+                }
                 if block.header.timestamp > now.saturating_add(MAX_FUTURE_DRIFT) {
                     let _ = reply.send(BlockOutcome::Rejected {
                         reason: "timestamp too far in the future".to_string(),
@@ -289,6 +339,15 @@ pub async fn run_node(
                     tip_hash: chain.tip_hash(),
                     tip_target: chain.tip_header().target,
                 });
+            }
+
+            NodeRequest::GetSignal { reply } => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let since = now.saturating_sub(crate::signal::WINDOW);
+                let _ = reply.send(signals.summary(now, chain.work_since(since)));
             }
 
             NodeRequest::GetLocator { reply } => {
@@ -607,5 +666,90 @@ mod tests {
         run2.await.unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+    // A block with a newer version and real proof of work is refused as
+    // usual, and is counted as evidence that newer rules are in use.
+    #[tokio::test]
+    async fn a_newer_version_block_is_refused_and_counted() {
+        use crate::block::mine_chunk;
+        use crate::signal::Level;
+
+        let (core, rx) = mpsc::channel(8);
+        tokio::spawn(run_node(rx, None, REGTEST));
+        let signal = |core: mpsc::Sender<NodeRequest>| async move {
+            let (reply, rx) = oneshot::channel();
+            core.send(NodeRequest::GetSignal { reply }).await.unwrap();
+            rx.await.unwrap()
+        };
+        assert_eq!(signal(core.clone()).await.level, Level::None);
+
+        let genesis = Block::genesis(&REGTEST);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        for i in 0..3u64 {
+            let (mut block, _) = build_and_mine(
+                &genesis.header,
+                &State::new(),
+                REGTEST.initial_reward,
+                [7u8; 32],
+                None,
+                REGTEST.pow_limit,
+                now - 10 + i,
+            )
+            .unwrap();
+            block.header.version = crate::consensus::LATEST_VERSION + 1;
+            block.header.nonce = 0;
+            while !mine_chunk(&mut block.header, 1 << 20) {}
+            assert!(matches!(submit_block(&core, block).await, BlockOutcome::Rejected { .. }));
+        }
+        let seen = signal(core.clone()).await;
+        assert_eq!(seen.blocks, 3);
+        assert_eq!(seen.newest_version, crate::consensus::LATEST_VERSION + 1);
+        // This node's own chain found nothing in the window, so the newer
+        // rules carry more work.
+        assert_eq!(seen.level, Level::Strong);
+    }
+
+    // A data folder holding another chain's blocks (a chain restart): the
+    // file is kept under another name and this chain starts empty.
+    #[tokio::test]
+    async fn blocks_from_another_chain_are_moved_aside() {
+        let dir = std::env::temp_dir().join(format!("jcoin-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Blocks of a chain with a different genesis.
+        let other = Params { genesis_timestamp: 12345, ..REGTEST };
+        let other_genesis = Block::genesis(&other);
+        let (b1, state) = build_and_mine(
+            &other_genesis.header, &State::new(), other.initial_reward, [3u8; 32], None, other.pow_limit, 12346,
+        )
+        .unwrap();
+        let (b2, _) = build_and_mine(&b1.header, &state, other.initial_reward, [3u8; 32], None, other.pow_limit, 12347)
+            .unwrap();
+        {
+            let mut log = BlockLog::open(&dir.join("blocks.dat")).unwrap();
+            log.append(&b1).unwrap();
+            log.append(&b2).unwrap();
+        }
+
+        let (core, rx) = mpsc::channel(8);
+        let run = tokio::spawn(run_node(rx, Some(dir.clone()), REGTEST));
+        let (reply, info) = oneshot::channel();
+        core.send(NodeRequest::GetChainInfo { reply }).await.unwrap();
+        assert_eq!(info.await.unwrap().height, 0);
+
+        // The old file is kept; a block of this chain is stored in a new one.
+        let aside = dir.join("blocks-previous-chain.dat");
+        assert_eq!(load_and_repair(&aside).unwrap().blocks.len(), 2);
+        let genesis = Block::genesis(&REGTEST);
+        let (mine, _) = build_and_mine(
+            &genesis.header, &State::new(), REGTEST.initial_reward, [1u8; 32], None, REGTEST.pow_limit, 1,
+        )
+        .unwrap();
+        assert!(matches!(submit_block(&core, mine).await, BlockOutcome::Accepted { .. }));
+        drop(core);
+        run.await.unwrap();
+        assert_eq!(load_and_repair(&dir.join("blocks.dat")).unwrap().blocks.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

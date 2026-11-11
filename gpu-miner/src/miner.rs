@@ -105,11 +105,18 @@ impl MinerControl {
         }
     }
 
-    /// Sleep for `total`, waking early when asked to stop.
+    /// Sleep for `total`, waking early when asked to stop. Sleeps in steps
+    /// of at most 100 ms and never past the end: a rest of 10 ms takes 10 ms.
+    /// (Until 2.1.2 every step was a full 100 ms, so any GPU use limit below
+    /// 100% rested at least 100 ms per dispatch and they all behaved alike.)
     fn pause(&self, total: Duration) {
         let end = Instant::now() + total;
-        while !self.stopped() && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(100));
+        while !self.stopped() {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(100)));
         }
     }
 }
@@ -313,6 +320,22 @@ mod tests {
         // Out-of-range values are clamped, never a division by zero.
         assert_eq!(rest_after(busy, 0), rest_after(busy, 1));
         assert_eq!(rest_after(busy, 500), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_pause_lasts_as_long_as_asked_not_a_fixed_step() {
+        let control = MinerControl::default();
+        for millis in [0u64, 10, 30, 90, 250] {
+            let start = Instant::now();
+            control.pause(Duration::from_millis(millis));
+            let took = start.elapsed().as_millis() as u64;
+            assert!(took >= millis && took < millis + 40, "{millis} ms pause took {took} ms");
+        }
+        // A stop request ends a long pause early.
+        control.stop();
+        let start = Instant::now();
+        control.pause(Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_millis(50));
     }
 
     #[test]
