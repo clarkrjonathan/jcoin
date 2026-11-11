@@ -762,7 +762,7 @@ fn developer_section(
         ui.label("This app sends its log and crash reports to the developer, to find problems. They hold addresses and network details, never secret keys.");
         ui.horizontal(|ui| {
             ui.label("Label for this computer");
-            ui.add(egui::TextEdit::singleline(device).desired_width(160.0).hint_text("for example: Noah desktop"));
+            ui.add(egui::TextEdit::singleline(device).desired_width(160.0).hint_text("for example: Jons Desktop"));
             if ui.button("Save").clicked() {
                 *device_result = Some(telemetry::set_device_name(&backend.settings.data_dir, device));
                 if let Some(Ok(saved)) = device_result {
