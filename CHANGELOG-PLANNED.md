@@ -491,3 +491,8 @@ Problems and wanted changes that have no version yet.
   needs that version.
 - The relay and the iMac node do not report to Sentry; they log locally only.
   Decide whether the command-line node and the relay should report too.
+- The `readme-releases` workflow fills the "Latest releases" table in
+  `README.md` from the GitHub Releases on a release change or manual dispatch,
+  and pushes the result to `main`. For its push to land, `main`'s branch
+  protection must let `github-actions[bot]` commit (or run it by hand). Run it
+  once (Actions → readme-releases → Run workflow) to populate the table.

@@ -1,0 +1,87 @@
+name: readme-releases
+
+# Keep the "Latest releases" list in README.md in step with the GitHub Releases.
+# The release workflow (release.yml) publishes a Release for every `v*` tag; this
+# rewrites only the block between the RELEASES markers in README.md and commits
+# the change to main when the list actually changed. Runs on a release change and
+# on manual dispatch.
+
+on:
+  release:
+    types: [published, edited, deleted, released]
+  workflow_dispatch:
+
+permissions:
+  contents: write # to commit the updated README to main
+
+# One run at a time, so two release events cannot race to push README.md.
+concurrency:
+  group: readme-releases
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main # always update the README on main, whatever triggered the run
+
+      - name: Render the latest releases into README.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          start="<!-- RELEASES:START -->"
+          end="<!-- RELEASES:END -->"
+          if ! grep -qF "$start" README.md || ! grep -qF "$end" README.md; then
+            echo "::warning::README.md has no RELEASES markers; nothing to fill."
+            exit 0
+          fi
+
+          # Newest five published releases (the API returns newest first). Drafts
+          # are excluded; the JeffyCoin release workflow never marks a prerelease,
+          # so these are the real downloads.
+          rows="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=5" \
+            --jq '[ .[] | select(.draft == false) ]
+                  | map("| [\(.tag_name)](\(.html_url)) | \(.published_at[0:10]) | \(.name // .tag_name) |")
+                  | .[]')"
+
+          {
+            echo "$start"
+            if [ -n "$rows" ]; then
+              echo "| Version | Date | Name |"
+              echo "| --- | --- | --- |"
+              echo "$rows"
+            else
+              echo "No releases yet."
+            fi
+            echo "$end"
+          } > block.txt
+
+          # Replace everything between the markers (inclusive) with block.txt.
+          awk -v s="$start" -v e="$end" '
+            index($0, s) { print_block(); skip = 1 }
+            skip && index($0, e) { skip = 0; next }
+            !skip { print }
+            function print_block() {
+              while ((getline line < "block.txt") > 0) print line
+              close("block.txt")
+            }
+          ' README.md > README.new
+          mv README.new README.md
+          rm -f block.txt
+
+      - name: Commit if the release list changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- README.md; then
+            echo "README already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "Update latest releases in README"
+          git push
