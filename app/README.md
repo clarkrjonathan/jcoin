@@ -58,8 +58,11 @@ was started with. There is no delete: remove a key file by hand.
 Mining rewards go to the address of the key in use. The Mining section has a
 GPU use limit (10% to 100%): the miner rests between GPU dispatches so the GPU
 is busy for about that share of the time. It can be changed while mining and is
-stored in the file `gpu_limit`. A sent transfer shows
-"confirmed" once the wallet's confirmed nonce has passed the transfer's nonce.
+stored in the file `gpu_limit`. The "Sent" list holds the last 100 transfers
+sent from the app, stored in `sent.txt`. A sent transfer shows "confirmed"
+once the wallet's confirmed nonce has passed the transfer's nonce. The node
+keeps pending transfers in `pending.dat`, so they are still pending after a
+restart.
 
 ## Developer section
 
