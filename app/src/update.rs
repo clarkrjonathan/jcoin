@@ -325,6 +325,11 @@ mod tests {
         std::fs::copy("/bin/sleep", &exe).unwrap();
         let mut child = std::process::Command::new(&exe).arg("30").spawn().unwrap();
         let running = || std::fs::read_link(format!("/proc/{}/exe", child.id())).unwrap();
+        // Right after spawn the child may not have started `prog` yet.
+        let start = std::time::Instant::now();
+        while running() != exe && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(running(), exe);
         replace_program(&exe, b"new").unwrap();
         assert_eq!(running(), with_suffix(&exe, ".old"));
