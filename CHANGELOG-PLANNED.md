@@ -43,9 +43,27 @@ Since 2.1.1 the app sends every log line to Sentry, and `tools/sentry-logs`
 and the `sentry-logs` skill read them. Reading them on 2026-11-11 showed what
 is missing. None of this changes consensus.
 
+Built on branch `2.2.2-logs-and-friendly-names` (not yet committed). Decisions
+taken with Jonathan while building:
+
+- **Friendly names, decided yes.** The device label travels to peers so the
+  connections list can show it. It is sent as a new, optional `NODE_INFO`
+  message (`0x0005`) after the handshake, not as a field in `HELLO`; older
+  nodes ignore an unknown message and still connect and sync. The label is
+  visible to every peer connected to. See `jcoin/src/p2p/README.md`.
+- **Structured attributes threaded through the logger**, not parsed back out of
+  text in `classify`. `log_info!`/`log_error!` take an optional field list
+  (`jcoin/src/log.rs`); the sink and `telemetry::log` carry the fields to
+  Sentry as attributes.
+- **One diagnostic call**: `tools/sentry-logs diagnose NODE` returns a digest
+  (state, peers, signals, errors) in one invocation, no raw lines.
+
 ### "Install and restart" stays disabled after "Check again"
 
-- Status: planned
+- Status: built. The reason is shown inline (`app/src/main.rs`,
+  `updates_section`); "Stop mining and install" is offered when mining is the
+  only blocker; a test re-reads the release list and checks the newer release
+  stays installable (`app/src/update.rs`).
 - Consensus: no
 - Source: Jonathan, 2026-11-11
 - Found: after "Check again" listed the new version, "Install and restart"
@@ -65,7 +83,11 @@ is missing. None of this changes consensus.
 
 ### Name the computer on first run
 
-- Status: planned
+- Status: built. On first run with no label and no marker, the window shows
+  "What should this computer be called?" with a text field and Skip
+  (`app/src/main.rs`); Skip writes a `device_prompted` marker. The label set
+  this way reaches peers after the next restart (the running node took its
+  label at start).
 - Consensus: no
 - Problem: no node had a device label, because the field is inside the
   Developer section. Nodes had to be told apart by peer id and operating
@@ -76,20 +98,19 @@ is missing. None of this changes consensus.
 
 ### Show device labels in the connections list
 
-- Status: planned
+- Status: built. The connections grid shows the peer's friendly name beside the
+  short peer id (`app/src/main.rs`), from a `label` field on `/peers`.
 - Consensus: no
 - Source: Jonathan's note, 2026-11-11
-- Problem: the connections list in the Developer section shows peer ids only.
-  It does not say whose node each one is.
-- Planned change: show each peer's device label next to its peer id.
-- Open point: how a node learns another node's label. The label is sent to
-  Sentry today, not to peers. Sending it to peers is a protocol addition
-  (a field a node may send after the handshake) and makes the label public to
-  every node it connects to.
+- Open point, now decided: a node learns another's label from the new
+  `NODE_INFO` message sent after the handshake (`jcoin/src/p2p/message.rs`,
+  `peer.rs`, `network.rs`). The label is public to every peer it connects to,
+  which Jonathan accepted.
 
 ### A status line once a minute
 
-- Status: planned
+- Status: built. `Backend::log_status_if_due` (`app/src/backend.rs`) logs a
+  `status` line each minute with all the named attributes; short text.
 - Consensus: no
 - Problem: to learn whether a node is connected, synced, and mining, its whole
   history has to be read.
@@ -101,74 +122,66 @@ is missing. None of this changes consensus.
 
 ### Log the events that are missing
 
-- Status: planned
+- Status: built, with two deferrals.
 - Consensus: no
 - Problem: the log has no record of several things that had to be worked out
   by hand on 2026-11-11.
-- Planned change: add lines, each with its own `event`:
-  - `transfer_sent` (id, amount, fee, nonce, recipient) and
-    `transfer_confirmed` (id, height).
-  - `transfer_received` when the balance of the key in use rises by a
-    transfer (not by a mined block).
-  - `block_received` (height, from which peer) and `sync_done` (height, block
-    count) when a node catches up from a peer.
-  - `reorg` (old tip, new tip, depth).
-  - `update_started`, `update_installed`, `update_failed` (versions, reason),
-    and `installed` / `uninstalled` from the install flow.
-  - `pending_dropped` when a pending transfer leaves the mempool without being
-    confirmed.
+- Done, each with its own `event`:
+  - `transfer_sent` (id, amount, fee, nonce, recipient) in `Backend::send`.
+  - `block_received` (height) and `sync_done` (height, blocks) in `peer.rs`.
+  - `reorg` (height, depth) in `chain.rs` fork choice.
+  - `update_started` / `update_installed` / `update_failed` in `update.rs`,
+    and `installed` / `uninstalled` in `install.rs`.
+  - `pending_dropped` in `mempool.rs` prune (unconfirmed drops only).
+- Deferred: `transfer_confirmed` (id, height) and `transfer_received` (balance
+  of the key in use rises by a transfer, not a mined block). Both need the node
+  to watch a block's transfers against the wallet; confirmation is already
+  visible as the balance changing. Pick these up in a later patch.
 
 ### Stop sending lines that say nothing
 
-- Status: planned
+- Status: built, with one deferral.
 - Consensus: no
 - Found: 2026-11-11. About half of a node's lines are failed dials to
   addresses that can never be reached and "already connected or dialing"
-  notices. Nodes pass on loopback and private addresses of other machines
-  (`127.0.0.1`, `172.17.0.1`, `::1`) and stale records of old test nodes;
-  each node then tries to dial them and logs a failure.
-- Planned change:
-  - Do not pass on or dial loopback and link-local addresses of other
-    machines. This removes the cause, not only the lines.
-  - Drop addresses of peers that have not been reachable for some time.
-  - Do not log "already connected or dialing"; it is not a failure.
-  - Send a failed dial to Sentry only the first time for each peer in a run;
-    keep every one in the local log file.
+  notices.
+- Done:
+  - `Network::routable` (`jcoin/src/p2p/network.rs`) drops loopback and
+    link-local addresses on `learn`, so they are never stored, gossiped, or
+    dialed. Relayed (`/p2p-circuit`) addresses are kept. Ordinary LAN
+    addresses are kept (2.2.3 wants them reachable).
+  - The "already connected or dialing" dial condition is no longer logged
+    (`host.rs`, `DialPeerConditionFalse`).
+  - A failed dial (same `peer` + `reason`) reaches Sentry once per run; every
+    one still goes to the local file (`telemetry.rs`, `first_dial_failure`).
+- Deferred: time-based aging of the address book. The loopback filter removes
+  the main cause, and the per-run attempted set plus the Sentry dedup bound the
+  rest; aging adds timestamps to the book, a later refinement.
 
 ### Attributes that make a line cheap to read
 
-- Status: planned
+- Status: built. The attributes are threaded from the call sites, not parsed
+  from text: `log_info!`/`log_error!` take an optional field list
+  (`jcoin/src/log.rs`), the sink and `telemetry::log` carry them to Sentry.
+  `run` is a per-start tag; `peer`, `reason`, `via` are on the dial, connection,
+  hole-punch, and reservation lines (`host.rs`, `peer.rs`); `height` is on the
+  block and sync lines.
 - Consensus: no
-- Problem: the reader has to fetch a line's full text to learn which peer it
-  is about, why something failed, or what height a node is at. One failed-dial
-  line is 300 to 800 characters.
-- Planned change: put those facts in attributes, so a query can ask for the
-  attributes and leave the text out.
-  - `run`: a short random id made at each app start. Selects one run of one
-    node without a time window.
-  - `peer`: the 6 characters after `12D3KooW` of the other node a line is
-    about (dials, connections, hole punches, streams).
-  - `reason`: a short class for a failure: `timeout`, `refused`,
-    `no_reservation`, `address_in_use`, `handshake`, `other`.
-  - `via`: `relay` or `direct`, for dials and connections.
-  - `height`: the block height a line is about.
-- Where: `telemetry::classify` in the app takes these from the line's text
-  today. Cleaner is for the node to log structured fields; decide when
-  building.
 
 ### Reader and skill follow-up
 
-- Status: planned
+- Status: built, except the token check.
 - Consensus: no
-- After the changes above, update `tools/sentry-logs` and the `sentry-logs`
-  skill:
-  - `sentry-logs status NODE`: the latest `status` row for a node (or for all
-    nodes), as one line each.
-  - `sentry-logs peers NODE`: who a node connected to, by `peer` and `via`,
-    without fetching text.
-  - `timeline` and `lines` use `run` to show the latest run by default.
-  - Verify the reader's request to Sentry with a real token. It has only been
-    tested without one.
+- Done in `tools/sentry-logs` and the `sentry-logs` skill:
+  - `diagnose NODE`: one call → a digest (state, peers, signals, errors), no
+    raw lines. This is the "one parameterized call" Jonathan asked for.
+  - `status NODE` (latest status row, one line per node for `all`) and
+    `peers NODE` (by `peer` and `via`, no text).
+  - `timeline` and `lines` default to the node's latest `run` (`--all-runs`
+    for every run).
+  - `--self-test` still passes.
+- Still to do: run the reader against Sentry with a real token (it has only
+  been exercised without one). Needs the token from the Operations list.
 
 ## 2.2.3: network health and mining view
 
@@ -441,6 +454,21 @@ Problems and wanted changes that have no version yet.
   the sender cannot see which transfers are affected.
 - Possible change: store pending transfers in the data folder and reload them
   at startup; keep the sent list across restarts.
+
+### The updater checks the checksum but not a signature
+
+- Consensus: no
+- Source: Jonathan's question, 2026-11-11
+- Today `update::install` fetches `SHA256SUMS-<platform>.txt` from the release,
+  hashes the downloaded binary, and refuses to install on a mismatch
+  (`app/src/update.rs`). This catches a corrupt or partial download, but it is
+  integrity, not authenticity: the checksum list is fetched over HTTPS from the
+  same GitHub release and is not signed, so anyone who could publish to that
+  release (or tamper with both files) could supply a matching checksum for a
+  swapped binary.
+- Possible change: sign `SHA256SUMS` in the release workflow with a key whose
+  public half is baked into the app, and verify the signature before trusting
+  the list. Low priority for the current friends-only use, but it is the gap.
 
 ### Two copies of the app can run on the same data folder
 

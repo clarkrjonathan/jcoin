@@ -20,6 +20,33 @@ use crate::Transaction;
 
 use super::message::Message;
 
+/// Whether an address is worth storing and passing on. A direct loopback or
+/// link-local address is only reachable on the machine that sent it, so another
+/// node can never dial it; keeping it just fills the book and the log with dials
+/// that always fail. A relayed address (`/p2p-circuit`) is reached through the
+/// relay, not by dialing its IP, so its IP is not judged here. Everything else
+/// (including ordinary LAN addresses) is kept.
+pub fn routable(addr: &Multiaddr) -> bool {
+    let mut host_unreachable = false;
+    for proto in addr.iter() {
+        match proto {
+            // A circuit address is dialed through the relay; its IP is the
+            // relay's and is handled when the relay itself is reached.
+            Protocol::P2pCircuit => return true,
+            Protocol::Ip4(ip) => {
+                // 127.0.0.0/8 loopback, 169.254.0.0/16 link-local.
+                host_unreachable = ip.is_loopback() || ip.is_link_local();
+            }
+            Protocol::Ip6(ip) => {
+                // ::1 loopback, fe80::/10 link-local.
+                host_unreachable = ip.is_loopback() || (ip.segments()[0] & 0xffc0) == 0xfe80;
+            }
+            _ => {}
+        }
+    }
+    !host_unreachable
+}
+
 /// Local, per-process identifier for one protocol session with a peer.
 /// Assigned when `run_peer` starts and forgotten when it ends. It never
 /// appears on the wire.
@@ -64,12 +91,19 @@ pub struct ConnectionInfo {
     pub session: bool,
     /// When the connection opened (Unix seconds).
     pub since: u64,
+    /// The friendly label the peer sent after the handshake (what its user
+    /// named the computer), if any. Filled in by `connections`.
+    pub label: Option<String>,
 }
 
 struct Inner {
     peers: Mutex<HashMap<PeerId, mpsc::Sender<Message>>>,
     /// Log labels of the protocol sessions; each starts with the peer id.
     session_labels: Mutex<HashMap<PeerId, String>>,
+    /// Friendly device labels peers sent, by libp2p peer id string.
+    peer_labels: Mutex<HashMap<String, String>>,
+    /// This node's own friendly label, sent to peers after the handshake.
+    own_label: Mutex<Option<String>>,
     /// Open connections by libp2p connection id.
     connections: Mutex<HashMap<String, ConnectionInfo>>,
     next_id: AtomicU64,
@@ -112,6 +146,8 @@ impl Network {
             inner: Arc::new(Inner {
                 peers: Mutex::new(HashMap::new()),
                 session_labels: Mutex::new(HashMap::new()),
+                peer_labels: Mutex::new(HashMap::new()),
+                own_label: Mutex::new(None),
                 connections: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(0),
                 book: Mutex::new(HashSet::new()),
@@ -171,6 +207,29 @@ impl Network {
         self.inner.session_labels.lock().unwrap().remove(&id);
     }
 
+    /// Set this node's own friendly label, sent to peers after the handshake.
+    /// An empty label means none is sent.
+    pub fn set_own_label(&self, label: Option<String>) {
+        *self.inner.own_label.lock().unwrap() =
+            label.filter(|l| !l.is_empty());
+    }
+
+    /// This node's own friendly label, if set.
+    pub fn own_label(&self) -> Option<String> {
+        self.inner.own_label.lock().unwrap().clone()
+    }
+
+    /// Record the friendly label a peer sent, by its libp2p peer id string.
+    /// Shown next to the peer id in the connections list.
+    pub fn set_peer_label(&self, peer: &str, label: &str) {
+        let mut labels = self.inner.peer_labels.lock().unwrap();
+        if label.is_empty() {
+            labels.remove(peer);
+        } else {
+            labels.insert(peer.to_string(), label.to_string());
+        }
+    }
+
     /// Record the log label of session `id` (it starts with the peer id), so
     /// `connections` can tell which connections carry a session.
     pub fn label_session(&self, id: PeerId, label: &str) {
@@ -194,6 +253,7 @@ impl Network {
     /// The open connections, oldest first, with `session` filled in.
     pub fn connections(&self) -> Vec<ConnectionInfo> {
         let labels = self.inner.session_labels.lock().unwrap();
+        let friendly = self.inner.peer_labels.lock().unwrap();
         let mut list: Vec<ConnectionInfo> = self
             .inner
             .connections
@@ -203,6 +263,7 @@ impl Network {
             .cloned()
             .map(|mut c| {
                 c.session = labels.values().any(|label| label.starts_with(&c.peer));
+                c.label = friendly.get(&c.peer).cloned();
                 c
             })
             .collect();
@@ -292,6 +353,11 @@ impl Network {
         let mut rng = rand::thread_rng();
         let mut fresh = Vec::new();
         for addr in addrs.into_iter().take(MAX_ADDR_PER_MESSAGE) {
+            // Drop loopback and link-local addresses: no other node can reach
+            // them, so storing or dialing them only makes noise.
+            if !routable(&addr) {
+                continue;
+            }
             if advertised.contains(&addr) || book.contains(&addr) {
                 continue;
             }
@@ -364,6 +430,28 @@ mod tests {
         Network::new(node, 8333, Vec::new(), max_peers)
     }
 
+    #[test]
+    fn loopback_and_link_local_are_not_routable_or_learned() {
+        let parse = |s: &str| s.parse::<Multiaddr>().unwrap();
+        assert!(!routable(&parse("/ip4/127.0.0.1/tcp/8333")));
+        assert!(!routable(&parse("/ip4/169.254.1.2/tcp/8333")));
+        assert!(!routable(&parse("/ip6/::1/tcp/8333")));
+        assert!(!routable(&parse("/ip6/fe80::1/tcp/8333")));
+        // Ordinary LAN and public addresses are kept.
+        assert!(routable(&parse("/ip4/192.168.0.5/tcp/8333")));
+        assert!(routable(&parse("/ip4/10.0.0.9/tcp/8333")));
+        assert!(routable(&parse("/ip4/3.14.123.27/tcp/8333")));
+
+        let net = network(8);
+        let fresh = net.learn(vec![
+            parse("/ip4/127.0.0.1/tcp/8333"),
+            parse("/ip4/169.254.0.7/tcp/8333"),
+            parse("/ip4/192.168.0.5/tcp/8333"),
+        ]);
+        assert_eq!(fresh, vec![parse("/ip4/192.168.0.5/tcp/8333")]);
+        assert_eq!(net.book_len(), 1);
+    }
+
     // S5: one oversized ADDR is read only up to MAX_ADDR_PER_MESSAGE, and the
     // book never grows past MAX_BOOK however many messages arrive.
     #[test]
@@ -407,6 +495,33 @@ mod tests {
         assert_eq!(net.dials_in_flight(), 3);
         net.maybe_dial(vec![addr(0)]);
         assert_eq!(net.dials_in_flight(), 4);
+    }
+
+    #[test]
+    fn a_peers_label_shows_up_in_its_connection() {
+        let net = network(8);
+        net.connection_opened(
+            "conn-1".to_string(),
+            ConnectionInfo {
+                peer: "12D3KooWABCDEF".to_string(),
+                address: "/ip4/1.2.3.4/tcp/8333".to_string(),
+                outbound: true,
+                relayed: false,
+                is_relay: false,
+                session: false,
+                since: 1,
+                label: None,
+            },
+        );
+        // Before the peer sends its label, there is none.
+        assert_eq!(net.connections()[0].label, None);
+        net.set_peer_label("12D3KooWABCDEF", "Noahs PC");
+        assert_eq!(net.connections()[0].label.as_deref(), Some("Noahs PC"));
+        // Our own label round-trips, and an empty one is dropped.
+        net.set_own_label(Some("Jons Desktop".to_string()));
+        assert_eq!(net.own_label().as_deref(), Some("Jons Desktop"));
+        net.set_own_label(Some(String::new()));
+        assert_eq!(net.own_label(), None);
     }
 
     #[test]

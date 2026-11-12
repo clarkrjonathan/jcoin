@@ -92,13 +92,23 @@ Each log line carries attributes for sorting and filtering in Sentry:
 | `event` | The kind of line, for example `dial_failed`, `reservation_ok`, `reservation_lost`, `peer_connected`, `block_won`, `block_accepted`, `startup` |
 | `device` | The label set in the Developer section (also `user.name`) |
 | `install_id` | A random id made on first run, stored in the data folder (also `user.id`) |
+| `run` | A fresh id made at each program start; selects one run without a time window |
 | `peer_id` | The node's libp2p peer id; it matches the relay's log |
 | `network` | `mainnet` or `regtest` (also the Sentry environment) |
 | `address` | The address of the key in use |
 | `gpu` | The GPU in use while mining |
 
+A line may also carry its own fields, so a query can filter on them instead of
+reading the message text: `peer` (6 chars after `12D3KooW`), `reason`
+(`timeout`, `refused`, `no_reservation`, `address_in_use`, `handshake`,
+`other`), `via` (`relay` or `direct`), `height`, and the `status` fields
+(`peers`, `reservation`, `mining`, `hash_rate`, `gpu_limit`, `pending`,
+`balance`). A `status` line is logged once a minute. A repeated failed dial
+(same `peer` and `reason`) is written to the local log file every time but sent
+to Sentry only once per `run`.
+
 Example searches in Sentry Logs: `device:"Noah desktop" component:p2p`,
-`event:reservation_lost`, `event:dial_failed peer_id:12D3KooW...`.
+`event:reservation_lost`, `event:dial_failed peer:AbC123`, `event:status`.
 
 Failed dials, failed protocol streams, and failed hole punches are routine on a
 peer-to-peer network; they are sent as warnings, not errors. Everything else the

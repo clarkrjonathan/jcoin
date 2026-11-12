@@ -121,7 +121,12 @@ impl Layout {
             std::fs::write(icon, ICON_SVG).map_err(|e| format!("cannot write the icon: {e}"))?;
         }
         make_parent(&self.menu_entry)?;
-        self.write_menu_entry()
+        self.write_menu_entry()?;
+        jcoin::log_info!(
+            [("event", "installed".to_string()), ("version", version.to_string())];
+            "[app] installed version {version}"
+        );
+        Ok(())
     }
 
     /// Record `version` as the installed version. The installed copy calls
@@ -161,6 +166,7 @@ impl Layout {
     /// program cannot delete itself, so if `self.program` is the running
     /// program it is deleted a few seconds after the app exits.
     pub fn uninstall(&self, running: &Path) -> Result<(), String> {
+        jcoin::log_info!([("event", "uninstalled".to_string())]; "[app] uninstalling");
         let _ = std::fs::remove_file(&self.menu_entry);
         if let Some(icon) = &self.icon {
             let _ = std::fs::remove_file(icon);

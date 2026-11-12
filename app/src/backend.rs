@@ -159,6 +159,8 @@ pub struct Connection {
     pub session: bool,
     /// When it opened (Unix seconds).
     pub since: u64,
+    /// The friendly name the peer's user gave their computer, if sent.
+    pub label: Option<String>,
 }
 
 /// A transfer sent from this window.
@@ -218,6 +220,8 @@ pub struct Backend {
     /// GPU names by adapter index; filled in by a background thread.
     gpus: Arc<Mutex<Option<Vec<String>>>>,
     pub sent: Vec<SentTx>,
+    /// When the last once-a-minute `status` line was logged.
+    last_status: std::time::Instant,
 }
 
 impl Backend {
@@ -243,8 +247,8 @@ impl Backend {
         let log = AppLog::open(&settings.data_dir);
         {
             let log = log.clone();
-            jcoin::log::set_sink(move |level, line| {
-                log.push(level == jcoin::log::Level::Error, line);
+            jcoin::log::set_sink(move |level, line, fields| {
+                log.push_with(level == jcoin::log::Level::Error, line, fields);
             });
         }
         log.push(
@@ -288,6 +292,10 @@ impl Backend {
             cpu_miner: None,
             data_dir: Some(settings.data_dir.clone()),
             regtest: settings.regtest,
+            // Send our friendly name to peers so their connections list can
+            // show it. Empty (unset) sends nothing.
+            label: Some(crate::telemetry::device_name(&settings.data_dir))
+                .filter(|l| !l.is_empty()),
         };
 
         let view = Arc::new(Mutex::new(NodeView::default()));
@@ -326,6 +334,8 @@ impl Backend {
             mining_error: None,
             gpus,
             sent: Vec::new(),
+            // Emit the first status line about a minute after start.
+            last_status: std::time::Instant::now(),
         };
         backend.refresh_keys();
         backend.gpu_limit = std::fs::read_to_string(backend.settings.data_dir.join(GPU_LIMIT_FILE))
@@ -464,10 +474,23 @@ impl Backend {
             return Err(format!("the node rejected the transfer: {reason}"));
         }
         let id = tx.tx_id_hex();
+        let recipient_hex = hex::encode(to);
+        self.log.push_with(
+            false,
+            &format!("[app] transfer {id} sent: {} JEF to {recipient_hex}", format_jef(amount)),
+            &[
+                ("event", "transfer_sent".to_string()),
+                ("id", id.clone()),
+                ("amount", amount.to_string()),
+                ("fee", fee.to_string()),
+                ("nonce", nonce.to_string()),
+                ("recipient", recipient_hex.clone()),
+            ],
+        );
         self.sent.push(SentTx {
             sender: self.address.clone(),
             id: id.clone(),
-            recipient: hex::encode(to),
+            recipient: recipient_hex,
             amount,
             nonce,
         });
@@ -659,6 +682,40 @@ impl Backend {
             )
         })
     }
+
+    /// Log one `status` line if a minute has passed since the last one. Called
+    /// each frame from the window's update. One row then answers "what state is
+    /// this node in" without reading the whole history.
+    pub fn log_status_if_due(&mut self) {
+        if self.last_status.elapsed() < Duration::from_secs(60) {
+            return;
+        }
+        self.last_status = std::time::Instant::now();
+        let v = self.view();
+        let mining = matches!(self.mining_state_peek(), MiningState::Running);
+        let reservation = v.advertised.iter().any(|a| a.contains("p2p-circuit"));
+        let hash_rate = self.mining_stats().map(|(hr, _, _, _)| hr).unwrap_or(0);
+        let yes_no = |b: bool| if b { "yes" } else { "no" }.to_string();
+        let fields: Vec<jcoin::log::Field> = vec![
+            ("event", "status".to_string()),
+            ("height", v.height.to_string()),
+            ("peers", v.peers.to_string()),
+            ("reservation", yes_no(reservation)),
+            ("mining", yes_no(mining)),
+            ("hash_rate", hash_rate.to_string()),
+            ("gpu_limit", self.gpu_limit.to_string()),
+            ("pending", v.pending.to_string()),
+            ("balance", v.balance.to_string()),
+        ];
+        self.log.push_with(
+            false,
+            &format!(
+                "[app] status: height {}, {} peers, mining {}, {} h/s, {} pending",
+                v.height, v.peers, yes_no(mining), hash_rate, v.pending
+            ),
+            &fields,
+        );
+    }
 }
 
 /// Run the node on its own thread and runtime. If it stops, record why.
@@ -729,6 +786,7 @@ fn spawn_poller(
                         is_relay: c["is_relay"].as_bool().unwrap_or(false),
                         session: c["session"].as_bool().unwrap_or(false),
                         since: c["since"].as_u64().unwrap_or(0),
+                        label: c["label"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
                     })
                     .collect();
             }

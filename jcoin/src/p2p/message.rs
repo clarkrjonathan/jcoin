@@ -19,6 +19,9 @@ pub mod type_code {
     pub const HELLO_ACK: u16 = 0x0002;
     pub const PING: u16 = 0x0003;
     pub const PONG: u16 = 0x0004;
+    /// An optional friendly label for this node, sent once after the handshake.
+    /// Added in 2.2.2; older nodes do not send it and ignore it when received.
+    pub const NODE_INFO: u16 = 0x0005;
     pub const NEW_TRANSACTION: u16 = 0x0010;
     pub const GET_ADDR: u16 = 0x0020;
     pub const ADDR: u16 = 0x0021;
@@ -73,6 +76,9 @@ pub enum Message {
     HelloAck,
     Ping(u64),
     Pong(u64),
+    /// The remote node's friendly label (what its user named the computer).
+    /// Cosmetic: shown in the connections list. May be empty.
+    NodeInfo(String),
     NewTransaction(Transaction),
     /// Request the peer's known addresses.
     GetAddr,
@@ -134,6 +140,7 @@ impl Message {
             Message::HelloAck => type_code::HELLO_ACK,
             Message::Ping(_) => type_code::PING,
             Message::Pong(_) => type_code::PONG,
+            Message::NodeInfo(_) => type_code::NODE_INFO,
             Message::NewTransaction(_) => type_code::NEW_TRANSACTION,
             Message::GetAddr => type_code::GET_ADDR,
             Message::Addr(_) => type_code::ADDR,
@@ -149,6 +156,7 @@ impl Message {
             Message::Hello(h) => h.encode(),
             Message::HelloAck => Vec::new(),
             Message::Ping(nonce) | Message::Pong(nonce) => nonce.to_be_bytes().to_vec(),
+            Message::NodeInfo(label) => encode_label(label),
             Message::NewTransaction(tx) => tx.serialize_to_bytes(),
             Message::GetAddr => Vec::new(),
             Message::Addr(endpoints) => encode_addrs(endpoints),
@@ -196,6 +204,7 @@ impl Message {
                     })
                 }
             }
+            type_code::NODE_INFO => Ok(Message::NodeInfo(decode_label(&raw.payload))),
             type_code::PING | type_code::PONG => {
                 let bytes: [u8; 8] = raw
                     .payload
@@ -263,6 +272,32 @@ pub async fn read_message<R: AsyncRead + Unpin>(
 ) -> Result<Message, MessageError> {
     let raw = read_frame(reader).await?;
     Message::decode(&raw)
+}
+
+/// Most characters in a node label on the wire.
+pub const MAX_LABEL_CHARS: usize = 32;
+
+/// Encode a node label: cleaned and bounded, so the wire form matches what a
+/// node would accept.
+fn encode_label(label: &str) -> Vec<u8> {
+    clean_label(label).into_bytes()
+}
+
+/// Decode a node label from a peer. The sender is not trusted, so the text is
+/// cleaned to letters, digits, spaces, `-`, and `_`, and bounded in length,
+/// the same rule the app applies to a local label.
+fn decode_label(payload: &[u8]) -> String {
+    clean_label(&String::from_utf8_lossy(payload))
+}
+
+/// A label as it is kept: trimmed, at most `MAX_LABEL_CHARS` characters, and
+/// only letters, digits, spaces, `-`, and `_`.
+fn clean_label(text: &str) -> String {
+    text.trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+        .take(MAX_LABEL_CHARS)
+        .collect()
 }
 
 fn decode_locator(payload: &[u8]) -> Option<Vec<[u8; 32]>> {
@@ -362,6 +397,22 @@ mod tests {
                 assert_eq!(got.serialize_to_bytes(), tx.serialize_to_bytes());
             }
             other => panic!("expected NewTransaction, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn node_info_round_trips_and_is_cleaned() {
+        match round_trip(Message::NodeInfo("Jons Desktop".to_string())).await {
+            Message::NodeInfo(label) => assert_eq!(label, "Jons Desktop"),
+            other => panic!("expected NodeInfo, got {other:?}"),
+        }
+        // A hostile label is cleaned and bounded on the wire.
+        match round_trip(Message::NodeInfo(format!("  rm -rf /!! {}", "x".repeat(50)))).await {
+            Message::NodeInfo(label) => {
+                assert!(label.chars().count() <= MAX_LABEL_CHARS);
+                assert!(!label.contains('/') && !label.contains('!'));
+            }
+            other => panic!("expected NodeInfo, got {other:?}"),
         }
     }
 

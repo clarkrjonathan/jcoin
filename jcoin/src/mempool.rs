@@ -237,6 +237,9 @@ impl Mempool {
     /// After a reorg this also drops the part of a chain that no longer fits.
     pub fn prune(&mut self, state: &State) {
         let mut drop_ids = Vec::new();
+        // Ids that leave without being confirmed (a broken or unaffordable
+        // chain), as opposed to those included in a block.
+        let mut dropped_unconfirmed = Vec::new();
         for (sender, chain) in self.by_sender.iter_mut() {
             let mut expected = state.nonce(sender);
             let available = state.balance(sender);
@@ -265,6 +268,7 @@ impl Mempool {
                     // is broken here, and everything after it goes too.
                     if nonce >= expected {
                         broken = true;
+                        dropped_unconfirmed.push((*id, nonce));
                     }
                     drop_ids.push(*id);
                 }
@@ -274,6 +278,13 @@ impl Mempool {
         self.by_sender.retain(|_, chain| !chain.is_empty());
         for id in drop_ids {
             self.by_id.remove(&id);
+        }
+        for (id, nonce) in dropped_unconfirmed {
+            crate::log_info!(
+                [("event", "pending_dropped".to_string()), ("id", hex::encode(id)), ("nonce", nonce.to_string())];
+                "[node] pending transfer {} dropped without confirming (nonce {nonce})",
+                hex::encode(id)
+            );
         }
     }
 }

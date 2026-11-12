@@ -6,11 +6,18 @@ The app sends every log line to Sentry with attributes (see app/README.md,
 answers the question: counts first, then short lines with peer ids and
 addresses shortened and repeated lines collapsed.
 
+  sentry-logs diagnose NODE [-p 2h]              one digest: state, peers, signals, errors
+  sentry-logs status  NODE [-p 2h]               the latest status line (per node for `all`)
+  sentry-logs peers   NODE [-p 2h]               who it connected to, by peer and transport
   sentry-logs nodes   [-p 2h]                    who reported, how much, last seen
   sentry-logs events  NODE [-p 2h]               count of each kind of line for a node
-  sentry-logs timeline NODE [-p 2h] [-n 60]      the lines that tell the story
+  sentry-logs timeline NODE [-p 2h] [-n 60]      the story (latest run; --all-runs for all)
   sentry-logs lines   NODE [-e EVENT]... [-n 40] chosen lines (add --noise for failed dials)
   sentry-logs query   'SENTRY QUERY' [-f FIELD]...   anything else
+
+Start with `diagnose NODE`: it answers "what is wrong with this node" in one
+call, fetching only what a diagnosis needs. Attributes to query on a line:
+`run`, `peer`, `reason`, `via`, `height`, and the status fields.
 
 NODE picks one computer: a device label, an install id (16 hex), or a peer id
 (or the 6 characters after `12D3KooW`). Use `all` for every node.
@@ -37,14 +44,29 @@ TOKEN_FILE = os.path.expanduser("~/.config/jeffycoin/sentry-token")
 
 # Lines that are routine on a peer-to-peer network. Left out unless asked for.
 NOISE = ["dial_failed", "stream_failed", "listening", "block_candidate", "handshake_failed"]
-# The lines that say what a node did, in order.
+# The lines that say what a node did, in order. `status` is left out: it
+# repeats every minute and would bury the story (use `status` or `diagnose`).
 STORY = [
-    "startup", "install", "store_replayed", "identity", "reservation_ok", "reservation_lost",
-    "rendezvous_registered", "rendezvous_failed", "peer_connected", "peer_disconnected",
-    "hole_punch_ok", "hole_punch_failed", "mining_started", "mining_stopped", "gpu_unavailable",
+    "startup", "install", "installed", "uninstalled", "store_replayed", "identity",
+    "reservation_ok", "reservation_lost", "rendezvous_registered", "rendezvous_failed",
+    "peer_connected", "peer_disconnected", "hole_punch_ok", "hole_punch_failed",
+    "block_received", "sync_done", "reorg", "mining_started", "mining_stopped", "gpu_unavailable",
     "gpu_limit_set", "block_won", "block_not_accepted", "work_unavailable", "submit_failed",
-    "host_stopped", "update", "other",
+    "transfer_sent", "transfer_confirmed", "transfer_received", "pending_dropped",
+    "update_started", "update_installed", "update_failed", "update", "host_stopped", "other",
 ]
+
+# Attributes a `status` line carries; also used by `diagnose` for the state line.
+STATUS_KEYS = ["height", "peers", "reservation", "mining", "hash_rate", "gpu_limit", "pending", "balance"]
+
+
+def status_line(row):
+    """A status row (or any row carrying the attributes) as one compact line."""
+    when = (row.get("timestamp") or "")[11:19]
+    who = row.get("device") or row.get("run") or "?"
+    present = [f"{k}={row.get(k)}" for k in STATUS_KEYS if row.get(k) is not None]
+    body = ", ".join(present) if present else "(no status attributes)"
+    return f"{when} {who}: {body}"
 
 
 def node_filter(node):
@@ -135,6 +157,13 @@ def join(*terms):
     return " ".join(t for t in terms if t)
 
 
+def latest_run(node_term, period):
+    """The `run` id of a node's most recent line in the period, or None. Lets
+    `timeline`/`lines` show one run of one node without a time window."""
+    rows = fetch(["run", "timestamp"], join(node_term, "has:run"), period, 1, "-timestamp")
+    return rows[0].get("run") if rows else None
+
+
 def table(rows, columns):
     """Rows of dicts as an aligned text table."""
     cells = [[str(r.get(c) if r.get(c) is not None else "-") for c in columns] for r in rows]
@@ -144,6 +173,46 @@ def table(rows, columns):
     lines = ["  ".join(h.ljust(w) for h, w in zip(heads, widths))]
     lines += ["  ".join(v.ljust(w) for v, w in zip(row, widths)) for row in cells]
     return lines
+
+
+def diagnose(node_term, period, width):
+    """One call: a compact digest of a node's current state and recent trouble,
+    with no raw log dump. Runs the few queries a diagnosis needs and prints only
+    the pre-parsed result."""
+    out = []
+    # Current state: the latest status line.
+    sfields = ["timestamp", "device", "run", "sentry.release", "sentry.environment"] + STATUS_KEYS
+    status = fetch(sfields, join(node_term, "event:status"), period, 1, "-timestamp")
+    if status:
+        s = status[0]
+        facts = [f"{k}={s.get(label)}" for k, label in
+                 (("device", "device"), ("release", "sentry.release"),
+                  ("env", "sentry.environment"), ("run", "run")) if s.get(label)]
+        out.append("node:    " + " ".join(facts))
+        out.append("state:   " + status_line(s))
+    else:
+        out.append("state:   no status line in this period (older build, or not reporting)")
+    # Who it connected to, by peer and transport.
+    peers = fetch(["peer", "via", "count()"], join(node_term, "event:peer_connected"),
+                  period, 20, "-count()")
+    if peers:
+        out.append("peers:   " + ", ".join(
+            f"{p.get('peer') or '?'}({p.get('via') or '?'})" for p in peers))
+    # Reorgs, lost reservations, sync, dropped transfers, GPU trouble.
+    signals = fetch(["event", "count()"],
+                    join(node_term, "event:[reorg,reservation_lost,sync_done,pending_dropped,gpu_unavailable]"),
+                    period, 10, "-count()")
+    if signals:
+        out.append("signals: " + ", ".join(f"{r.get('event')}x{r.get('count()')}" for r in signals))
+    # Recent errors, deduped, without the routine dials.
+    errs = fetch(["timestamp", "severity", "event", "message"],
+                 join(node_term, "severity:[error,fatal]"), period, 15, "-timestamp")
+    errs.sort(key=lambda r: r.get("timestamp") or "")
+    err_lines = collapse([(r.get("timestamp"), r.get("severity"), r.get("event"), r.get("message"))
+                          for r in errs], width)
+    out.append("errors:")
+    out += ["  " + line for line in err_lines] if err_lines else ["  none"]
+    print("\n".join(out))
 
 
 def main():
@@ -158,12 +227,18 @@ def main():
 
     common(sub.add_parser("nodes"), node=False)
     common(sub.add_parser("events"))
+    d = sub.add_parser("diagnose")
+    common(d)
+    d.add_argument("-w", "--width", type=int, default=150, help="longest message; 0 for all")
+    common(sub.add_parser("status"))
+    common(sub.add_parser("peers"))
     for name in ("timeline", "lines"):
         p = sub.add_parser(name)
         common(p)
         p.add_argument("-n", "--limit", type=int, default=60 if name == "timeline" else 40)
         p.add_argument("-w", "--width", type=int, default=150, help="longest message; 0 for all")
         p.add_argument("--oldest", action="store_true", help="start from the oldest line")
+        p.add_argument("--all-runs", action="store_true", help="every run, not just the latest")
         if name == "lines":
             p.add_argument("-e", "--event", action="append", default=[])
             p.add_argument("--errors", action="store_true", help="errors and warnings only")
@@ -187,7 +262,31 @@ def main():
         columns = ["event", "severity", "count()"]
         rows = fetch(columns, node_filter(args.node), args.period, 60, "-count()")
         print("\n".join(table(rows, columns)))
+    elif args.command == "diagnose":
+        diagnose(node_filter(args.node), args.period, args.width)
+    elif args.command == "status":
+        nf = node_filter(args.node)
+        fields = ["timestamp", "device", "run"] + STATUS_KEYS
+        rows = fetch(fields, join(nf, "event:status"), args.period, 50, "-timestamp")
+        seen, lines = set(), []
+        for row in rows:  # newest first: keep the first (latest) per node
+            who = row.get("device") or row.get("run")
+            if who in seen:
+                continue
+            seen.add(who)
+            lines.append(status_line(row))
+        print("\n".join(lines) if lines else "no status line in this period")
+    elif args.command == "peers":
+        columns = ["peer", "via", "count()"]
+        rows = fetch(columns, join(node_filter(args.node), "event:peer_connected"),
+                     args.period, 50, "-count()")
+        print("\n".join(table(rows, columns)) if rows else "no connections in this period")
     elif args.command in ("timeline", "lines"):
+        # Default to the node's latest run, so one run is shown without a window.
+        run_term = ""
+        if not args.all_runs and args.node != "all":
+            run = latest_run(node_filter(args.node), args.period)
+            run_term = f"run:{run}" if run else ""
         if args.command == "timeline":
             terms = "event:[" + ",".join(STORY) + "]"
         else:
@@ -197,7 +296,7 @@ def main():
                 "severity:[error,warn,fatal]" if args.errors else "",
             )
         rows = fetch(["timestamp", "severity", "event", "message"],
-                     join(node_filter(args.node), terms), args.period, args.limit,
+                     join(node_filter(args.node), run_term, terms), args.period, args.limit,
                      "timestamp" if args.oldest else "-timestamp")
         rows.sort(key=lambda r: r.get("timestamp") or "")
         lines = collapse([(r.get("timestamp"), r.get("severity"), r.get("event"), r.get("message"))
@@ -252,6 +351,12 @@ def self_test():
     assert node_filter("PwbBoq") == "peer_id:12D3KooWPwbBoq*"
     assert node_filter("Noah desktop") == 'device:"Noah desktop"'
     assert table([{"a": 1, "count()": None}], ["a", "count()"]) == ["a  count", "1  -    "]
+
+    line = status_line({"timestamp": "2026-11-11T03:00:00+00:00", "device": "Jon",
+                        "height": 5, "peers": 2, "mining": "no"})
+    assert line == "03:00:00 Jon: height=5, peers=2, mining=no", line
+    assert status_line({"run": "ab12", "timestamp": "2026-11-11T03:00:00+00:00"}) \
+        == "03:00:00 ab12: (no status attributes)"
     print("self-test passed")
 
 
