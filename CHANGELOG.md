@@ -10,6 +10,26 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.2.5 (2026-11-12)
+
+A patch. No consensus change.
+
+### Fixed
+
+- On Linux, the in-app update started the old program again instead of the
+  new one. The updater renames the running program to `<program>.old`, and
+  on Linux the running program's own path follows that rename. It now
+  restarts the path it read before the swap. Windows was not affected.
+
+The update to 2.2.5 is still done by the old updater, so on Linux it starts
+the old program once more: close the app and open it again from the menu.
+Updates after 2.2.5 restart the new program.
+
+Not tested: a real update and restart (it needs a release newer than the
+one updating). Not tested on Windows; the Windows path is unchanged.
+
+Consensus: no.
+
 ## 2.2.4 (2026-11-12)
 
 A patch. No consensus change: it runs on the same chain as 2.2.0 and
