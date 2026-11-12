@@ -128,9 +128,13 @@ relay only fully valid transactions):
 2. Check the type (normal only) and the signature.
 3. Offer it to the mempool, which checks the nonce and balance against the tip
    and the sender's pending chain (consecutive nonces, the whole chain
-   affordable, no reuse of a pending nonce).
+   affordable, no reuse of a pending nonce). One that skips ahead of the
+   sender's chain is held (up to 16 per sender, for 10 minutes) and admitted
+   when the gap fills.
 4. If it is newly admitted, send it to every other session. If it was already
-   pending, or it is rejected, do not relay it.
+   pending, is held, or is rejected, do not relay it. Pending transfers are
+   announced to every peer again each minute, so held ones that are later
+   admitted still spread.
 
 **`NEW_BLOCK`.** The payload is the block (156-byte header, `u16` transaction
 count, 153 bytes per transaction). Blocks are pushed in full. A block is
@@ -251,7 +255,6 @@ A compatible node needs:
 
 ### Known limitations
 
-- Out-of-order queued transactions are rejected (`KNOWN-ISSUES.md` O8).
 - The address book is not persisted; after a restart a node depends on
   `--peer` and the relay again.
 - Only one relay per node (`--relay`). Several relays would remove the single

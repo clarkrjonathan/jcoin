@@ -64,7 +64,6 @@ release = "reliability"
 title = "A reorg puts transfers back in the queue"
 status = "in progress"
 consensus = false
-issue = "O1"
 problem = '''
 On a reorg the mempool is only pruned to the new tip. Transfers confirmed
 only on the dropped branch disappear until the sender sends them again.'''
@@ -78,7 +77,6 @@ release = "reliability"
 title = "Hold transfers that arrive out of order"
 status = "in progress"
 consensus = false
-issue = "O8"
 problem = '''
 The mempool accepts nonce n + 1 only after n. A node that receives n + 1
 from one peer before n from another rejects n + 1 and does not keep it.'''
@@ -92,7 +90,6 @@ release = "reliability"
 title = "Bound the memory used by forks"
 status = "in progress"
 consensus = false
-issue = "V1"
 source = "docs/adr/0005-reliability-patch-2-2-4.md"
 problem = '''
 The chain keeps every valid block it accepts, each with a full State copy. A
@@ -106,7 +103,7 @@ tip. A node then refuses a reorg deeper than 288 blocks and logs it.'''
 id = "direct-dupes"
 release = "reliability"
 title = "One direct connection per pair of nodes"
-status = "planned"
+status = "in progress"
 consensus = false
 issue = "O5"
 source = "tools/local-net up 2 relay"
@@ -115,8 +112,9 @@ Both nodes dial each other's direct address, and a hole punch can add one
 more, so a pair can keep up to three direct connections. Only one carries the
 session; the others stay open.'''
 change = '''
-Track which connection carries the session in the host, then close the other
-direct connections to that peer.'''
+The smaller peer id keeps the direct connection it dialed (else the oldest)
+and closes the others. If the closed one carried the session, the host opens
+it again on the kept one.'''
 
 # --- wallet ----------------------------------------------------------------
 

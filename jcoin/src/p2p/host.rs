@@ -200,6 +200,9 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
     // Open connections that run through a relay circuit, by peer. Closed when
     // a direct connection to the same peer opens.
     let mut relayed_conns: HashMap<ConnectionId, PeerId> = HashMap::new();
+    // Open direct connections by peer, oldest first, each with whether the
+    // smaller peer id dialed it. One is kept (`keep_one_direct`).
+    let mut direct_conns: HashMap<PeerId, Vec<(ConnectionId, bool)>> = HashMap::new();
     // Peers reached only through the relay with a direct dial in flight, and
     // their other direct addresses, tried one at a time if it fails. One dial
     // per address at once would leave a connection per interface (Docker and
@@ -312,6 +315,18 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                                 swarm.close_connection(c);
                             }
                         }
+                        let dialer = if endpoint.is_dialer() { local_id } else { peer_id };
+                        let conns = direct_conns.entry(peer_id).or_default();
+                        conns.push((connection_id, dialer == local_id.min(peer_id)));
+                        if local_id < peer_id {
+                            for c in keep_one_direct(conns) {
+                                crate::log_info!(
+                                    [("peer", peer6(&peer_id.to_string()))];
+                                    "[p2p] closing an extra direct connection to {peer_id}"
+                                );
+                                swarm.close_connection(c);
+                            }
+                        }
                     }
                     // The dialing side opens the protocol stream, unless a
                     // session already runs (for example, a hole-punched direct
@@ -341,6 +356,12 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                 }
                 SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
                     relayed_conns.remove(&connection_id);
+                    if let Some(conns) = direct_conns.get_mut(&peer_id) {
+                        conns.retain(|(c, _)| *c != connection_id);
+                        if conns.is_empty() {
+                            direct_conns.remove(&peer_id);
+                        }
+                    }
                     network.connection_closed(&connection_id.to_string());
                     if num_established == 0 {
                         network.set_connected(peer_id, false);
@@ -566,6 +587,25 @@ async fn run_session(
     let _ = closed_tx.send(peer).await;
 }
 
+/// Of a peer's direct connections (oldest first; `true` if the smaller peer
+/// id dialed it), keep the oldest one the smaller id dialed, else the oldest.
+/// Removes the others from `conns` and returns them, to be closed. Only the
+/// smaller peer id calls this, so both sides never close different ones.
+fn keep_one_direct(conns: &mut Vec<(ConnectionId, bool)>) -> Vec<ConnectionId> {
+    let keep = conns.iter().position(|(_, preferred)| *preferred).unwrap_or(0);
+    let mut extra = Vec::new();
+    let mut i = 0;
+    conns.retain(|(c, _)| {
+        let kept = i == keep;
+        i += 1;
+        if !kept {
+            extra.push(*c);
+        }
+        kept
+    });
+    extra
+}
+
 fn release(sessions: &Sessions, peer: PeerId) {
     let mut map = sessions.lock().unwrap();
     if let Some(count) = map.get_mut(&peer) {
@@ -697,6 +737,21 @@ mod tests {
     use tokio::sync::oneshot;
 
     use crate::block::{build_and_mine, Block};
+
+    #[test]
+    fn one_direct_connection_is_kept() {
+        let c = ConnectionId::new_unchecked;
+        // The one the smaller id dialed wins, even when it is not the oldest.
+        let mut conns = vec![(c(1), false), (c(2), true), (c(3), true)];
+        assert_eq!(keep_one_direct(&mut conns), vec![c(1), c(3)]);
+        assert_eq!(conns, vec![(c(2), true)]);
+        // Without one, the oldest.
+        let mut conns = vec![(c(4), false), (c(5), false)];
+        assert_eq!(keep_one_direct(&mut conns), vec![c(5)]);
+        // A single connection stays.
+        let mut conns = vec![(c(6), false)];
+        assert!(keep_one_direct(&mut conns).is_empty());
+    }
     use crate::consensus::REGTEST;
     use crate::node::{run_node, NodeRequest, StatusResult, SubmitResult};
     use crate::state::State;
