@@ -164,7 +164,7 @@ pub async fn run_node(
                 for block in loaded.blocks {
                     match chain.accept(block) {
                         Accept::Stored { .. } | Accept::AlreadyHave { .. } => {}
-                        Accept::Orphan => rejected += 1,
+                        Accept::Orphan | Accept::TooDeep { .. } => rejected += 1,
                         Accept::Invalid(e) => {
                             rejected += 1;
                             if rejected == 1 {
@@ -301,14 +301,23 @@ pub async fn run_node(
                 // Clone for the log only when persisting.
                 let for_log = log.as_ref().map(|_| (*block).clone());
                 let outcome = match chain.accept(*block) {
-                    Accept::Stored { new_tip, height } => {
+                    Accept::Stored { new_tip, height, abandoned } => {
                         if let (Some(log), Some(block)) = (log.as_mut(), for_log.as_ref()) {
                             if let Err(e) = log.append(block) {
                                 crate::log_error!("[store] append failed: {e}");
                             }
                         }
-                        // Drop transactions no longer applicable on the new tip.
+                        // Drop transactions no longer applicable on the new tip,
+                        // then take back those of blocks a reorg abandoned
+                        // (admission drops any the new branch already holds).
                         mempool.prune(chain.tip_state());
+                        let requeued = abandoned
+                            .into_iter()
+                            .filter(|tx| mempool.insert(tx.clone(), chain.tip_state()).is_ok())
+                            .count();
+                        if requeued > 0 {
+                            crate::log_info!("[chain] reorg: {requeued} transfer(s) back in the queue");
+                        }
                         BlockOutcome::Accepted {
                             is_new: true,
                             new_tip,
@@ -323,6 +332,12 @@ pub async fn run_node(
                     Accept::Orphan => BlockOutcome::Orphan,
                     Accept::Invalid(e) => BlockOutcome::Rejected {
                         reason: e.to_string(),
+                    },
+                    Accept::TooDeep { parent_height } => BlockOutcome::Rejected {
+                        reason: format!(
+                            "forks at height {parent_height}, deeper than {} blocks",
+                            crate::chain::MAX_REORG_DEPTH
+                        ),
                     },
                 };
                 let _ = reply.send(outcome);

@@ -16,10 +16,17 @@
 //!   counted),
 //! - the chain is at most `MAX_PENDING_PER_SENDER` long.
 //!
+//! A transaction that skips ahead of the sender's chain (it arrived before an
+//! earlier one) is held, not admitted: up to `MAX_HELD_PER_SENDER` per sender,
+//! each for `HOLD_SECS`. When the gap fills, held transactions are admitted in
+//! nonce order through the same rules. Held ones are not pending: they are not
+//! mined, relayed, or counted.
+//!
 //! Both structures are owned by the node core task, so neither needs a lock.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::state::State;
 use crate::Transaction;
@@ -33,6 +40,15 @@ pub const MAX_PENDING_PER_SENDER: usize = 25;
 /// Most transaction ids remembered by the seen cache (oldest evicted first).
 pub const SEEN_CAPACITY: usize = 50_000;
 
+/// Most out-of-order transactions held for one sender.
+pub const MAX_HELD_PER_SENDER: usize = 16;
+
+/// Most out-of-order transactions held in all.
+pub const MAX_HELD: usize = 1_000;
+
+/// How long an out-of-order transaction is held, in seconds.
+pub const HOLD_SECS: u64 = 600;
+
 /// A 32-byte transaction id.
 pub type TxId = [u8; 32];
 
@@ -43,6 +59,9 @@ pub enum Admitted {
     New,
     /// The same transaction was already pending. Do not relay it again.
     AlreadyPending,
+    /// It skips ahead of the sender's chain and is held until the gap fills.
+    /// Do not relay it yet.
+    Held,
 }
 
 /// Why a transaction was not admitted.
@@ -111,10 +130,20 @@ pub struct Mempool {
     by_id: HashMap<TxId, Transaction>,
     by_sender: HashMap<[u8; 32], BTreeMap<u64, TxId>>,
     capacity: usize,
+    /// Out-of-order transactions by sender, then nonce, with the time each
+    /// was held (seconds since the Unix epoch).
+    held: HashMap<[u8; 32], BTreeMap<u64, (Transaction, u64)>>,
 }
 
 fn debit(tx: &Transaction) -> Option<u64> {
     tx.amount.checked_add(tx.fee)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl Mempool {
@@ -123,7 +152,13 @@ impl Mempool {
             by_id: HashMap::new(),
             by_sender: HashMap::new(),
             capacity,
+            held: HashMap::new(),
         }
+    }
+
+    /// Number of out-of-order transactions held.
+    pub fn held_len(&self) -> usize {
+        self.held.values().map(|m| m.len()).sum()
     }
 
     pub fn len(&self) -> usize {
@@ -162,8 +197,65 @@ impl Mempool {
 
     /// Admit a normal transaction whose signature and type the caller has
     /// already checked. Nonce and balance are checked here against `state`
-    /// (the tip) and the sender's pending chain; see the module docs.
+    /// (the tip) and the sender's pending chain; see the module docs. One that
+    /// skips ahead is held (`Admitted::Held`) if there is room.
     pub fn insert(&mut self, tx: Transaction, state: &State) -> Result<Admitted, AdmitError> {
+        self.insert_at(tx, state, now_secs())
+    }
+
+    /// `insert` at time `now` (seconds since the Unix epoch).
+    pub fn insert_at(&mut self, tx: Transaction, state: &State, now: u64) -> Result<Admitted, AdmitError> {
+        let sender = tx.sender;
+        match self.admit(tx.clone(), state) {
+            Ok(Admitted::New) => {
+                self.release_held(&sender, state, now);
+                Ok(Admitted::New)
+            }
+            Err(AdmitError::NonceGap { expected, got })
+                if got < expected + MAX_PENDING_PER_SENDER as u64 =>
+            {
+                let total = self.held_len();
+                let held = self.held.entry(sender).or_default();
+                if held.contains_key(&got) {
+                    return Ok(Admitted::Held);
+                }
+                if held.len() >= MAX_HELD_PER_SENDER || total >= MAX_HELD {
+                    if held.is_empty() {
+                        self.held.remove(&sender);
+                    }
+                    return Err(AdmitError::NonceGap { expected, got });
+                }
+                held.insert(got, (tx, now));
+                Ok(Admitted::Held)
+            }
+            other => other,
+        }
+    }
+
+    /// Admit the sender's held transactions that now follow its chain, in
+    /// nonce order, and drop those that expired or fell below it.
+    fn release_held(&mut self, sender: &[u8; 32], state: &State, now: u64) {
+        let Some(mut held) = self.held.remove(sender) else {
+            return;
+        };
+        held.retain(|_, (_, at)| now.saturating_sub(*at) < HOLD_SECS);
+        loop {
+            let next = self.summary(sender, state).next_nonce;
+            held.retain(|&nonce, _| nonce >= next);
+            let Some((tx, _)) = held.remove(&next) else {
+                break;
+            };
+            // One that fails admission (for example, unaffordable) is dropped;
+            // the loop then finds the gap and stops.
+            let _ = self.admit(tx, state);
+        }
+        if !held.is_empty() {
+            self.held.insert(*sender, held);
+        }
+    }
+
+    /// The admission rules for one transaction, without holding.
+    fn admit(&mut self, tx: Transaction, state: &State) -> Result<Admitted, AdmitError> {
         let id = tx.tx_id();
         if self.by_id.contains_key(&id) {
             return Ok(Admitted::AlreadyPending);
@@ -235,7 +327,21 @@ impl Mempool {
     /// drop transactions already included (nonce below the confirmed nonce),
     /// then keep the chain only while it stays consecutive and affordable.
     /// After a reorg this also drops the part of a chain that no longer fits.
+    /// Then admits held transactions that now follow a chain.
     pub fn prune(&mut self, state: &State) {
+        self.prune_at(state, now_secs());
+    }
+
+    /// `prune` at time `now` (seconds since the Unix epoch).
+    pub fn prune_at(&mut self, state: &State, now: u64) {
+        self.prune_pending(state);
+        let senders: Vec<[u8; 32]> = self.held.keys().copied().collect();
+        for sender in senders {
+            self.release_held(&sender, state, now);
+        }
+    }
+
+    fn prune_pending(&mut self, state: &State) {
         let mut drop_ids = Vec::new();
         // Ids that leave without being confirmed (a broken or unaffordable
         // chain), as opposed to those included in a block.
@@ -422,12 +528,13 @@ mod tests {
     }
 
     #[test]
-    fn gaps_and_stale_nonces_are_rejected() {
+    fn far_gaps_and_stale_nonces_are_rejected() {
         let mut state = funded();
         let mut pool = Mempool::new(10);
+        let far = MAX_PENDING_PER_SENDER as u64;
         assert_eq!(
-            pool.insert(tx(1, 2, 5, 0), &state),
-            Err(AdmitError::NonceGap { expected: 0, got: 2 })
+            pool.insert(tx(1, far, 5, 0), &state),
+            Err(AdmitError::NonceGap { expected: 0, got: far })
         );
         // Confirm nonce 0, then nonce 0 again is stale.
         state.apply(&tx(1, 0, 5, 0)).unwrap();
@@ -435,6 +542,52 @@ mod tests {
             pool.insert(tx(1, 0, 7, 0), &state),
             Err(AdmitError::StaleNonce { expected: 1, got: 0 })
         );
+    }
+
+    #[test]
+    fn an_out_of_order_transfer_is_held_until_the_gap_fills() {
+        let state = funded();
+        let mut pool = Mempool::new(10);
+        assert_eq!(pool.insert_at(tx(1, 2, 5, 0), &state, 100), Ok(Admitted::Held));
+        assert_eq!(pool.insert_at(tx(1, 1, 5, 0), &state, 100), Ok(Admitted::Held));
+        assert_eq!(pool.len(), 0);
+        assert_eq!(pool.held_len(), 2);
+        // Nonce 0 fills the gap; 1 and 2 follow.
+        assert_eq!(pool.insert_at(tx(1, 0, 5, 0), &state, 101), Ok(Admitted::New));
+        assert_eq!(pool.len(), 3);
+        assert_eq!(pool.held_len(), 0);
+        assert_eq!(pool.summary(&[1u8; 32], &state).next_nonce, 3);
+    }
+
+    #[test]
+    fn a_block_confirming_the_gap_releases_held_transfers() {
+        let mut state = funded();
+        let mut pool = Mempool::new(10);
+        assert_eq!(pool.insert_at(tx(1, 1, 5, 0), &state, 100), Ok(Admitted::Held));
+        // Nonce 0 arrives in a block, not through the mempool.
+        state.apply(&tx(1, 0, 5, 0)).unwrap();
+        pool.prune_at(&state, 110);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.held_len(), 0);
+    }
+
+    #[test]
+    fn held_transfers_expire_and_are_bounded() {
+        let state = funded();
+        let mut pool = Mempool::new(100);
+        assert_eq!(pool.insert_at(tx(1, 1, 5, 0), &state, 100), Ok(Admitted::Held));
+        // Past HOLD_SECS the held one is dropped when nonce 0 arrives.
+        assert_eq!(pool.insert_at(tx(1, 0, 5, 0), &state, 100 + HOLD_SECS), Ok(Admitted::New));
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.held_len(), 0);
+        // At most MAX_HELD_PER_SENDER for one sender.
+        for n in 0..MAX_HELD_PER_SENDER as u64 {
+            assert_eq!(pool.insert_at(tx(2, n + 2, 1, 0), &state, 200), Ok(Admitted::Held));
+        }
+        assert!(matches!(
+            pool.insert_at(tx(2, MAX_HELD_PER_SENDER as u64 + 2, 1, 0), &state, 200),
+            Err(AdmitError::NonceGap { .. })
+        ));
     }
 
     #[test]

@@ -62,7 +62,7 @@ restarts.'''
 id = "reorg-requeue"
 release = "reliability"
 title = "A reorg puts transfers back in the queue"
-status = "planned"
+status = "in progress"
 consensus = false
 issue = "O1"
 problem = '''
@@ -76,7 +76,7 @@ invalid ones fall out there.'''
 id = "out-of-order"
 release = "reliability"
 title = "Hold transfers that arrive out of order"
-status = "planned"
+status = "in progress"
 consensus = false
 issue = "O8"
 problem = '''
@@ -90,7 +90,7 @@ minutes) and admit them when the gap fills.'''
 id = "fork-pruning"
 release = "reliability"
 title = "Bound the memory used by forks"
-status = "planned"
+status = "in progress"
 consensus = false
 issue = "V1"
 source = "docs/adr/0005-reliability-patch-2-2-4.md"

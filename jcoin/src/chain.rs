@@ -6,14 +6,23 @@
 //! are retained and a reorg is just moving the tip pointer. Each block's
 //! required difficulty target and its timestamp lower bound (median-time-past)
 //! are computed here from the block's own ancestry.
+//!
+//! Memory is bounded by `MAX_REORG_DEPTH` (ADR 0005): side branches that leave
+//! the canonical chain more than that many blocks below the tip are dropped,
+//! and canonical blocks that deep keep no state. A block that would fork there
+//! is refused (`Accept::TooDeep`). This is node policy, not a validity rule.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use primitive_types::U256;
 
 use crate::block::{Block, BlockError};
 use crate::consensus::{BlockContext, Params};
 use crate::state::State;
+use crate::Transaction;
+
+/// The deepest reorg a node follows: about a day of 5-minute blocks.
+pub const MAX_REORG_DEPTH: u64 = 288;
 
 /// One block of history for the difficulty rule: the target it was mined at
 /// and its solve time (its timestamp minus its parent's, zero if not later).
@@ -112,20 +121,26 @@ struct StoredBlock {
     block: Block,
     height: u64,
     work: U256,
-    state: State,
+    /// The state after this block. `None` for canonical blocks more than
+    /// `MAX_REORG_DEPTH` below the tip, which no accepted block can build on.
+    state: Option<State>,
 }
 
 /// Outcome of offering a block to the store.
 pub enum Accept {
     /// Newly stored and connected to a known parent. `new_tip` is true if it
-    /// became the canonical tip.
-    Stored { new_tip: bool, height: u64 },
+    /// became the canonical tip. On a reorg, `abandoned` holds the transfers
+    /// of the blocks that left the canonical chain, oldest first, for the
+    /// mempool to take back.
+    Stored { new_tip: bool, height: u64, abandoned: Vec<Transaction> },
     /// Already in the store.
     AlreadyHave { height: u64 },
     /// Parent is unknown; the caller should sync the gap.
     Orphan,
     /// Connected to a parent but failed validation.
     Invalid(BlockError),
+    /// Builds on a canonical block more than `MAX_REORG_DEPTH` below the tip.
+    TooDeep { parent_height: u64 },
 }
 
 pub struct Chain {
@@ -146,7 +161,7 @@ impl Chain {
                 block: genesis,
                 height: 0,
                 work: U256::zero(),
-                state: State::new(),
+                state: Some(State::new()),
             },
         );
         Chain {
@@ -188,7 +203,7 @@ impl Chain {
     }
 
     pub fn tip_state(&self) -> &State {
-        &self.blocks[&self.tip].state
+        self.blocks[&self.tip].state.as_ref().expect("the tip keeps its state")
     }
 
     pub fn contains(&self, hash: &[u8; 32]) -> bool {
@@ -290,9 +305,20 @@ impl Chain {
             return Accept::Orphan;
         }
 
-        let ctx = self.context_for_child(parent_hash);
         let parent = &self.blocks[&parent_hash];
-        let new_state = match block.validate_and_apply(&parent.block.header, &parent.state, &ctx) {
+        let Some(parent_state) = parent.state.as_ref() else {
+            let parent_height = parent.height;
+            crate::log_info!(
+                [
+                    ("event", "reorg_refused".to_string()),
+                    ("height", parent_height.to_string()),
+                ];
+                "[chain] refused a block that forks at height {parent_height}, more than {MAX_REORG_DEPTH} blocks below the tip"
+            );
+            return Accept::TooDeep { parent_height };
+        };
+        let ctx = self.context_for_child(parent_hash);
+        let new_state = match block.validate_and_apply(&parent.block.header, parent_state, &ctx) {
             Ok(s) => s,
             Err(e) => return Accept::Invalid(e),
         };
@@ -300,7 +326,6 @@ impl Chain {
         let height = parent.height + 1;
         let work = parent.work + block_work(&block.header.target);
         let old_tip = self.tip;
-        let old_tip_height = self.blocks[&old_tip].height;
         let new_tip = work > self.blocks[&old_tip].work;
 
         self.blocks.insert(
@@ -309,27 +334,91 @@ impl Chain {
                 block,
                 height,
                 work,
-                state: new_state,
+                state: Some(new_state),
             },
         );
+        let mut abandoned = Vec::new();
         if new_tip {
             self.tip = hash;
             // A reorg is a tip switch onto a different branch, abandoning the
-            // blocks after the common parent. A plain extension (parent was the
-            // old tip) is not a reorg.
+            // blocks after the common ancestor. A plain extension (parent was
+            // the old tip) is not a reorg.
             if parent_hash != old_tip {
-                let depth = old_tip_height.saturating_sub(height - 1);
+                let (fork_height, dropped) = self.branch_off(old_tip, hash);
+                let depth = dropped.len();
+                abandoned = dropped
+                    .iter()
+                    .rev()
+                    .flat_map(|h| self.blocks[h].block.transactions.iter())
+                    .filter(|tx| !tx.is_coinbase())
+                    .cloned()
+                    .collect();
                 crate::log_info!(
                     [
                         ("event", "reorg".to_string()),
                         ("height", height.to_string()),
                         ("depth", depth.to_string()),
+                        ("fork_height", fork_height.to_string()),
                     ];
                     "[chain] reorg: tip moved to height {height}, {depth} block(s) abandoned"
                 );
             }
+            self.prune();
         }
-        Accept::Stored { new_tip, height }
+        Accept::Stored { new_tip, height, abandoned }
+    }
+
+    /// The blocks on `from`'s branch that are not ancestors of `to`, newest
+    /// first, and the height of the common ancestor.
+    fn branch_off(&self, from: [u8; 32], to: [u8; 32]) -> (u64, Vec<[u8; 32]>) {
+        let (mut a, mut b) = (from, to);
+        let mut dropped = Vec::new();
+        while a != b {
+            let (ha, hb) = (self.blocks[&a].height, self.blocks[&b].height);
+            if ha >= hb {
+                dropped.push(a);
+                a = self.blocks[&a].block.header.previous_block_hash;
+            }
+            if hb > ha {
+                b = self.blocks[&b].block.header.previous_block_hash;
+            }
+        }
+        (self.blocks[&a].height, dropped)
+    }
+
+    /// Drop side branches that leave the canonical chain more than
+    /// `MAX_REORG_DEPTH` below the tip, and the state of canonical blocks that
+    /// deep. Runs on every tip change; costs one pass over the store.
+    fn prune(&mut self) {
+        let Some(limit) = self.tip_height().checked_sub(MAX_REORG_DEPTH) else {
+            return;
+        };
+        let canonical: HashSet<[u8; 32]> = self.canonical_hashes().into_iter().collect();
+        let doomed: Vec<[u8; 32]> = self
+            .blocks
+            .keys()
+            .filter(|h| !canonical.contains(*h))
+            .filter(|h| {
+                // Walk down the side branch to where it meets the canonical chain.
+                let mut cur = **h;
+                while !canonical.contains(&cur) {
+                    match self.blocks.get(&cur) {
+                        Some(b) => cur = b.block.header.previous_block_hash,
+                        None => return true,
+                    }
+                }
+                self.blocks[&cur].height < limit
+            })
+            .copied()
+            .collect();
+        for h in doomed {
+            self.blocks.remove(&h);
+        }
+        for stored in self.blocks.values_mut() {
+            if stored.height < limit {
+                stored.state = None;
+            }
+        }
     }
 
     /// Hashes of the canonical chain from genesis up to the tip, in order.
@@ -428,7 +517,7 @@ mod tests {
         let genesis = Block::genesis(&REGTEST);
         let b1 = mine_on(&genesis.header, &State::new(), [1u8; 32]);
         match chain.accept(b1.clone()) {
-            Accept::Stored { new_tip: true, height: 1 } => {}
+            Accept::Stored { new_tip: true, height: 1, .. } => {}
             _ => panic!("block 1 should extend the tip"),
         }
         assert_eq!(chain.tip_height(), 1);
@@ -473,6 +562,70 @@ mod tests {
         // More than the chain holds stops at genesis.
         let all: Vec<u64> = chain.recent(50).iter().map(|b| b.header.height).collect();
         assert_eq!(all, vec![5, 4, 3, 2, 1, 0]);
+    }
+
+    /// Mine a child of the stored block `parent`, crediting `miner`.
+    fn child_of(chain: &Chain, parent: [u8; 32], miner: [u8; 32], normal: Option<Transaction>) -> Block {
+        let stored = &chain.blocks[&parent];
+        let state = stored.state.as_ref().unwrap();
+        let ts = stored.block.header.timestamp + 1;
+        let reward = chain.context_for_child(parent).reward;
+        build_and_mine(&stored.block.header, state, reward, miner, normal, REGTEST.pow_limit, ts)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn a_reorg_returns_the_abandoned_transfers() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let sender = crate::wallet::address_of(&key);
+        let mut chain = Chain::new(REGTEST);
+        let genesis = chain.tip_hash();
+        let b1 = child_of(&chain, genesis, sender, None);
+        chain.accept(b1.clone());
+        // Branch A: one block carrying a transfer from `sender`.
+        let transfer = crate::wallet::sign_transfer(&key, [9u8; 32], 5, 1, 0);
+        let a2 = child_of(&chain, b1.hash(), [1u8; 32], Some(transfer.clone()));
+        chain.accept(a2);
+        // Branch B: two empty blocks on b1 overtake it.
+        let b2 = child_of(&chain, b1.hash(), [2u8; 32], None);
+        assert!(matches!(chain.accept(b2.clone()), Accept::Stored { new_tip: false, .. }));
+        let b3 = child_of(&chain, b2.hash(), [2u8; 32], None);
+        match chain.accept(b3) {
+            Accept::Stored { new_tip: true, abandoned, .. } => {
+                let ids: Vec<_> = abandoned.iter().map(|t| t.tx_id()).collect();
+                assert_eq!(ids, vec![transfer.tx_id()]);
+            }
+            _ => panic!("b3 should take the tip"),
+        }
+    }
+
+    #[test]
+    fn forks_deeper_than_the_limit_are_dropped_and_refused() {
+        let mut chain = Chain::new(REGTEST);
+        let mut hashes = vec![chain.tip_hash()];
+        let mut side = None;
+        for h in 1..=MAX_REORG_DEPTH + 10 {
+            let block = child_of(&chain, *hashes.last().unwrap(), [1u8; 32], None);
+            hashes.push(block.hash());
+            chain.accept(block);
+            if h == 3 {
+                // A side block forking at height 2.
+                let s = child_of(&chain, hashes[2], [2u8; 32], None);
+                side = Some(s.hash());
+                chain.accept(s);
+            }
+        }
+        let tip = chain.tip_height();
+        assert!(!chain.contains(&side.unwrap()), "the deep side branch is dropped");
+        // At the limit a fork is still accepted; one block deeper it is refused.
+        let at_limit = child_of(&chain, hashes[(tip - MAX_REORG_DEPTH) as usize], [3u8; 32], None);
+        assert!(matches!(chain.accept(at_limit), Accept::Stored { new_tip: false, .. }));
+        let deep = hashes[(tip - MAX_REORG_DEPTH - 1) as usize];
+        assert!(chain.blocks[&deep].state.is_none());
+        let mut header_only = chain.blocks[&hashes[1]].block.clone();
+        header_only.header.previous_block_hash = deep;
+        assert!(matches!(chain.accept(header_only), Accept::TooDeep { .. }));
     }
 
     #[test]
@@ -537,6 +690,7 @@ mod tests {
             Accept::Invalid(e) => panic!("block 2 with a transfer was rejected: {e}"),
             Accept::Orphan => panic!("block 2 unexpectedly orphan"),
             Accept::AlreadyHave { .. } => panic!("block 2 unexpectedly already held"),
+            Accept::TooDeep { .. } => panic!("block 2 unexpectedly too deep"),
         }
         assert_eq!(chain.tip_height(), 2);
         assert_eq!(chain.tip_state().balance(&[2u8; 32]), 10);
@@ -896,7 +1050,7 @@ mod tests {
         let eased_tip = chain.tip_hash();
         let ctx_again = chain.context_for_child(normal_parent);
         let parent = chain.blocks[&normal_parent].block.header.clone();
-        let parent_state = chain.blocks[&normal_parent].state.clone();
+        let parent_state = chain.blocks[&normal_parent].state.clone().unwrap();
         let (normal, _) = build_and_mine(&parent, &parent_state, p.initial_reward, [2u8; 32], None, ctx_again.target, time + 300)
             .unwrap();
         assert!(matches!(chain.accept(normal), Accept::Stored { new_tip: true, .. }));
