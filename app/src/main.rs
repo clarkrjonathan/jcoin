@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use eframe::egui;
 use jcoin::amount::format_jef;
+use jcoin_gpu_miner::kernel::Kernel;
 
 use backend::{
     connection_kind, display_path, expected_seconds, short, span, zero_bits, Backend, MiningState, Settings,
@@ -892,6 +893,22 @@ fn developer_section(
                 .on_hover_text(format!("Target {}", view.target));
             ui.end_row();
         });
+        ui.horizontal(|ui| {
+            ui.label("GPU kernel");
+            let mut kernel = backend.kernel();
+            egui::ComboBox::from_id_salt("gpu-kernel")
+                .selected_text(kernel.name())
+                .show_ui(ui, |ui| {
+                    for k in Kernel::ALL {
+                        ui.selectable_value(&mut kernel, k, k.name());
+                    }
+                });
+            backend.set_kernel(kernel);
+        })
+        .response
+        .on_hover_text(
+            "The shader the miner runs. baseline is the default. unrolled and precomputed find the same blocks and were about three times faster on NVIDIA and Intel GPUs under Vulkan; they are not yet measured under DirectX 12 or on AMD GPUs. A change restarts mining.",
+        );
         if ui.button("Copy diagnostics").on_hover_text(
             "Copies the node state, connections, and recent log as text, to paste into a bug report. It holds no secret keys.",
         ).clicked() {

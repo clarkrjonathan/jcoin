@@ -247,6 +247,7 @@ pub fn classify(text: &str) -> Class {
         "app" if starts("uninstalling") => ("uninstalled", false),
         "app" if starts("install") || starts("running") => ("install", false),
         "app" if starts("GPU use limit") => ("gpu_limit_set", false),
+        "app" if starts("GPU kernel") => ("gpu_kernel_set", false),
         "app" if starts("update") => ("update", false),
         _ => ("other", false),
     };
@@ -355,6 +356,7 @@ mod tests {
         // 2.2.2 events.
         assert_eq!(filed("[app] status: height 4, 2 peers, mining no, 0 h/s, 0 pending"), ("app", "status", false));
         assert_eq!(filed("[app] transfer abcd sent: 1 JEF to ef01"), ("app", "transfer_sent", false));
+        assert_eq!(filed("[app] GPU kernel set to precomputed"), ("app", "gpu_kernel_set", false));
         assert_eq!(filed("[app] uninstalling"), ("app", "uninstalled", false));
         assert_eq!(filed("[p2p] stored new block 5 from a peer"), ("p2p", "block_received", false));
         assert_eq!(filed("[p2p] synced up to height 10 (3 block(s) in the last batch)"), ("p2p", "sync_done", false));

@@ -116,24 +116,23 @@ open = [
 ]
 
 [[item]]
-id = "gpu-kernel"
+id = "gpu-kernel-default"
 release = "backlog"
-title = "A faster SHA-256 kernel for the GPU miner"
-status = "in progress"
+title = "Make a faster GPU kernel the default"
+status = "to design"
 consensus = false
-source = "Jonathan, 2026-11-12"
+source = "tools/gpu-bench, 2026-11-12"
 problem = '''
-The kernel (`sha256.wgsl`) is a direct transcription of SHA-256: a 64-word
-schedule array and a round loop that indexes a private constant array, and it
-repeats for every nonce the work that does not depend on the nonce's low
-word (rounds 0 to 5 and schedule words 16 to 20).'''
+The miner and the app default to the `baseline` kernel. `precomputed` was
+2.9 times faster on an NVIDIA RTX 2000 Ada and 3.5 times on an Intel Iris
+Xe, both under Vulkan, and passes the self-test on both. It is only a choice
+in the Developer section.'''
 change = '''
-Kernel variants selectable with `--kernel` and `--workgroup`, each checked
-against the CPU, and `tools/gpu-bench` to compare them and batch sizes on a
-GPU. The default kernel changes only after results from more than one GPU
-maker.'''
+Make `precomputed` the default once it is measured under DirectX 12 (the
+Windows backend) and on an AMD GPU, with `gpu-miner --bench-matrix 3`. Run a
+short self-test when mining starts and fall back to `baseline` if it fails.'''
 open = [
-  "Which kernel becomes the default, from results on NVIDIA, AMD, and Intel GPUs under Vulkan and DirectX 12.",
+  "Results from Windows (DirectX 12) and from an AMD GPU.",
 ]
 
 [[item]]

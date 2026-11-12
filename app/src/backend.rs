@@ -16,6 +16,7 @@ use jcoin::amount::{format_jef, parse_jef};
 use jcoin::service::{self, ServiceConfig};
 use jcoin::wallet;
 use jcoin_gpu_miner::gpu::{self, Gpu, WORKGROUP};
+use jcoin_gpu_miner::kernel::{Config as KernelConfig, Kernel};
 use jcoin_gpu_miner::miner::{mine, FoundBlock, MinerControl};
 
 use crate::applog::{self, AppLog};
@@ -29,6 +30,10 @@ const FIRST_KEY: &str = "wallet";
 
 /// File in the data folder that records the GPU use limit, in percent.
 const GPU_LIMIT_FILE: &str = "gpu_limit";
+
+/// File in the data folder that records the GPU kernel (`kernel::Kernel`
+/// name). Missing means the baseline kernel.
+const GPU_KERNEL_FILE: &str = "gpu_kernel";
 
 /// The lowest GPU use limit the app offers, in percent.
 pub const MIN_GPU_LIMIT: u32 = 10;
@@ -246,6 +251,8 @@ pub enum MiningState {
 }
 
 struct Mining {
+    /// The GPU it was started on, to start it again on a kernel change.
+    adapter: Option<usize>,
     control: Arc<MinerControl>,
     thread: JoinHandle<()>,
     /// Set by the thread once the GPU is open, or with the reason it is not.
@@ -274,6 +281,8 @@ pub struct Backend {
     won: Vec<FoundBlock>,
     /// GPU use limit while mining, in percent of full power.
     gpu_limit: u32,
+    /// The shader the miner uses (Developer section).
+    kernel: Kernel,
     node_url: String,
     view: Arc<Mutex<NodeView>>,
     http: reqwest::blocking::Client,
@@ -390,6 +399,7 @@ impl Backend {
             log,
             won: Vec::new(),
             gpu_limit: 100,
+            kernel: Kernel::Baseline,
             node_url,
             view,
             http,
@@ -405,6 +415,10 @@ impl Backend {
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok())
             .map_or(100, |percent| percent.clamp(MIN_GPU_LIMIT, 100));
+        backend.kernel = std::fs::read_to_string(backend.settings.data_dir.join(GPU_KERNEL_FILE))
+            .ok()
+            .and_then(|text| Kernel::parse(text.trim()).ok())
+            .unwrap_or(Kernel::Baseline);
         Ok(backend)
     }
 
@@ -588,6 +602,34 @@ impl Backend {
         self.log.push(false, &format!("[app] GPU use limit set to {percent}%"));
     }
 
+    /// The GPU kernel the miner uses.
+    pub fn kernel(&self) -> Kernel {
+        self.kernel
+    }
+
+    /// Use `kernel` from now on and remember it. If mining, mining starts
+    /// again on the same GPU with it.
+    pub fn set_kernel(&mut self, kernel: Kernel) {
+        if kernel == self.kernel {
+            return;
+        }
+        self.kernel = kernel;
+        let _ = std::fs::write(self.settings.data_dir.join(GPU_KERNEL_FILE), kernel.name());
+        self.log.push(false, &format!("[app] GPU kernel set to {}", kernel.name()));
+        if let Some(adapter) = self.mining.as_ref().map(|m| m.adapter) {
+            // Wait for the old thread to drop its GPU device (one dispatch)
+            // so two devices are never open at once.
+            self.pump_miner();
+            if let Some(m) = self.mining.take() {
+                m.control.stop();
+                let _ = m.thread.join();
+                self.won.extend(m.control.found());
+                self.log.push(false, "[app] mining stopped");
+            }
+            self.start_mining(adapter);
+        }
+    }
+
     /// Start mining on GPU `adapter` (an index into `gpus()`), or on the one
     /// the system prefers for `None`. Rewards go to this wallet.
     pub fn start_mining(&mut self, adapter: Option<usize>) {
@@ -595,15 +637,23 @@ impl Backend {
             return;
         }
         self.mining_error = None;
-        self.log.push(false, &format!("[app] mining started, rewards to {}", self.address));
+        self.log.push(
+            false,
+            &format!("[app] mining started, rewards to {}, kernel {}", self.address, self.kernel.name()),
+        );
         let control = Arc::new(MinerControl::default());
         control.set_limit(self.gpu_limit);
         let opened = Arc::new(Mutex::new(None));
+        let config = KernelConfig {
+            kernel: self.kernel,
+            workgroup: WORKGROUP,
+        };
+        crate::telemetry::set_tag("gpu_kernel", self.kernel.name());
         let thread = {
             let (control, opened) = (control.clone(), opened.clone());
             let (node, miner) = (self.node_url.clone(), self.address.clone());
             std::thread::spawn(move || {
-                let gpu = match Gpu::open(adapter) {
+                let gpu = match Gpu::open_with(adapter, config) {
                     Ok(gpu) => gpu,
                     Err(e) => {
                         *opened.lock().unwrap() = Some(Err(e));
@@ -617,6 +667,7 @@ impl Backend {
             })
         };
         self.mining = Some(Mining {
+            adapter,
             control,
             thread,
             opened,
@@ -1044,10 +1095,14 @@ mod tests {
         backend.set_gpu_limit(3);
         assert_eq!(backend.gpu_limit(), MIN_GPU_LIMIT);
         backend.set_gpu_limit(55);
+        // So is the GPU kernel.
+        assert_eq!(backend.kernel(), Kernel::Baseline);
+        backend.set_kernel(Kernel::Precomputed);
 
         // A second start in the same folder uses the remembered key.
         let again = Backend::start(settings()).unwrap();
         assert_eq!(again.gpu_limit(), 55);
+        assert_eq!(again.kernel(), Kernel::Precomputed);
         assert_eq!(again.key_name, "savings");
         assert_eq!(again.address, backend.address);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1098,8 +1153,13 @@ mod tests {
         assert_eq!(id.len(), 64);
         wait_for("the pending amount", Duration::from_secs(10), || backend.view().pending > 0);
 
+        // Mine the transfer's block with another kernel, switched while
+        // mining: mining restarts with it.
         backend.start_mining(None);
+        backend.set_kernel(Kernel::Precomputed);
+        assert!(backend.log.tail().iter().any(|l| l.text.contains("kernel precomputed")));
         wait_for("the transfer to confirm", Duration::from_secs(300), || {
+            assert!(!matches!(backend.mining_state(), MiningState::Failed(_)));
             backend.view().nonce > before
         });
         backend.stop_mining();

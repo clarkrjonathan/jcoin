@@ -69,6 +69,9 @@ restart.
 Collapsed by default (`JCOIN_APP_DEV=1` starts with it open). It shows:
 
 - The app version and the tip's difficulty in leading zero bits.
+- The GPU kernel the miner runs: `baseline` (default), `unrolled`, or
+  `precomputed` (see `gpu-miner/README.md`). The choice is stored in the file
+  `gpu_kernel`; changing it while mining restarts mining with it.
 - Every open connection from `GET /peers`: peer id, whether it is direct,
   through the relay, or the relay itself, its direction, whether blocks are
   exchanged over it, and its age. The peer's chain height is not shown; the
