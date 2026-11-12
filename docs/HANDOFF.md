@@ -10,7 +10,7 @@ states only what is true now.
 
 **Releases**
 
-- Latest release: `v2.2.6`. Friends run 2.2.x on Windows. The chain is the
+- Latest release: `v2.3.0`. Friends run 2.2.x on Windows. The chain is the
   one started by 2.2.0 (block version 3).
 - Planned releases: `tools/planned`. Settled consensus questions are in
   `docs/adr/0004-difficulty-and-stall-fallback.md`.

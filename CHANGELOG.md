@@ -10,6 +10,37 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.3.0 (2026-11-12)
+
+No consensus change: it runs on the same chain as 2.2.0 and connects and
+syncs with 2.2.0 to 2.2.6. The minor version marks the new GPU kernels.
+
+### Added
+
+- The Developer section has a GPU kernel choice: `baseline` (the default,
+  as before), `unrolled`, and `precomputed`. All three find the same blocks.
+  `precomputed` hashed 2.9 times faster on an NVIDIA RTX 2000 Ada (1992
+  against 694 MH/s) and 3.5 times faster on an Intel Iris Xe (555 against
+  157 MH/s), both under Vulkan on Linux. The choice is remembered; changing
+  it while mining restarts mining with it.
+- `gpu-miner --kernel`, `--workgroup`, and `--bench-matrix`, and
+  `tools/gpu-bench`, which checks each kernel against the CPU and times it.
+
+### Checked
+
+- `--self-test` passed for all three kernels on both GPUs, including
+  targets one above a nonce's own hash.
+- The GPU end-to-end test mined a block with `baseline`, switched to
+  `precomputed` while mining, and mined the block that confirmed a transfer.
+  The test program then crashed on exit (known issue O9; tests only).
+
+Not tested: the new kernels under DirectX 12 (Windows) and on AMD GPUs. If a
+kernel finds nothing or is slow on a computer, choose `baseline` again; a
+wrong result cannot make a bad block, because the CPU checks every hit
+before it is sent.
+
+Consensus: no.
+
 ## 2.2.6 (2026-11-12)
 
 A patch. No consensus change. The program code is the same as 2.2.5; only
