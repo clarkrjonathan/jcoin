@@ -25,6 +25,11 @@
 # block and its items.
 
 [[release]]
+id = "linux-build"
+kind = "patch"
+title = "Linux builds start on Ubuntu 24.04 again"
+
+[[release]]
 id = "wallet"
 kind = "patch"
 title = "Wallet and block detail"
@@ -34,6 +39,25 @@ id = "overhaul"
 kind = "minor"
 title = "Graphical overhaul"
 
+
+# --- linux-build -----------------------------------------------------------
+
+[[item]]
+id = "linux-glibc"
+release = "linux-build"
+title = "The 2.2.4 and 2.2.5 Linux programs need glibc 2.43"
+status = "in progress"
+consensus = false
+source = "tools/update-app on the laptop, 2026-11-12"
+problem = '''
+The release workflow built Linux on `ubuntu-latest`, which GitHub moved from
+Ubuntu 24.04 to 26.04 between the 2.2.3 and 2.2.4 builds. The 2.2.4 and
+2.2.5 Linux programs need glibc 2.43 and exit at once on Ubuntu 24.04
+(glibc 2.39): "version `GLIBC_2.43' not found". A Linux install that updates
+in the app to one of them no longer starts. Windows is not affected.'''
+change = '''
+Build Linux on `ubuntu-24.04`, and fail the build if any Linux program needs
+a glibc newer than 2.39.'''
 
 # --- wallet ----------------------------------------------------------------
 
@@ -89,6 +113,64 @@ open = [
 ]
 
 # --- backlog ---------------------------------------------------------------
+
+[[item]]
+id = "app-api"
+release = "backlog"
+title = "A local API on the desktop app for diagnostics and management"
+status = "to design"
+consensus = false
+source = "Jonathan, 2026-11-12"
+problem = '''
+Scripts such as `tools/node-status` go around the app to the embedded node's
+REST server, and find its port by reading the app's log. They see only what
+the node knows. What the app knows (keys in use, mining state, GPU and its
+limit, the sent list, install and update state, the log) is visible only in
+the window or in Sentry. Managing the app (start or stop mining, set the GPU
+limit, check for or install an update, restart) needs clicks.'''
+change = '''
+The app serves a local API (loopback only) with its own state and actions,
+and passes node queries through, so diagnostics and management scripts use
+one interface. `tools/node-status` and new management scripts move to it.'''
+open = [
+  "Transport and access: HTTP on 127.0.0.1 with a token in the data folder, or a Unix socket and a named pipe on Windows.",
+  "Which actions to expose (mining, GPU limit, update, restart, key switch) and which stay window-only (key export, sending).",
+  "Whether the node's own REST server stays public on loopback or is reached only through the app.",
+  "How a script finds the API: a port file in the data folder instead of reading the log.",
+]
+
+[[item]]
+id = "updater-start-check"
+release = "backlog"
+title = "The updater checks that the new program can start"
+status = "to design"
+consensus = false
+source = "2.2.4 and 2.2.5 Linux builds, 2026-11-12"
+problem = '''
+The in-app updater checks the download's checksum, then swaps it in and
+restarts. A program that cannot start on this system (on Linux, one built
+against a newer glibc) still replaces the working one, and the app no longer
+opens.'''
+change = '''
+Before the swap, check on Linux that the system's glibc covers the new
+program, or start the new program with a flag that exits at once and refuse
+the update if it fails. Keep the old program to start again if the new one
+exits right after the restart.'''
+
+[[item]]
+id = "gpu-slider-log"
+release = "backlog"
+title = "Dragging the GPU limit slider logs and writes every step"
+status = "planned"
+consensus = false
+source = "Sentry, Jons Desktop, 2026-11-12 07:24 UTC"
+problem = '''
+`Backend::set_gpu_limit` runs for each value the slider passes while it is
+dragged. One drag from 35% to 100% logged 14 `gpu_limit_set` lines in one
+second and wrote `gpu_limit` 14 times.'''
+change = '''
+Apply the limit to the miner while dragging, but write the file and log once,
+when the drag ends (egui `drag_stopped`, or `changed` without a drag).'''
 
 [[item]]
 id = "peer-scoring"

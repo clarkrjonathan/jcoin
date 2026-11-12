@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Update the installed desktop app on this Linux computer to a release, the
+# way the in-app updater would, and start it again. Prints a few lines.
+#
+#   tools/update-app [VERSION]        say what it would do (default: latest)
+#   tools/update-app [VERSION] --yes  do it
+#
+# Downloads JeffyCoin-linux-x86_64 and its checksum list from the GitHub
+# release, checks the checksum and that this system's glibc is new enough, stops the running installed copy (by process
+# id, SIGTERM, then waits), puts the new program at ~/.local/bin/jeffycoin,
+# and starts it on the same display. Mining does not resume by itself: press
+# Start mining in the window. Exits non-zero on any failure; the old program
+# is left in place unless the new one is fully written.
+set -euo pipefail
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+version=""; yes=0
+for arg in "$@"; do
+  case "$arg" in
+    --yes) yes=1 ;;
+    *) version="${arg#v}" ;;
+  esac
+done
+
+program="$HOME/.local/bin/jeffycoin"
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_dir"
+
+if [[ -z "$version" ]]; then
+  version="$(gh release view --json tagName --jq .tagName)"; version="${version#v}"
+fi
+installed="$(cat "$HOME/.local/share/jeffycoin-install/version.txt" 2>/dev/null || echo none)"
+
+pids=()
+for p in /proc/[0-9]*; do
+  exe="$(readlink "$p/exe" 2>/dev/null || true)"
+  if [[ "$exe" == "$program" || "$exe" == "$program.old" || "$exe" == "$program (deleted)" ]]; then
+    pids+=("${p#/proc/}")
+  fi
+done
+
+echo "installed $installed; release $version; running copies: ${pids[*]:-none}"
+if [[ $yes -eq 0 ]]; then
+  echo "dry run: add --yes to download, check, replace, and restart"
+  exit 0
+fi
+
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+gh release download "v$version" -D "$tmp" -p JeffyCoin-linux-x86_64 -p SHA256SUMS-linux-x86_64.txt
+expected="$(awk '$2 ~ /JeffyCoin-linux-x86_64$/ {print $1}' "$tmp/SHA256SUMS-linux-x86_64.txt")"
+actual="$(sha256sum "$tmp/JeffyCoin-linux-x86_64" | awk '{print $1}')"
+if [[ -z "$expected" || "$expected" != "$actual" ]]; then
+  echo "checksum mismatch (expected '${expected:-none}', got $actual); nothing changed" >&2
+  exit 1
+fi
+# A program built against a newer glibc than this system has does not start.
+have="$(ldd --version | sed -n '1s/.* \([0-9]\+\.[0-9]\+\)$/\1/p')"
+need="$(objdump -T "$tmp/JeffyCoin-linux-x86_64" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)"
+if [[ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | tail -1)" != "$have" ]]; then
+  echo "$version needs glibc $need; this system has $have; nothing changed" >&2
+  exit 1
+fi
+
+# The display of the running copy, so the new one opens on the same screen.
+display="${DISPLAY:-}"
+if [[ ${#pids[@]} -gt 0 ]]; then
+  display="$(tr '\0' '\n' < "/proc/${pids[0]}/environ" | sed -n 's/^DISPLAY=//p' | sed -n '1p')"
+  kill -TERM "${pids[@]}"
+  for _ in $(seq 30); do
+    alive=0
+    for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [[ $alive -eq 0 ]] && break
+    sleep 0.5
+  done
+  if [[ $alive -eq 1 ]]; then
+    echo "the running copy did not stop within 15 s; nothing replaced" >&2
+    exit 1
+  fi
+fi
+
+install -m 755 "$tmp/JeffyCoin-linux-x86_64" "$program.new"
+mv -f "$program.new" "$program"
+rm -f "$program.old"
+
+DISPLAY="${display:-:0}" setsid nohup "$program" >/dev/null 2>&1 < /dev/null &
+new_pid=$!
+sleep 5
+if ! kill -0 "$new_pid" 2>/dev/null; then
+  echo "replaced with $version, but it exited right after starting" >&2
+  exit 1
+fi
+echo "replaced with $version and started (pid $new_pid); press Start mining in the window"

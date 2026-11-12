@@ -5,6 +5,11 @@
   tools/chain-dump PATH            another blocks.dat
   tools/chain-dump --all           every block (default: first 3, last 15, every 10th)
   tools/chain-dump --tail N        the last N blocks
+  tools/chain-dump --who [--not ADDR,...]
+                                   who mined (blocks, share, first and last,
+                                   longest gap) and every transfer, instead
+                                   of the block table; --not leaves out
+                                   addresses (6+ hex characters each)
 
 Columns: height, time (UTC), seconds since the block before, difficulty in
 leading zero bits, miner (first 6 hex characters of the address), transfers.
@@ -43,8 +48,49 @@ def load(path):
             # The coinbase is first: type (1), sender (32), recipient (32).
             "miner": body[33:65].hex()[:6] if len(body) >= TX else "?",
             "transfers": max(count - 1, 0),
+            "txs": [parse_tx(body[i * TX:(i + 1) * TX]) for i in range(1, count) if len(body) >= (i + 1) * TX],
         }
     return blocks
+
+
+def parse_tx(raw):
+    """A transfer: type (1), sender (32), recipient (32), amount, fee, nonce (8 each)."""
+    amount, fee, nonce = struct.unpack(">QQQ", raw[65:89])
+    return {"sender": raw[1:33].hex(), "recipient": raw[33:65].hex(), "amount": amount, "fee": fee, "nonce": nonce}
+
+
+COIN = 100_000_000
+
+
+def jef(units):
+    return f"{units / COIN:g}"
+
+
+def stamp(t):
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%m-%d %H:%M")
+
+
+def who(chain, skip):
+    """Blocks by miner and every transfer, leaving out addresses in `skip`."""
+    mined = [b for b in chain[1:] if not any(b["miner"].startswith(s[:6]) for s in skip)]
+    total = len(chain) - 1
+    print(f"{total} blocks after genesis; {total - len(mined)} by the left-out addresses")
+    by = {}
+    for b in mined:
+        by.setdefault(b["miner"], []).append(b)
+    for miner, bs in sorted(by.items(), key=lambda kv: -len(kv[1])):
+        times = [b["time"] for b in bs]
+        gap = max((y - x for x, y in zip(times, times[1:])), default=0)
+        print(
+            f"  {miner}  {len(bs):4d} blocks  {100 * len(bs) / total:4.1f}%  "
+            f"first {stamp(times[0])} (h{bs[0]['height']})  last {stamp(times[-1])} (h{bs[-1]['height']})  "
+            f"longest gap {gap // 3600} h {gap % 3600 // 60} min"
+        )
+    txs = [(b, t) for b in chain for t in b["txs"]]
+    shown = [(b, t) for b, t in txs if not any(t["sender"].startswith(s) or t["recipient"].startswith(s) for s in skip)]
+    print(f"{len(txs)} transfers; {len(txs) - len(shown)} involve the left-out addresses")
+    for b, t in shown:
+        print(f"  h{b['height']}  {stamp(b['time'])}  {t['sender'][:6]} -> {t['recipient'][:6]}  {jef(t['amount'])} JEF (fee {jef(t['fee'])}, nonce {t['nonce']})")
 
 
 def canonical(blocks):
@@ -69,7 +115,8 @@ def main():
         return
     show_all = "--all" in args
     tail = int(args[args.index("--tail") + 1]) if "--tail" in args else None
-    paths = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] != "--tail")]
+    skip = args[args.index("--not") + 1].lower().split(",") if "--not" in args else []
+    paths = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in ("--tail", "--not"))]
     path = paths[0] if paths else default_path()
     if not os.path.exists(path):
         sys.exit(f"no chain file at {path}")
@@ -79,6 +126,9 @@ def main():
         print(f"{path}: empty")
         return
     last = len(chain) - 1
+    if "--who" in args:
+        who(chain, skip)
+        return
     for i, b in enumerate(chain):
         if tail is not None:
             shown = i > last - tail
