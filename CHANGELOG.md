@@ -11,6 +11,40 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.2.2 (2026-11-11)
+
+A patch. No consensus change: it runs on the same chain as 2.2.0. Nodes on
+2.2.2 and 2.2.1 still connect and sync with each other.
+
+### Added
+
+- The connections list (Developer section) shows each peer's friendly name
+  beside its peer id. A node now sends its device label to the nodes it
+  connects to, after the handshake. The label is cosmetic and is visible to
+  every peer connected to.
+- On first run, the app asks what to call this computer, with a Skip button.
+  The name can still be changed later in the Developer section.
+- The update screen says why "Install and restart" is unavailable, and offers
+  "Stop mining and install" when mining is the only thing in the way.
+- The log records more of what a node does: a once-a-minute status line
+  (height, peers, mining, pending, balance, and more), transfers sent, blocks
+  received, syncs, reorgs, dropped pending transfers, and the update and
+  install steps. These go to the log file and to the developer's reports.
+
+### Changed
+
+- The logs carry the facts worth querying (which peer, why a dial failed,
+  relay or direct, which height) as fields, so a question can be answered
+  without reading each line's full text.
+- A node no longer stores, shares, or dials loopback and link-local addresses
+  of other machines, which removes most of the failed-dial noise. Ordinary
+  local-network and relayed addresses are unchanged. A repeated failed dial is
+  kept in the local log file but reported once per run.
+
+Consensus: no.
+
+Not tested on Windows; this version's build is the first Windows run.
+
 ## 2.2.1 (2026-11-11)
 
 A small patch. No consensus change: it runs on the same chain as 2.2.0.
