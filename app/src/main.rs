@@ -188,7 +188,7 @@ impl Updates {
         *state.lock().unwrap() = UpdateState::Installing(release.tag.clone());
         std::thread::spawn(move || {
             // `restart` only returns on failure.
-            let result = update::install(&release).and_then(|()| update::restart());
+            let result = update::install(&release).and_then(|exe| update::restart(&exe));
             if let Err(e) = result {
                 *state.lock().unwrap() = UpdateState::Failed(e);
             }

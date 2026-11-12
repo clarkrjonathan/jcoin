@@ -126,20 +126,20 @@ pub fn fetch_releases() -> Result<Vec<Release>, String> {
 }
 
 /// Download `release`, check it, and put it in place of the running program
-/// file. The caller then calls `restart`. On any error the running file is
-/// left as it was.
-pub fn install(release: &Release) -> Result<(), String> {
+/// file. Returns the program's path, for `restart`. On any error the running
+/// file is left as it was.
+pub fn install(release: &Release) -> Result<PathBuf, String> {
     jcoin::log_info!(
         [("event", "update_started".to_string()), ("from", CURRENT.to_string()), ("to", release.tag.clone())];
         "[app] update started: {CURRENT} to {}", release.tag
     );
     match install_inner(release) {
-        Ok(()) => {
+        Ok(exe) => {
             jcoin::log_info!(
                 [("event", "update_installed".to_string()), ("to", release.tag.clone())];
                 "[app] update installed: {}, restarting", release.tag
             );
-            Ok(())
+            Ok(exe)
         }
         Err(e) => {
             jcoin::log_error!(
@@ -151,7 +151,7 @@ pub fn install(release: &Release) -> Result<(), String> {
     }
 }
 
-fn install_inner(release: &Release) -> Result<(), String> {
+fn install_inner(release: &Release) -> Result<PathBuf, String> {
     let (program, _) = asset_names().ok_or("there are no builds for this system")?;
     let http = client(Duration::from_secs(600))?;
     let get = |url: &str| {
@@ -169,8 +169,11 @@ fn install_inner(release: &Release) -> Result<(), String> {
     if actual != expected {
         return Err("the download does not match its checksum; nothing was changed".to_string());
     }
+    // Read the path before the swap: on Linux, `current_exe` follows the
+    // running file, so after it is renamed it names `<program>.old`.
     let exe = std::env::current_exe().map_err(|e| format!("cannot find this program: {e}"))?;
-    replace_program(&exe, &bytes)
+    replace_program(&exe, &bytes)?;
+    Ok(exe)
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -209,9 +212,9 @@ pub fn clean_up() {
     }
 }
 
-/// Start the program file again and end this process.
-pub fn restart() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("cannot find this program: {e}"))?;
+/// Start the program at `exe` (the path `install` returned) and end this
+/// process.
+pub fn restart(exe: &Path) -> Result<(), String> {
     std::process::Command::new(exe)
         .spawn()
         .map_err(|e| format!("the update is installed, but the program could not be restarted: {e}"))?;
@@ -306,6 +309,28 @@ mod tests {
         // A second update replaces the leftover.
         replace_program(&exe, b"newer").unwrap();
         assert_eq!(std::fs::read(with_suffix(&exe, ".old")).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Why `install` returns the path read before the swap: on Linux a running
+    /// program's own path (`/proc/<pid>/exe`, which `current_exe` reads)
+    /// follows the file when it is renamed aside.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_the_running_path_follows_the_renamed_file() {
+        let dir = std::env::temp_dir().join(format!("jcoin-update-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("prog");
+        std::fs::copy("/bin/sleep", &exe).unwrap();
+        let mut child = std::process::Command::new(&exe).arg("30").spawn().unwrap();
+        let running = || std::fs::read_link(format!("/proc/{}/exe", child.id())).unwrap();
+        assert_eq!(running(), exe);
+        replace_program(&exe, b"new").unwrap();
+        assert_eq!(running(), with_suffix(&exe, ".old"));
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+        child.kill().unwrap();
+        child.wait().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

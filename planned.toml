@@ -25,6 +25,11 @@
 # block and its items.
 
 [[release]]
+id = "linux-update"
+kind = "patch"
+title = "The Linux updater restarts the new program"
+
+[[release]]
 id = "wallet"
 kind = "patch"
 title = "Wallet and block detail"
@@ -33,6 +38,25 @@ title = "Wallet and block detail"
 id = "overhaul"
 kind = "minor"
 title = "Graphical overhaul"
+
+# --- linux-update ----------------------------------------------------------
+
+[[item]]
+id = "linux-restart-path"
+release = "linux-update"
+title = "After an update on Linux, the old program starts again"
+status = "in progress"
+consensus = false
+source = "Jonathan, 2026-11-12"
+problem = '''
+`update::restart` starts `std::env::current_exe()`. On Linux that reads
+/proc/self/exe, which follows the running file when it is renamed. The
+updater renames the running program to `<program>.old` before putting the
+new one in place, so the restart starts `<program>.old`: the old version.
+Windows reports the original path, so it works there.'''
+change = '''
+`update::install` returns the program path it read before the swap, and
+`restart` starts that path.'''
 
 # --- wallet ----------------------------------------------------------------
 
