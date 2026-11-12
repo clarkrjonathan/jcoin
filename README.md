@@ -10,5 +10,11 @@ in [`CHANGELOG-PLANNED.md`](CHANGELOG-PLANNED.md).
 ## Latest releases
 
 <!-- RELEASES:START -->
-<!-- Filled by the readme-releases workflow. Run it once to populate this. -->
+| Version | Date | Name |
+| --- | --- | --- |
+| [v2.2.2](https://github.com/clarkrjonathan/jcoin/releases/tag/v2.2.2) | 2026-11-12 | v2.2.2 |
+| [v2.2.1](https://github.com/clarkrjonathan/jcoin/releases/tag/v2.2.1) | 2026-11-12 | v2.2.1 |
+| [v2.2.0](https://github.com/clarkrjonathan/jcoin/releases/tag/v2.2.0) | 2026-11-11 | v2.2.0 |
+| [v2.1.2](https://github.com/clarkrjonathan/jcoin/releases/tag/v2.1.2) | 2026-11-11 | v2.1.2 |
+| [v2.1.1](https://github.com/clarkrjonathan/jcoin/releases/tag/v2.1.1) | 2026-11-11 | v2.1.1 |
 <!-- RELEASES:END -->
