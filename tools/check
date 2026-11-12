@@ -4,24 +4,42 @@
 #
 #   tools/check                 test jcoin, gpu-miner, app
 #   tools/check jcoin app       only those packages
-#   tools/check --gpu           also the app's GPU end-to-end test (needs a GPU, ~10 s)
+#   tools/check --gpu           also the GPU tests: app end to end, GPU use limit (~40 s)
 #   tools/check --build         also build the release programs
+#   tools/check --at REF ...    the same checks on commit REF (for example main),
+#                               to see whether a failure is new. Uses a reused
+#                               worktree in .check-at/; the first run builds
+#                               everything (minutes)
 #
+# A failure prints compiler errors, failed tests, panics, and crashes (a test
+# program killed by a signal), and saves the whole output in .check-logs/.
 # Exit status is 0 only if everything passed.
 set -u
 root="$(cd "$(dirname "$0")/.." && pwd)"
+if [ "${1:-}" = --at ]; then
+  ref="${2:?--at needs a commit, for example main}"; shift 2
+  wt="$root/.check-at"
+  if [ ! -d "$wt" ]; then git -C "$root" worktree add --detach "$wt" "$ref" >/dev/null 2>&1 || { echo "cannot make a worktree at $ref" >&2; exit 2; }
+  else git -C "$wt" checkout --detach --quiet "$ref" || exit 2; fi
+  echo "at $(git -C "$wt" log -1 --format='%h %s' | cut -c1-70)"
+  # The checked-out commit may have an older copy of this script; use this one.
+  CHECK_ROOT="$wt" exec "$0" "$@"
+fi
+root="${CHECK_ROOT:-$root}"
 gpu=0; build=0; packages=()
 for arg in "$@"; do
   case "$arg" in
     --gpu) gpu=1 ;;
     --build) build=1 ;;
-    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     jcoin|gpu-miner|app) packages+=("$arg") ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
 [ ${#packages[@]} -eq 0 ] && packages=(jcoin gpu-miner app)
 status=0
+logs="$root/.check-logs"
+rm -rf "$logs" # only this run's failures
 
 # Run cargo in a package; print "name: summary", or the failure detail.
 run() { # label package cargo-args...
@@ -37,9 +55,18 @@ run() { # label package cargo-args...
     esac
   else
     status=1
-    echo "$label: FAILED"
-    # Compiler errors, failed test names, and panic messages; not the whole log.
-    grep -E "^error|^ +--> |^test .* FAILED|panicked at|assertion|^  (left|right):|^failures:" <<<"$out" | head -40 | sed 's/^/    /'
+    mkdir -p "$logs"
+    local log="$logs/$(tr 'A-Z' 'a-z' <<<"$label" | tr -cs 'a-z0-9\n' '-' | sed 's/-$//').log"
+    printf '%s\n' "$out" > "$log"
+    echo "$label: FAILED (full output: ${log#$root/})"
+    # Compiler errors with their locations (not warnings'), failed test
+    # names, panic messages, and crashes; not the whole log.
+    awk '/^error/ {e=1} /^warning/ {e=0}
+         /^error/ || (e && /^ +--> /) || /^test .* FAILED|panicked at|assertion|^  (left|right):|^failures:|signal: |process didn.t exit/' <<<"$out" \
+      | grep -v "^error: test failed, to rerun" | head -40 | sed 's/^/    /'
+    if grep -q "^test result: ok" <<<"$out" && ! grep -qE "FAILED|panicked" <<<"$out"; then
+      echo "    (every test passed; the test program itself failed afterwards)"
+    fi
   fi
 }
 
@@ -48,6 +75,9 @@ for package in "${packages[@]}"; do
   [ $build -eq 1 ] && run "$package (build)" "$package" build --release
   if [ "$package" = app ] && [ $gpu -eq 1 ]; then
     run "app (GPU end to end)" app test --release -- --ignored
+  fi
+  if [ "$package" = gpu-miner ] && [ $gpu -eq 1 ]; then
+    run "gpu-miner (GPU use limit)" gpu-miner test --release -- --ignored
   fi
 done
 exit $status

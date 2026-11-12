@@ -69,7 +69,7 @@ translation step guesses.
 2. What kinds of lines one node has:
    `query: "install_id:<id>"`, `fields: ["event","severity","count()"]`, `limit: 40`.
 3. The story for that node. Leave `message` out when the event name is enough:
-   `query: "install_id:<id> event:[startup,reservation_ok,reservation_lost,rendezvous_registered,peer_connected,peer_disconnected,hole_punch_ok,hole_punch_failed,mining_started,mining_stopped,block_won]"`,
+   `query: "install_id:<id> event:[startup,reservation_ok,reservation_lost,rendezvous_registered,peer_connected,peer_disconnected,hole_punch_ok,hole_punch_failed,relay_replaced,mining_started,mining_stopped,block_won]"`,
    `fields: ["timestamp","event","message"]`, `sort: "timestamp"`, `limit: 30`.
 4. Only if needed, errors without the noise:
    `query: "install_id:<id> severity:[error,warn] !event:dial_failed !event:stream_failed !event:hole_punch_failed"`,
@@ -99,6 +99,7 @@ Rules for MCP queries:
 | `rendezvous_registered` | Registered for discovery; other nodes can find it |
 | `peer_connected` / `peer_disconnected` | A protocol session with another node started or ended. `(out)` means this node dialed |
 | `hole_punch_ok` / `hole_punch_failed` | A direct connection was or was not made; on failure the relay carries the traffic |
+| `relay_replaced` | A direct connection to a peer opened (LAN address or hole punch), so its relayed connection was closed; the session moves to the direct one (2.2.3+) |
 | `mining_started` / `mining_stopped` / `gpu_limit_set` | Mining controls |
 | `block_won` / `block_accepted` | This node mined a block |
 | `status` | Once a minute: height, peers, reservation, mining, hash_rate, gpu_limit, pending, balance (see `status`/`diagnose`) |

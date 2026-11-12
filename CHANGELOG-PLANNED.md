@@ -37,66 +37,32 @@ change is not).
   fallback at 20 minutes).
 - Redeploy the relay and the iMac node (see "Operations").
 
-## 2.2.3: network health and mining view
+## Left over from 2.2.3
 
-### A block tracker and the average block time
-
-- Status: planned
-- Consensus: no
-- Source: Jonathan's note, 2026-11-11
-- Problem: the app shows only the current block height. It does not show
-  whether blocks are arriving on time, so a stalled or racing chain is not
-  visible. The stall on 2026-11-11 was found by reading the chain file.
-- Planned change: a view of recent blocks (height, time, time since the block
-  before it, difficulty, miner) and the average block time over the last
-  blocks, next to the 300-second target, plus the time since the last block.
-
-### Expected time to a block for this node
+### Several direct connections between two nodes
 
 - Status: planned
 - Consensus: no
-- Source: Jonathan's note, 2026-11-11
-- Problem: a miner cannot tell what to expect from their own GPU.
-- Planned change: show the expected time for this node to find a block if it
-  were the only one mining: current difficulty divided by this node's hash
-  rate. State that it is an average and that a block can take much less or
-  much more.
+- Source: seen while building 2.2.3, with `tools/local-net up 2 relay`
+- Problem: both nodes dial each other's direct address, and a hole punch can
+  add one more, so a pair can keep up to three direct connections. Only one
+  carries the session; the others stay open.
+- Planned change: only the smaller peer id dials (as for sessions), or close
+  direct connections that carry no session once one does. The host cannot
+  yet tell which connection carries the session.
 
-### The GPU use limit has no effect below 100%
+### Address book entries never expire
 
-- Status: fixed in 2.2.0 (the rest loop now sleeps for the computed time).
-  Still to do here: measure the hash rate through the mining loop in the app
+- Status: not planned yet; decide after 2.2.3's direct connections have been
+  seen in the field
 - Consensus: no
-- Source: Jonathan's note, 2026-11-11
-- Found: in the app, every setting below 100% gives about the same hash rate,
-  and 100% is about ten times higher.
-- Likely cause, from reading `gpu-miner/src/miner.rs`: the rest between GPU
-  dispatches goes through `MinerControl::pause`, which sleeps in steps of
-  100 ms. A dispatch takes about 30 ms, so any limit below 100% rests at
-  least 100 ms for each 30 ms of work, about 20% to 25% use at every setting.
-  `--bench` sleeps for the exact time, which is why the benchmark numbers in
-  the 2.1.2 notes were proportional and the app is not. Not yet confirmed by
-  a measurement in the app.
-- Planned change: rest for the computed time, in steps no longer than what
-  remains. Add a test of the rest loop's timing, and measure the hash rate
-  through the mining loop, not only through `--bench`.
-
-### Pass on relayed addresses, and reach nodes on the same network directly
-
-- Status: planned; needs investigation first
-- Consensus: no
-- Source: Jonathan's note, 2026-11-11
-- Problem: discovery depends on the relay's rendezvous list. Jonathan wants
-  nodes to tell each other about nodes they reach through the relay as well,
-  so a node can be found through any node that knows it.
-- Related finding, 2026-11-11: two nodes on the same LAN (192.168.0.x)
-  connected to each other through the relay. Neither tried the other's LAN
-  address.
-- To investigate: what the address exchange (`ADDR`, `GETADDR`) passes on
-  today, whether relayed (`/p2p-circuit`) addresses are included, and why a
-  LAN address was not tried.
-- This interacts with "Stop sending lines that say nothing" in 2.2.2: pass on
-  addresses that can be reached, not every address a node has.
+- Source: investigation for 2.2.3, 2026-11-11
+- Problem: relayed addresses are already passed on (a node's own circuit
+  address goes out in every `ADDR`, plus up to 64 book entries), so a node
+  can be found through any node that knows it. But entries never expire,
+  and the 64 are taken in hash-set order, not the most recent.
+- Planned change: expire entries not seen for a while, and pass on the most
+  recently seen first.
 
 ## 2.2.4: wallet and block detail
 

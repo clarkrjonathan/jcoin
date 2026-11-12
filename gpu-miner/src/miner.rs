@@ -338,6 +338,79 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(50));
     }
 
+    /// A node that hands out work no GPU can solve (target zero) at height 1
+    /// and reports height 0, so `mine` hashes one job for as long as it runs.
+    fn unsolvable_node() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let body = if request.starts_with("GET /mining/work/") {
+                    format!(
+                        r#"{{"job":1,"height":1,"header":"{}","target":"{}"}}"#,
+                        "00".repeat(HEADER_LEN),
+                        "00".repeat(32)
+                    )
+                } else {
+                    r#"{"height":0}"#.to_string()
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        url
+    }
+
+    /// The GPU use limit, measured through the mining loop the app runs (not
+    /// `--bench`): the hash rate at 50% and 25% is about that share of 100%.
+    #[test]
+    #[ignore = "needs a GPU; about 30 s"]
+    fn the_limit_scales_the_hash_rate_of_the_mining_loop() {
+        let gpu = crate::gpu::Gpu::open(None).expect("a GPU");
+        let batch = ((1u32 << 22) / crate::gpu::WORKGROUP * crate::gpu::WORKGROUP).min(gpu.max_batch());
+        let node = unsolvable_node();
+        let control = std::sync::Arc::new(MinerControl::default());
+        let rate_at = |percent: u32| {
+            control.set_limit(percent);
+            // Let one 2 s window pass under the new limit, then average three.
+            std::thread::sleep(Duration::from_millis(2_500));
+            let mut sum = 0u64;
+            for _ in 0..3 {
+                std::thread::sleep(Duration::from_secs(2));
+                sum += control.hash_rate.load(Ordering::Relaxed);
+            }
+            sum as f64 / 3.0
+        };
+        std::thread::scope(|scope| {
+            let c = control.clone();
+            let (gpu, node) = (&gpu, &node);
+            scope.spawn(move || mine(gpu, node, &"11".repeat(32), batch, Duration::from_secs(600), &c));
+            let full = rate_at(100);
+            let half = rate_at(50);
+            let quarter = rate_at(25);
+            control.stop();
+            println!(
+                "hash rate: 100% {:.1} MH/s, 50% {:.1} MH/s ({:.2}), 25% {:.1} MH/s ({:.2})",
+                full / 1e6,
+                half / 1e6,
+                half / full,
+                quarter / 1e6,
+                quarter / full
+            );
+            assert!(full > 0.0, "no hash rate at 100%");
+            assert!((0.35..0.65).contains(&(half / full)), "50% gave {:.2} of full", half / full);
+            assert!((0.15..0.35).contains(&(quarter / full)), "25% gave {:.2} of full", quarter / full);
+        });
+    }
+
     #[test]
     fn the_limit_defaults_to_full_power_and_is_clamped() {
         let control = MinerControl::default();

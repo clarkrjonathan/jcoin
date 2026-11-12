@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
-"""One line on the state of a local node.
+"""The state of a local node, in a few lines.
 
-  tools/node-status            the desktop app's node on this computer
-  tools/node-status PORT       a node whose REST server is on 127.0.0.1:PORT
-  tools/node-status PORT ADDR  also the balance of an address (64 hex)
+  tools/node-status [PORT] [ADDR] [--peers] [--blocks N] [--wait COND [SECS]]
 
-Prints height, difficulty, peers (and how many exchange blocks), the
-newer-rules signal, and for the app its key's balance and pending amount.
+  PORT        a node whose REST server is on 127.0.0.1:PORT; without it, the
+              desktop app's node on this computer (found from its log)
+  ADDR        also the balance of this address (64 hex)
+  --peers     one line per open connection: peer, label, direct or relayed,
+              whether it carries a session, its address
+  --blocks N  the last N blocks (at most 100): height, time after the block
+              before, difficulty bits, miner; and the average block time
+  --wait COND wait until COND holds, checking every second, for at most SECS
+              (default 60); exit 1 on timeout. COND is one of:
+                direct     a direct (not relayed) session with another node
+                peers=N    at least N connections with a session
+                height=N   the chain is at height N or more
+
+The first line always gives height, difficulty, connections, the newer-rules
+signal, and the balance if an address is known.
 """
-import json, math, os, re, sys, urllib.request
+import json, math, os, re, sys, time, urllib.request
 
 
 def get(port, path):
@@ -25,25 +36,24 @@ def app_log():
     return open(path, errors="replace").read() if os.path.exists(path) else ""
 
 
-def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    if len(args) != len(sys.argv) - 1:
-        print(__doc__)
-        return
-    port = args[0] if args else None
-    address = args[1] if len(args) > 1 else None
-    if port is None:
-        log = app_log()
-        ports = re.findall(r"REST on 127\.0\.0\.1:(\d+)", log)
-        keys = re.findall(r"key '[^']+' ([0-9a-f]{64})", log)
-        if not ports:
-            sys.exit("no app log found; give a port")
-        port, address = ports[-1], (keys[-1] if keys else None)
+def bits(target_hex):
+    return 256 - math.log2(int(target_hex, 16) + 1)
+
+
+def span(secs):
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs} s"
+    if secs < 3600:
+        return f"{secs // 60} min {secs % 60} s"
+    return f"{secs // 3600} h {secs % 3600 // 60} min"
+
+
+def summary(port, address):
     chain = get(port, "/chain")
     if chain is None:
-        sys.exit(f"no node answers on 127.0.0.1:{port}")
-    bits = 256 - math.log2(int(chain["target"], 16))
-    parts = [f"height {chain['height']}", f"tip {bits:.1f} bits"]
+        return None
+    parts = [f"height {chain['height']}", f"tip {bits(chain['target']):.1f} bits"]
     peers = get(port, "/peers")
     if peers:
         conns = peers["connections"]
@@ -59,7 +69,102 @@ def main():
         account = get(port, f"/balance/{address}")
         if account:
             parts.append(f"balance {account['balance'] / 1e8:g} JEF, pending {account['pending'] / 1e8:g}, nonce {account['nonce']}")
-    print(f"127.0.0.1:{port}: " + "; ".join(parts))
+    return f"127.0.0.1:{port}: " + "; ".join(parts)
+
+
+def print_peers(port):
+    peers = get(port, "/peers") or {"connections": []}
+    for c in peers["connections"]:
+        kind = "relay" if c["is_relay"] else ("relayed" if c["relayed"] else "direct")
+        label = c.get("label") or "-"
+        session = "session" if c["session"] else "no session"
+        print(f"  {c['peer'][-6:]}  {label:<14} {kind:<8} {session:<10} {c['address'][:70]}")
+    if not peers["connections"]:
+        print("  no connections")
+
+
+def print_blocks(port, n):
+    recent = get(port, f"/chain/recent?count={n}")
+    if recent is None:
+        print("  no /chain/recent (node older than 2.2.3?)")
+        return
+    for b in recent["blocks"]:
+        gap = span(b["gap"]) if b["gap"] is not None else "genesis"
+        miner = b["miner"][:10] if b["miner"] else "-"
+        print(f"  {b['height']:>6}  after {gap:<12} {bits(b['target']):5.1f} bits  miner {miner}  transfers {b['transfers']}")
+    if recent["average_gap"] is not None:
+        print(f"  average {span(recent['average_gap'])}; last block {span(recent['since_tip'] or 0)} ago")
+
+
+def holds(port, cond):
+    if cond == "direct":
+        peers = get(port, "/peers") or {"connections": []}
+        return any(c["session"] and not c["relayed"] and not c["is_relay"] for c in peers["connections"])
+    name, _, value = cond.partition("=")
+    if name == "peers":
+        peers = get(port, "/peers") or {"connections": []}
+        return len({c["peer"] for c in peers["connections"] if c["session"]}) >= int(value)
+    if name == "height":
+        chain = get(port, "/chain")
+        return chain is not None and chain["height"] >= int(value)
+    sys.exit(f"unknown condition {cond!r}; see --help")
+
+
+def main():
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return
+    show_peers = "--peers" in argv
+    argv = [a for a in argv if a != "--peers"]
+    blocks = wait = None
+    timeout = 60
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--blocks":
+            blocks = min(int(argv[i + 1]), 100)
+            i += 2
+        elif a == "--wait":
+            wait = argv[i + 1]
+            i += 2
+            if i < len(argv) and argv[i].isdigit() and len(argv[i]) < 6:
+                timeout = int(argv[i])
+                i += 1
+        elif a.startswith("-"):
+            sys.exit(f"unknown option {a}; see --help")
+        else:
+            rest.append(a)
+            i += 1
+    port = rest[0] if rest else None
+    address = rest[1] if len(rest) > 1 else None
+    if port is None:
+        log = app_log()
+        ports = re.findall(r"REST on 127\.0\.0\.1:(\d+)", log)
+        keys = re.findall(r"key '[^']+' ([0-9a-f]{64})", log)
+        if not ports:
+            sys.exit("no app log found; give a port")
+        port, address = ports[-1], (keys[-1] if keys else None)
+
+    if wait:
+        start = time.time()
+        while not holds(port, wait):
+            if time.time() - start > timeout:
+                print(f"127.0.0.1:{port}: '{wait}' did not hold within {timeout} s")
+                print(summary(port, address) or f"no node answers on 127.0.0.1:{port}")
+                sys.exit(1)
+            time.sleep(1)
+        print(f"127.0.0.1:{port}: '{wait}' holds after {time.time() - start:.0f} s")
+
+    line = summary(port, address)
+    if line is None:
+        sys.exit(f"no node answers on 127.0.0.1:{port}")
+    print(line)
+    if show_peers:
+        print_peers(port)
+    if blocks:
+        print_blocks(port, blocks)
 
 
 if __name__ == "__main__":

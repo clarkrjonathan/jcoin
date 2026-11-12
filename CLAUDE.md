@@ -45,11 +45,14 @@ Run these in place of composing commands. Each prints a few lines.
 
 | Task | Command |
 | --- | --- |
-| Build and test everything | `tools/check` (`--gpu` adds the GPU test, `--build` builds programs) |
+| Build and test everything | `tools/check` (`--gpu` adds the GPU tests, `--build` builds programs; failures saved in `.check-logs/`) |
+| Is a failure new? | `tools/check --at main [PACKAGE]` (same checks on another commit) |
+| Is an intermittent test fixed? | `tools/repeat-test PACKAGE FILTER [N] [--ignored]` |
 | Release a version | `tools/release 2.2.1 --yes` (only when told; see the `release` skill) |
-| State of a local node or the app | `tools/node-status [PORT]` |
+| State of a local node or the app | `tools/node-status [PORT] [--peers] [--blocks N]` |
+| Wait for a node state | `tools/node-status PORT --wait direct\|peers=N\|height=N [SECS]` |
 | Read a chain file as a table | `tools/chain-dump [PATH] [--tail N]` |
-| Throwaway local nodes | `tools/local-net up [N] [mine]`, `status`, `down` |
+| Throwaway local nodes | `tools/local-net up [N] [mine] [relay]`, `status`, `peers`, `down` |
 | Picture of the app window | `tools/app-shot [--dev] [--tall] [--mainnet]` |
 | Friends' logs (Sentry) | the `sentry-logs` skill, `tools/sentry-logs` |
 | Diagnose one node's logs in one call | `tools/sentry-logs diagnose NODE` (also `status`, `peers`) |
@@ -59,6 +62,9 @@ Run these in place of composing commands. Each prints a few lines.
 ## Keeping token use low
 
 - Do not print build or test logs. `tools/check` shows failures only.
+- Do not improvise a diagnosis. Starting processes by hand, `curl` plus a
+  JSON one-liner, waiting loops, or `git stash` to compare with `main` all
+  mean a script is missing: extend one in `tools/` first, then use it.
 - Do not read a whole source file to find one thing: the per-folder guides
   list what each file holds; search for the function, then read that part.
 - Edit with the edit tool. Do not rewrite files through scripts.

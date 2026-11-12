@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Run one test (or every test matching a filter) many times, to tell a fixed
+# intermittent failure from luck.
+#
+#   tools/repeat-test PACKAGE FILTER [N] [--ignored]
+#   tools/repeat-test --at REF PACKAGE FILTER [N]   the same on commit REF, in
+#                                                   tools/check's .check-at/
+#
+# PACKAGE is jcoin, gpu-miner, or app; FILTER is a cargo test filter; N
+# defaults to 10; --ignored runs ignored tests (the GPU ones). Builds once,
+# then runs the test program that holds the matching tests N times. Prints
+# "passed X of N", and for each failed run the panic or crash line. The output
+# of failed runs is kept in .check-logs/repeat-RUN.log. Exit status 1 if any
+# run failed.
+set -u
+root="$(cd "$(dirname "$0")/.." && pwd)"
+if [ "${1:-}" = --at ]; then
+  ref="${2:?--at needs a commit, for example main}"; shift 2
+  wt="$root/.check-at"
+  if [ ! -d "$wt" ]; then git -C "$root" worktree add --detach "$wt" "$ref" >/dev/null 2>&1 || { echo "cannot make a worktree at $ref" >&2; exit 2; }
+  else git -C "$wt" checkout --detach --quiet "$ref" || exit 2; fi
+  echo "at $(git -C "$wt" log -1 --format='%h %s' | cut -c1-70)"
+  CHECK_ROOT="$wt" exec "$0" "$@"
+fi
+root="${CHECK_ROOT:-$root}"
+package=""; filter=""; n=10; extra=()
+for arg in "$@"; do
+  case "$arg" in
+    --ignored) extra=(--ignored) ;;
+    -h|--help) package="" ; break ;;
+    *) if [ -z "$package" ]; then package=$arg; elif [ -z "$filter" ]; then filter=$arg; else n=$arg; fi ;;
+  esac
+done
+case "$package" in jcoin|gpu-miner|app) ;; *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
+[ -n "$filter" ] || { echo "a test filter is needed" >&2; exit 2; }
+cd "$root/$package" || exit 2
+# Build once; keep the test program whose list holds a matching test.
+progs="$(cargo test --release --no-run --message-format=json 2>/dev/null \
+  | python3 -c 'import sys, json
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get("reason") == "compiler-artifact" and m.get("profile", {}).get("test") and m.get("executable"):
+        print(m["executable"])')"
+[ -n "$progs" ] || { echo "build failed: run tools/check $package" >&2; exit 2; }
+prog=""
+for p in $progs; do
+  if "$p" --list "$filter" "${extra[@]}" 2>/dev/null | grep -q ': test$'; then prog=$p; break; fi
+done
+[ -n "$prog" ] || { echo "no test matches '$filter' in $package${extra[*]:+ (with --ignored)}" >&2; exit 2; }
+mkdir -p "$root/.check-logs"; rm -f "$root/.check-logs"/repeat-*.log
+passed=0
+for i in $(seq 1 "$n"); do
+  out="$("$prog" "$filter" "${extra[@]}" 2>&1)"; code=$?
+  if [ $code -eq 0 ]; then
+    passed=$((passed + 1))
+  else
+    printf '%s\n' "$out" > "$root/.check-logs/repeat-$i.log"
+    # The panic's location and, on the next line, its message.
+    why="$(grep -m1 -A1 "panicked at" <<<"$out" | sed 's/^thread .*panicked at //' | paste -sd ' ' || true)"
+    [ -z "$why" ] && [ $code -gt 128 ] && why="crashed with signal $((code - 128))"
+    echo "run $i: failed: ${why:-exit $code}; output in .check-logs/repeat-$i.log"
+  fi
+done
+echo "$package $filter: passed $passed of $n"
+[ "$passed" -eq "$n" ]

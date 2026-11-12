@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use libp2p::multiaddr::Protocol;
-use libp2p::swarm::dial_opts::DialOpts;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{
     dcutr, identify, identity, noise, ping, relay, rendezvous, tcp, yamux, Multiaddr, PeerId,
@@ -194,8 +194,17 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
 
     // Dial requests from the address book.
     let (dial_tx, mut dial_rx) = mpsc::channel::<Multiaddr>(256);
+    let redial_tx = dial_tx.clone();
     network.set_dialer(dial_tx);
     let mut pending: HashMap<ConnectionId, Multiaddr> = HashMap::new();
+    // Open connections that run through a relay circuit, by peer. Closed when
+    // a direct connection to the same peer opens.
+    let mut relayed_conns: HashMap<ConnectionId, PeerId> = HashMap::new();
+    // Peers reached only through the relay with a direct dial in flight, and
+    // their other direct addresses, tried one at a time if it fails. One dial
+    // per address at once would leave a connection per interface (Docker and
+    // VM bridges included), and those stay open.
+    let mut upgrades: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
 
     // The relay: reserve a slot (listen on a circuit) and use it for discovery.
     // The host first connects to the relay itself, then asks for the
@@ -259,13 +268,16 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                         circuit_listener = reserve(&mut swarm, relay_addr);
                     }
                     let remote = endpoint.get_remote_address();
+                    // An inbound relayed connection's remote address is only
+                    // `/p2p/<peer>`; the circuit shows in the local address.
+                    let relayed = endpoint.is_relayed();
                     network.connection_opened(
                         connection_id.to_string(),
                         super::network::ConnectionInfo {
                             peer: peer_id.to_string(),
                             address: remote.to_string(),
                             outbound: endpoint.is_dialer(),
-                            relayed: remote.iter().any(|p| matches!(p, Protocol::P2pCircuit)),
+                            relayed,
                             is_relay,
                             session: false,
                             since: std::time::SystemTime::now()
@@ -275,6 +287,32 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                             label: None,
                         },
                     );
+                    // A direct connection replaces relayed ones to the same
+                    // peer: closing them ends the session on the relay, and
+                    // `closed_rx` reopens it on the direct connection.
+                    if relayed {
+                        relayed_conns.insert(connection_id, peer_id);
+                    } else if !is_relay {
+                        // Direct addresses still waiting for this peer are not needed.
+                        for addr in upgrades.remove(&peer_id).unwrap_or_default() {
+                            network.dial_finished(&addr, true);
+                        }
+                        let old: Vec<ConnectionId> = relayed_conns
+                            .iter()
+                            .filter(|(_, p)| **p == peer_id)
+                            .map(|(c, _)| *c)
+                            .collect();
+                        if !old.is_empty() {
+                            crate::log_info!(
+                                [("peer", peer6(&peer_id.to_string())), ("via", "direct".to_string())];
+                                "[p2p] direct connection to {peer_id} at {remote}; closing {} relayed connection(s)",
+                                old.len()
+                            );
+                            for c in old {
+                                swarm.close_connection(c);
+                            }
+                        }
+                    }
                     // The dialing side opens the protocol stream, unless a
                     // session already runs (for example, a hole-punched direct
                     // connection after a relayed one).
@@ -286,6 +324,9 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                     let addr = pending.remove(&connection_id);
                     if let Some(addr) = &addr {
                         network.dial_finished(addr, false);
+                        if let Some(peer) = peer_of(addr) {
+                            next_upgrade(&mut upgrades, peer, &redial_tx, &network);
+                        }
                     }
                     let who = peer_id.map(|p| p.to_string()).unwrap_or_else(|| "?".into());
                     let via = addr.as_ref().map(via).unwrap_or("direct");
@@ -299,6 +340,7 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                     );
                 }
                 SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
+                    relayed_conns.remove(&connection_id);
                     network.connection_closed(&connection_id.to_string());
                     if num_established == 0 {
                         network.set_connected(peer_id, false);
@@ -385,7 +427,22 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
             },
 
             Some(addr) = dial_rx.recv() => {
-                let opts = dial_opts(&addr);
+                // A direct address of a peer reached only through the relay
+                // (`Network::maybe_dial` let it through): dial even though
+                // the peer is connected.
+                let upgrade_peer = peer_of(&addr).filter(|p| via(&addr) == "direct" && swarm.is_connected(p));
+                if let Some(peer) = upgrade_peer {
+                    if network.has_direct_connection(&peer) {
+                        network.dial_finished(&addr, true);
+                        continue;
+                    }
+                    if let Some(waiting) = upgrades.get_mut(&peer) {
+                        waiting.push(addr); // one direct dial per peer at a time
+                        continue;
+                    }
+                    upgrades.insert(peer, Vec::new());
+                }
+                let opts = dial_opts(&addr, upgrade_peer.is_some());
                 let id = opts.connection_id();
                 match swarm.dial(opts) {
                     Ok(()) => { pending.insert(id, addr); }
@@ -396,6 +453,9 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                     }
                     Err(e) => {
                         network.dial_finished(&addr, false);
+                        if let Some(peer) = upgrade_peer {
+                            next_upgrade(&mut upgrades, peer, &redial_tx, &network);
+                        }
                         crate::log_error!(
                             [
                                 ("peer", peer_of(&addr).map(|p| peer6(&p.to_string())).unwrap_or_else(|| "?".into())),
@@ -423,12 +483,12 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                 for (addr, known) in &bootstrap {
                     let connected = known.map(|p| swarm.is_connected(&p)).unwrap_or(false);
                     if !connected {
-                        let _ = swarm.dial(dial_opts(addr));
+                        let _ = swarm.dial(dial_opts(addr, false));
                     }
                 }
                 if let Some((relay_id, relay_addr)) = &relay_peer {
                     if !swarm.is_connected(relay_id) {
-                        let _ = swarm.dial(dial_opts(relay_addr));
+                        let _ = swarm.dial(dial_opts(relay_addr, false));
                         continue;
                     }
                     if circuit_listener.is_none() {
@@ -480,6 +540,12 @@ fn open_session(
             Err(e) => {
                 release(&sessions, peer);
                 crate::log_error!("[p2p] could not open a protocol stream to {peer}: {e}");
+                // The connection it was opening on may have closed (for
+                // example, a relayed one replaced by a direct one). Let the
+                // host reopen on what remains, after a pause so a peer that
+                // keeps refusing is not retried in a tight loop.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = closed_tx.send(peer).await;
             }
         }
     });
@@ -529,10 +595,30 @@ fn reserve(swarm: &mut libp2p::Swarm<Behaviour>, relay_addr: &Multiaddr) -> Opti
 /// on. Windows does not allow a second socket to connect from a port that is
 /// in use the way Unix does, and such dials fail with "Only one usage of each
 /// socket address" (os error 10048), so on Windows every dial gets a new port.
-fn dial_opts(addr: &Multiaddr) -> DialOpts {
+/// A direct dial to `peer` (reached only through the relay) failed: hand its
+/// waiting addresses back to the dial queue. The first one becomes the next
+/// dial and the rest wait behind it again.
+fn next_upgrade(
+    upgrades: &mut HashMap<PeerId, Vec<Multiaddr>>,
+    peer: PeerId,
+    redial: &mpsc::Sender<Multiaddr>,
+    network: &Network,
+) {
+    for addr in upgrades.remove(&peer).unwrap_or_default() {
+        if redial.try_send(addr.clone()).is_err() {
+            network.dial_finished(&addr, false);
+        }
+    }
+}
+
+fn dial_opts(addr: &Multiaddr, even_if_connected: bool) -> DialOpts {
     match peer_of(addr) {
         Some(peer) => {
-            let opts = DialOpts::peer_id(peer).addresses(vec![addr.clone()]);
+            let mut opts = DialOpts::peer_id(peer);
+            if even_if_connected {
+                opts = opts.condition(PeerCondition::Always);
+            }
+            let opts = opts.addresses(vec![addr.clone()]);
             if cfg!(windows) { opts.allocate_new_port().build() } else { opts.build() }
         }
         None => {

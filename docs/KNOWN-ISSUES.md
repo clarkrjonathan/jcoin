@@ -101,6 +101,15 @@ that node's miners only if another peer relays it again later, which does not
 happen today. Fix direction: hold out-of-order transactions in a small
 per-sender buffer and admit them when the gap fills.
 
+### O9. The app's test program sometimes crashes when it exits
+All app tests pass, then the test program ends with SIGSEGV: about 1 run
+in 20 for `tools/check app`, and every run of the GPU end-to-end test
+(`tools/check --gpu`). It happens on `main` at 2.2.2 as well
+(`tools/repeat-test --at main app tests 20`). Likely cause, not confirmed:
+threads the tests leave running (node, miner, GPU device) are torn down
+while the process exits. Fix direction: stop the backend's threads and drop
+the GPU before a test returns. It affects tests only, not the app.
+
 ## Suggested fix order
 1. **V1** bound/prune the fork store (cap by work-distance from tip or by count).
 2. **O1** re-queue transactions from orphaned blocks on reorg.

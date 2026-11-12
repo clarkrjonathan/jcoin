@@ -1,51 +1,79 @@
 #!/usr/bin/env bash
 # Throwaway nodes on this computer for a test, on the regtest network.
 #
-#   tools/local-net up [N]     start N nodes (default 2), none mining
-#   tools/local-net up N mine  node 1 also mines on the CPU (many blocks a second)
-#   tools/local-net status     one line for each node
+#   tools/local-net up [N] [mine] [relay]  start N nodes (default 2)
+#       mine   node 1 also mines on the CPU (many blocks a second)
+#       relay  start a relay on 127.0.0.1:3900; the nodes know only the relay
+#              and find each other through its rendezvous, like the app.
+#              They listen on all interfaces, so their LAN addresses are
+#              advertised (tests direct connections replacing relayed ones)
+#   tools/local-net status     one line for each node (and the relay)
+#   tools/local-net peers      each node's connections, one line each
 #   tools/local-net down       stop them and delete their data
 #
-# Node i has REST on 127.0.0.1:39<i>0 and P2P on 127.0.0.1:39<i>1; nodes 2..N
-# dial node 1. Data and logs are in .local-net/ (git-ignored). Regtest has
-# fixed, trivial difficulty. The nodes are stopped by process id. To mine one
-# block on demand, run the GPU miner briefly against node 1:
+# Node i has REST on 127.0.0.1:39<i>0 and P2P on port 39<i>1. Without
+# relay, nodes 2..N dial node 1. Data and logs are in .local-net/
+# (git-ignored). Regtest has fixed, trivial difficulty. Processes are stopped
+# by process id. Wait for a state with tools/node-status PORT --wait COND.
+# To mine one block on demand, run the GPU miner briefly against node 1:
 #   gpu-miner/target/release/gpu-miner --node http://127.0.0.1:3910 --miner <address>
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 dir="$root/.local-net"; bin="$root/jcoin/target/release"
 case "${1:-}" in
   up)
-    n="${2:-2}"
-    [ -x "$bin/node" ] || (cd "$root/jcoin" && cargo build --release --bin node --bin wallet 2>&1 | tail -1)
+    n=2; mine=0; relay=0
+    for arg in "${@:2}"; do
+      case "$arg" in
+        mine) mine=1 ;; relay) relay=1 ;;
+        *[!0-9]*|'') echo "unknown argument: $arg" >&2; exit 2 ;;
+        *) n="$arg" ;;
+      esac
+    done
+    (cd "$root/jcoin" && cargo build --release --bin node --bin wallet --bin relay 2>&1 | grep -E '^error' | head -5) || true
     [ -d "$dir" ] && "$0" down >/dev/null
     mkdir -p "$dir"
     miner="$("$bin/wallet" --key-dir "$dir/keys" key new miner | awk '/public key/ {print $3}')"
+    relay_addr=""
+    if [ $relay -eq 1 ]; then
+      relay_addr="$("$bin/relay" --addr 127.0.0.1:3900 --key-file "$dir/relay_key" --show-address)"
+      setsid nohup "$bin/relay" --addr 127.0.0.1:3900 --key-file "$dir/relay_key" > "$dir/relay.log" 2>&1 < /dev/null &
+      echo $! > "$dir/relay.pid"
+      sleep 1
+    fi
     for i in $(seq 1 "$n"); do
-      args=(--regtest --rest-addr "127.0.0.1:39${i}0" --p2p-addr "127.0.0.1:39${i}1" --data-dir "$dir/node$i")
-      if [ "$i" -eq 1 ]; then
-        if [ "${3:-}" = mine ]; then args+=(--mine --miner "$miner"); fi
+      args=(--regtest --rest-addr "127.0.0.1:39${i}0" --data-dir "$dir/node$i")
+      if [ $relay -eq 1 ]; then
+        args+=(--p2p-addr "0.0.0.0:39${i}1" --relay "$relay_addr")
       else
-        args+=(--peer 127.0.0.1:3911)
+        args+=(--p2p-addr "127.0.0.1:39${i}1")
+        [ "$i" -gt 1 ] && args+=(--peer 127.0.0.1:3911)
       fi
+      [ "$i" -eq 1 ] && [ $mine -eq 1 ] && args+=(--mine --miner "$miner")
       setsid nohup "$bin/node" "${args[@]}" > "$dir/node$i.log" 2>&1 < /dev/null &
       echo $! >> "$dir/pids"
     done
     sleep 2
-    echo "started $n nodes; miner key 'miner' in $dir/keys (address $miner)"
+    echo "started $n nodes$([ $relay -eq 1 ] && echo " behind a relay ($relay_addr)"); miner key 'miner' in $dir/keys (address $miner)"
     "$0" status
     ;;
-  status)
+  status|peers)
     [ -f "$dir/pids" ] || { echo "no local net is running"; exit 0; }
+    if [ -f "$dir/relay.pid" ]; then
+      kill -0 "$(cat "$dir/relay.pid")" 2>/dev/null && echo "relay: running on 127.0.0.1:3900" || echo "relay: not running; see $dir/relay.log"
+    fi
+    extra=(); [ "$1" = peers ] && extra=(--peers)
     i=0
     while read -r pid; do
       i=$((i + 1))
-      if kill -0 "$pid" 2>/dev/null; then "$root/tools/node-status" "39${i}0" || true; else echo "node $i (pid $pid) is not running; see $dir/node$i.log"; fi
+      if kill -0 "$pid" 2>/dev/null; then "$root/tools/node-status" "39${i}0" "${extra[@]}" || true; else echo "node $i (pid $pid) is not running; see $dir/node$i.log"; fi
     done < "$dir/pids"
     ;;
   down)
-    if [ -f "$dir/pids" ]; then while read -r pid; do kill "$pid" 2>/dev/null || true; done < "$dir/pids"; fi
+    for f in "$dir/pids" "$dir/relay.pid"; do
+      if [ -f "$f" ]; then while read -r pid; do kill "$pid" 2>/dev/null || true; done < "$f"; fi
+    done
     rm -rf "$dir"; echo "stopped and removed"
     ;;
-  *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

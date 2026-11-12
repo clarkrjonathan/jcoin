@@ -97,6 +97,16 @@ pub fn block_work(target: &[u8; 32]) -> U256 {
     }
 }
 
+/// `block_work` as a float: the average number of hashes needed to find a
+/// block with this target. For display only; never use it in consensus.
+pub fn expected_hashes(target: &[u8; 32]) -> f64 {
+    block_work(target)
+        .0
+        .iter()
+        .rev()
+        .fold(0.0, |acc, &limb| acc * 18_446_744_073_709_551_616.0 + limb as f64)
+}
+
 /// A block as stored, with the metadata needed for fork choice and validation.
 struct StoredBlock {
     block: Block,
@@ -360,6 +370,24 @@ impl Chain {
         locator
     }
 
+    /// Up to `count` canonical blocks ending at the tip, newest first. Walks
+    /// back from the tip, so it costs `count` steps, not the chain's length.
+    pub fn recent(&self, count: usize) -> Vec<Block> {
+        let mut out = Vec::with_capacity(count);
+        let mut cur = &self.blocks[&self.tip];
+        while out.len() < count {
+            out.push(cur.block.clone());
+            if cur.height == 0 {
+                break;
+            }
+            match self.blocks.get(&cur.block.header.previous_block_hash) {
+                Some(parent) => cur = parent,
+                None => break,
+            }
+        }
+        out
+    }
+
     /// Given a peer's locator, find the first hash on our canonical chain and
     /// return up to `cap` canonical blocks after it.
     pub fn blocks_after(&self, locator: &[[u8; 32]], cap: usize) -> Vec<Block> {
@@ -432,6 +460,30 @@ mod tests {
             out.push(block);
         }
         out
+    }
+
+    #[test]
+    fn recent_lists_the_canonical_tip_back_newest_first() {
+        let mut chain = Chain::new(REGTEST);
+        for b in branch(5, [1u8; 32]) {
+            chain.accept(b);
+        }
+        let heights: Vec<u64> = chain.recent(3).iter().map(|b| b.header.height).collect();
+        assert_eq!(heights, vec![5, 4, 3]);
+        // More than the chain holds stops at genesis.
+        let all: Vec<u64> = chain.recent(50).iter().map(|b| b.header.height).collect();
+        assert_eq!(all, vec![5, 4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn expected_hashes_doubles_with_each_zero_bit() {
+        let mut t = [0xffu8; 32];
+        t[0] = 0x00;
+        t[1] = 0x0f; // 12 leading zero bits
+        let at_12 = expected_hashes(&t);
+        assert!((at_12 / 4096.0 - 1.0).abs() < 1e-3, "{at_12}");
+        t[1] = 0x07; // 13 bits
+        assert!((expected_hashes(&t) / at_12 - 2.0).abs() < 1e-3);
     }
 
     #[test]

@@ -30,7 +30,7 @@ connection records), `message.rs` and `frame.rs` (wire format).
 
 REST routes (`service.rs`): `POST /wallet/transaction`,
 `GET /wallet/transaction/{id}`, `GET /balance/{address}`, `GET /chain`,
-`GET /peers`, `GET /network/signal`, `GET /mining/work/{miner}`,
+`GET /chain/recent?count=N`, `GET /peers`, `GET /network/signal`, `GET /mining/work/{miner}`,
 `POST /mining/submit`.
 
 ## Consensus facts (version 3, since 2.2.0)

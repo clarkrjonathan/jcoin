@@ -161,6 +161,13 @@ still in progress count toward the cap. Because the address names the peer id,
 a dial reaches only that peer; a stale or forged address fails the Noise
 handshake.
 
+A peer reached only through the relay is the exception to "dial new ones
+within the cap". Each direct address learned for it is dialed once, outside
+the cap, because on the same LAN the dial usually works. When any direct
+connection to a peer opens (from such a dial or from a hole punch), the host
+closes the relayed connections to it. The session then reopens on the direct
+connection. Since 2.2.3.
+
 ## 7. Transport: libp2p
 
 ### Stack

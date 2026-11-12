@@ -20,7 +20,9 @@ use std::time::Duration;
 use eframe::egui;
 use jcoin::amount::format_jef;
 
-use backend::{connection_kind, display_path, short, zero_bits, Backend, MiningState, Settings};
+use backend::{
+    connection_kind, display_path, expected_seconds, short, span, zero_bits, Backend, MiningState, Settings,
+};
 
 fn main() -> eframe::Result {
     // Start reporting before the window and the backend's threads, so a
@@ -494,6 +496,66 @@ fn network_section(ui: &mut egui::Ui, backend: &Backend) {
         ui.label("Block height");
         ui.label(view.height.to_string());
         ui.end_row();
+        if let Some(tip) = view.recent.first() {
+            let since = applog::now().saturating_sub(tip.timestamp);
+            ui.label("Last block");
+            let text = format!("{} ago", span(since));
+            // Four times the target is rare by chance (about 2%): worth a colour.
+            if view.target_block_time > 0 && since > 4 * view.target_block_time {
+                ui.colored_label(ui.visuals().warn_fg_color, text)
+                    .on_hover_text("Longer than usual. If no node is mining, the chain waits; after 20 minutes the difficulty starts to ease.");
+            } else {
+                ui.label(text);
+            }
+            ui.end_row();
+        }
+        if let Some(avg) = view.average_gap {
+            let listed = view.recent.iter().filter(|b| b.gap.is_some()).count();
+            ui.label("Average block time");
+            ui.label(format!(
+                "{} over the last {listed} blocks (target {})",
+                span(avg.round() as u64),
+                span(view.target_block_time)
+            ))
+            .on_hover_text("Time between block timestamps, which miners set from their own clocks. One block can be far from the average; the difficulty adjusts to bring the average back to the target.");
+            ui.end_row();
+        }
+    });
+    recent_blocks(ui, backend, &view);
+}
+
+/// The last blocks: when each came, how long after the one before, its
+/// difficulty, and who mined it.
+fn recent_blocks(ui: &mut egui::Ui, backend: &Backend, view: &backend::NodeView) {
+    if view.recent.is_empty() {
+        return;
+    }
+    egui::CollapsingHeader::new("Recent blocks").id_salt("recent_blocks").show(ui, |ui| {
+        egui::Grid::new("recent_blocks_grid").num_columns(5).striped(true).show(ui, |ui| {
+            for title in ["Height", "Mined", "After previous", "Difficulty", "Miner"] {
+                ui.strong(title);
+            }
+            ui.end_row();
+            for b in view.recent.iter().take(12) {
+                ui.label(b.height.to_string());
+                ui.label(format!("{} ago", span(applog::now().saturating_sub(b.timestamp))));
+                ui.label(b.gap.map(span).unwrap_or_else(|| "genesis".to_string()));
+                ui.label(format!("{} bits", zero_bits(&b.target)))
+                    .on_hover_text("Leading zero bits of the block's target. Each extra bit doubles the work per block.");
+                let miner = match &b.miner {
+                    None => "—".to_string(),
+                    Some(m) => match backend.keys().iter().find(|k| &k.address == m) {
+                        Some(k) => format!("you ('{}')", k.name),
+                        None => short(m),
+                    },
+                };
+                let cell = ui.label(miner);
+                if b.transfers > 0 {
+                    cell.on_hover_text(format!("{} transfer(s) in this block", b.transfers));
+                }
+                ui.end_row();
+            }
+        });
     });
 }
 
@@ -692,6 +754,13 @@ fn mining_section(ui: &mut egui::Ui, backend: &mut Backend, adapter: &mut Option
                     ui.label("Blocks mined this session");
                     ui.label(found.to_string());
                     ui.end_row();
+                    let view = backend.view();
+                    if let Some(secs) = expected_seconds(view.next_expected_hashes, rate) {
+                        ui.label("Expected time to a block, mining alone");
+                        ui.label(format!("about {}", span(secs.round() as u64)))
+                            .on_hover_text("The current difficulty divided by this computer's hash rate. It is an average: a block can take much less or much more. Other miners share the blocks, so your own blocks come less often than this when they mine too.");
+                        ui.end_row();
+                    }
                 });
                 if !status.is_empty() {
                     ui.small(status);

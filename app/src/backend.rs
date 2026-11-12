@@ -123,6 +123,14 @@ pub struct NodeView {
     pub account_known: bool,
     /// The tip's difficulty target, as hex.
     pub target: String,
+    /// Average hashes needed to find the next block if mined now.
+    pub next_expected_hashes: f64,
+    /// The chain's target seconds between blocks (300 on mainnet).
+    pub target_block_time: u64,
+    /// The last blocks, newest first, from `GET /chain/recent`.
+    pub recent: Vec<RecentBlock>,
+    /// The average of the listed blocks' times since their parent.
+    pub average_gap: Option<f64>,
     /// This node's own addresses, as it advertises them.
     pub advertised: Vec<String>,
     pub connections: Vec<Connection>,
@@ -146,6 +154,25 @@ pub struct NewerRules {
     /// Their work divided by this node's own chain's work in the window.
     pub work_ratio: f64,
 }
+
+/// One block of `GET /chain/recent`.
+#[derive(Clone, Default, PartialEq)]
+pub struct RecentBlock {
+    pub height: u64,
+    pub hash: String,
+    /// The block's own timestamp (Unix seconds, set by its miner).
+    pub timestamp: u64,
+    /// Seconds after its parent's timestamp; `None` for genesis.
+    pub gap: Option<u64>,
+    pub target: String,
+    /// Coinbase recipient, as hex; `None` for genesis.
+    pub miner: Option<String>,
+    pub transfers: u64,
+}
+
+/// How many recent blocks the poller reads: the difficulty window, so the
+/// average is over the same blocks the difficulty rule looks at.
+pub const RECENT_BLOCKS: u64 = 30;
 
 /// One open connection, as `GET /peers` reports it.
 #[derive(Clone, Default)]
@@ -751,6 +778,7 @@ fn spawn_poller(
                 .ok()
         };
         let chain = get("/chain".to_string());
+        let recent = get(format!("/chain/recent?count={RECENT_BLOCKS}"));
         let account = get(format!("/balance/{polled}"));
         let peers = get("/peers".to_string());
         let signal = get("/network/signal".to_string());
@@ -761,6 +789,12 @@ fn spawn_poller(
                 v.height = c["height"].as_u64().unwrap_or(0);
                 v.peers = c["peers"].as_u64().unwrap_or(0);
                 v.target = c["target"].as_str().unwrap_or_default().to_string();
+                v.next_expected_hashes = c["next_expected_hashes"].as_f64().unwrap_or(0.0);
+                v.target_block_time = c["target_block_time"].as_u64().unwrap_or(0);
+            }
+            if let Some(r) = &recent {
+                v.average_gap = r["average_gap"].as_f64();
+                v.recent = r["blocks"].as_array().into_iter().flatten().map(recent_block).collect();
             }
             if let Some(g) = &signal {
                 v.signal = NewerRules {
@@ -801,6 +835,37 @@ fn spawn_poller(
         }
         std::thread::sleep(Duration::from_secs(2));
     });
+}
+
+fn recent_block(b: &serde_json::Value) -> RecentBlock {
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    RecentBlock {
+        height: b["height"].as_u64().unwrap_or(0),
+        hash: text(&b["hash"]),
+        timestamp: b["timestamp"].as_u64().unwrap_or(0),
+        gap: b["gap"].as_u64(),
+        target: text(&b["target"]),
+        miner: b["miner"].as_str().map(str::to_string),
+        transfers: b["transfers"].as_u64().unwrap_or(0),
+    }
+}
+
+/// Average seconds for one miner at `hash_rate` hashes per second to find a
+/// block that needs `expected_hashes`. `None` if either is unknown.
+pub fn expected_seconds(expected_hashes: f64, hash_rate: u64) -> Option<f64> {
+    (expected_hashes > 0.0 && hash_rate > 0).then(|| expected_hashes / hash_rate as f64)
+}
+
+/// A length of time in words, to two units: `45 s`, `4 min 50 s`,
+/// `3 h 12 min`, `2 d 5 h`, `3.4 years`.
+pub fn span(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs} s"),
+        60..=3_599 => format!("{} min {} s", secs / 60, secs % 60),
+        3_600..=86_399 => format!("{} h {} min", secs / 3_600, secs % 3_600 / 60),
+        86_400..=31_535_999 => format!("{} d {} h", secs / 86_400, secs % 86_400 / 3_600),
+        _ => format!("{:.1} years", secs as f64 / 31_536_000.0),
+    }
 }
 
 /// What kind of connection `c` is, in words.
@@ -860,6 +925,24 @@ mod tests {
         assert_eq!(zero_bits(&format!("000000001f{}", "f".repeat(54))), 35);
         assert_eq!(zero_bits(&"f".repeat(64)), 0);
         assert_eq!(zero_bits(""), 0);
+    }
+
+    #[test]
+    fn span_uses_two_units() {
+        assert_eq!(span(45), "45 s");
+        assert_eq!(span(290), "4 min 50 s");
+        assert_eq!(span(3 * 3_600 + 12 * 60 + 5), "3 h 12 min");
+        assert_eq!(span(2 * 86_400 + 5 * 3_600), "2 d 5 h");
+        assert_eq!(span(2 * 31_536_000), "2.0 years");
+    }
+
+    #[test]
+    fn expected_seconds_divides_work_by_rate() {
+        // 28 zero bits at 1 MH/s: about 268 s.
+        let secs = expected_seconds(2f64.powi(28), 1_000_000).unwrap();
+        assert!((secs - 268.4).abs() < 0.1, "{secs}");
+        assert_eq!(expected_seconds(2f64.powi(28), 0), None);
+        assert_eq!(expected_seconds(0.0, 1_000_000), None);
     }
 
     /// Keys can be created, imported, and switched, and the choice survives a
@@ -932,6 +1015,11 @@ mod tests {
             backend.view().balance > 0
         });
         backend.stop_mining();
+        wait_for("the block in the recent list", Duration::from_secs(10), || {
+            let v = backend.view();
+            v.recent.first().is_some_and(|b| b.height >= 1 && b.miner.as_deref() == Some(&backend.address))
+        });
+        assert!(backend.view().next_expected_hashes > 0.0);
         assert_eq!(backend.mining_state(), MiningState::Idle);
         let won = backend.won_blocks();
         assert!(!won.is_empty(), "the mined block is recorded");

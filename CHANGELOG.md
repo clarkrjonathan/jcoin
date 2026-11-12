@@ -11,6 +11,52 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.2.3 (2026-11-11)
+
+A patch. No consensus change: it runs on the same chain as 2.2.0 and
+connects and syncs with 2.2.0 to 2.2.2.
+
+### Added
+
+- The Network section shows how long ago the last block came, and the
+  average time between the last 30 blocks next to the 5-minute target. The
+  "last block" time turns amber after four times the target.
+- A "Recent blocks" table (Network section, folded by default): height, how
+  long ago, time after the block before, difficulty in bits, and the miner
+  ("you" for your own keys).
+- While mining, the Mining section shows the expected time for this computer
+  to find a block if it mined alone: the current difficulty divided by its
+  hash rate. It is an average; a block can take much less or much more.
+- The node has a new REST route, `GET /chain/recent?count=N` (last N blocks,
+  gaps, average), and `GET /chain` also gives the next block's expected
+  hashes and the target block time.
+
+### Changed
+
+- Two nodes that reach each other through the relay now try each other's
+  direct addresses (for example, on the same home network). If a direct
+  connection opens, from that or from a hole punch, the relayed connection
+  is closed and the node exchanges blocks over the direct one. Before, two
+  computers on one network talked through the relay.
+
+### Fixed
+
+- Connections that another node opened through the relay were shown as
+  "direct" in the connections list.
+- If opening a session to a connected peer failed, it was not tried again.
+  It is now tried again after one second.
+
+### Checked
+
+- The GPU use limit (fixed in 2.2.0) was measured through the app's mining
+  loop: 50% gives about half the hash rate and 25% about a quarter.
+  `tools/check --gpu` repeats the measurement.
+
+Not tested on Windows. The direct-connection change was tested with a local
+relay and two nodes on this computer, not on two computers on one network.
+
+Consensus: no.
+
 ## 2.2.2 (2026-11-11)
 
 A patch. No consensus change: it runs on the same chain as 2.2.0. Nodes on

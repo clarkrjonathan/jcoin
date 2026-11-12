@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -168,6 +168,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), String> {
         .route("/wallet/transaction/{tx_id}", get(transaction_status))
         .route("/balance/{address}", get(balance))
         .route("/chain", get(chain_info))
+        .route("/chain/recent", get(recent_blocks))
         .route("/peers", get(peers))
         .route("/network/signal", get(network_signal))
         .route("/mining/work/{miner}", get(mining_work))
@@ -727,10 +728,14 @@ async fn chain_info(State(state): State<AppState>) -> impl IntoResponse {
         height,
         tip_hash,
         tip_target,
+        next_target,
+        target_block_time,
     } = reply_rx.await.unwrap_or(ChainInfo {
         height: 0,
         tip_hash: [0u8; 32],
         tip_target: [0u8; 32],
+        next_target: [0u8; 32],
+        target_block_time: 0,
     });
     // Leading zero bytes of the target are a rough difficulty gauge.
     let difficulty_zero_bytes = tip_target.iter().take_while(|b| **b == 0).count();
@@ -741,7 +746,144 @@ async fn chain_info(State(state): State<AppState>) -> impl IntoResponse {
             "tip": hex::encode(tip_hash),
             "target": hex::encode(tip_target),
             "target_leading_zero_bytes": difficulty_zero_bytes,
+            "next_target": hex::encode(next_target),
+            "next_expected_hashes": crate::chain::expected_hashes(&next_target),
+            "target_block_time": target_block_time,
             "peers": state.network.peer_count(),
         })),
     )
+}
+
+/// The most blocks `GET /chain/recent` returns.
+const RECENT_MAX: usize = 100;
+
+#[derive(serde::Deserialize)]
+struct RecentQuery {
+    count: Option<usize>,
+}
+
+/// GET /chain/recent?count=N — the last N canonical blocks, newest first,
+/// with the time since each block's parent, and the average of those times.
+/// N defaults to 20 and is at most 100.
+async fn recent_blocks(
+    State(state): State<AppState>,
+    Query(query): Query<RecentQuery>,
+) -> impl IntoResponse {
+    let count = query.count.unwrap_or(20).clamp(1, RECENT_MAX);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    // One extra block gives the oldest listed block its parent's timestamp.
+    if state
+        .node
+        .send(NodeRequest::GetRecent { count: count + 1, reply: reply_tx })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "node core unavailable" })),
+        );
+    }
+    let blocks = reply_rx.await.unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (StatusCode::OK, Json(recent_json(&blocks, count, now)))
+}
+
+/// The body of `GET /chain/recent` for `blocks` (newest first, possibly one
+/// more than `count`). The genesis block has no parent and no gap.
+fn recent_json(blocks: &[Block], count: usize, now: u64) -> serde_json::Value {
+    let mut rows = Vec::new();
+    let mut gaps = Vec::new();
+    for (i, block) in blocks.iter().take(count).enumerate() {
+        let h = &block.header;
+        let gap = blocks
+            .get(i + 1)
+            .map(|parent| h.timestamp.saturating_sub(parent.header.timestamp));
+        if let Some(g) = gap {
+            gaps.push(g);
+        }
+        let miner = block
+            .transactions
+            .first()
+            .filter(|t| t.is_coinbase())
+            .map(|t| hex::encode(t.recipient));
+        rows.push(json!({
+            "height": h.height,
+            "hash": hex::encode(block.hash()),
+            "timestamp": h.timestamp,
+            "gap": gap,
+            "target": hex::encode(h.target),
+            "expected_hashes": crate::chain::expected_hashes(&h.target),
+            "miner": miner,
+            "transfers": block.transactions.iter().filter(|t| !t.is_coinbase()).count(),
+        }));
+    }
+    let average_gap = if gaps.is_empty() {
+        None
+    } else {
+        Some(gaps.iter().sum::<u64>() as f64 / gaps.len() as f64)
+    };
+    let since_tip = blocks.first().map(|b| now.saturating_sub(b.header.timestamp));
+    json!({
+        "now": now,
+        "blocks": rows,
+        "average_gap": average_gap,
+        "since_tip": since_tip,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::build_and_mine;
+    use crate::state::State;
+
+    /// Blocks 1..=3 on genesis with the given timestamps, newest first, plus
+    /// genesis at the end.
+    fn chain_with_times(times: [u64; 4]) -> Vec<Block> {
+        let mut blocks = vec![Block::genesis(&REGTEST)];
+        let mut state = State::new();
+        for h in 1..=3u64 {
+            let parent = blocks.last().unwrap().header.clone();
+            let (block, next) =
+                build_and_mine(&parent, &state, REGTEST.initial_reward, [h as u8; 32], None, REGTEST.pow_limit, h)
+                    .unwrap();
+            state = next;
+            blocks.push(block);
+        }
+        for (b, t) in blocks.iter_mut().zip(times) {
+            b.header.timestamp = t;
+        }
+        blocks.reverse();
+        blocks
+    }
+
+    #[test]
+    fn recent_json_gives_gaps_average_and_miner() {
+        let blocks = chain_with_times([1000, 1300, 1500, 2000]);
+        // Asked for 2: the third block supplies the older one's gap.
+        let v = recent_json(&blocks[..3], 2, 2100);
+        let rows = v["blocks"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["height"], 3);
+        assert_eq!(rows[0]["gap"], 500);
+        assert_eq!(rows[1]["gap"], 200);
+        assert_eq!(rows[0]["miner"], hex::encode([3u8; 32]));
+        assert_eq!(rows[0]["transfers"], 0);
+        assert_eq!(v["average_gap"], 350.0);
+        assert_eq!(v["since_tip"], 100);
+    }
+
+    #[test]
+    fn genesis_has_no_gap() {
+        let blocks = chain_with_times([1000, 1300, 1500, 2000]);
+        let v = recent_json(&blocks, 10, 2000);
+        let rows = v["blocks"].as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(rows[3]["gap"].is_null());
+        assert!(rows[3]["miner"].is_null());
+        assert_eq!(v["average_gap"], 1000.0 / 3.0);
+    }
 }

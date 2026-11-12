@@ -50,6 +50,11 @@ pub enum NodeRequest {
     GetChainInfo {
         reply: oneshot::Sender<ChainInfo>,
     },
+    /// Up to `count` canonical blocks ending at the tip, newest first.
+    GetRecent {
+        count: usize,
+        reply: oneshot::Sender<Vec<Block>>,
+    },
     /// Evidence that the network follows newer rules (see `signal`).
     GetSignal {
         reply: oneshot::Sender<crate::signal::Summary>,
@@ -117,6 +122,11 @@ pub struct ChainInfo {
     pub tip_hash: [u8; 32],
     /// The difficulty target of the current tip (lets clients see retargeting).
     pub tip_target: [u8; 32],
+    /// The target a block on the tip must meet if mined now (the stall
+    /// fallback can make it easier than the tip's).
+    pub next_target: [u8; 32],
+    /// `Params::target_block_time`.
+    pub target_block_time: u64,
 }
 
 /// The node core task.
@@ -334,11 +344,21 @@ pub async fn run_node(
             }
 
             NodeRequest::GetChainInfo { reply } => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 let _ = reply.send(ChainInfo {
                     height: chain.tip_height(),
                     tip_hash: chain.tip_hash(),
                     tip_target: chain.tip_header().target,
+                    next_target: chain.next_context().target_at(now),
+                    target_block_time: chain.params().target_block_time,
                 });
+            }
+
+            NodeRequest::GetRecent { count, reply } => {
+                let _ = reply.send(chain.recent(count));
             }
 
             NodeRequest::GetSignal { reply } => {

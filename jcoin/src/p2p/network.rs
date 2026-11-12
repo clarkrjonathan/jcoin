@@ -295,6 +295,17 @@ impl Network {
         self.inner.connected.lock().unwrap().contains(peer)
     }
 
+    /// Whether an open connection to `peer` runs directly, not through a relay.
+    pub fn has_direct_connection(&self, peer: &libp2p::PeerId) -> bool {
+        let peer = peer.to_string();
+        self.inner
+            .connections
+            .lock()
+            .unwrap()
+            .values()
+            .any(|c| c.peer == peer && !c.relayed)
+    }
+
     /// The host reports that a requested dial finished. A failed address may
     /// be dialed again when learned again.
     pub fn dial_finished(&self, addr: &Multiaddr, succeeded: bool) {
@@ -393,17 +404,28 @@ impl Network {
         let advertised = self.inner.advertised.lock().unwrap().clone();
         let own: HashSet<libp2p::PeerId> = advertised.iter().filter_map(peer_of).collect();
         for addr in addrs {
-            let in_flight = self.inner.dialing.load(Ordering::Relaxed);
-            if self.peer_count() + in_flight >= self.inner.max_peers {
-                return;
-            }
             if advertised.contains(&addr) {
                 continue;
             }
+            // A peer reached only through the relay is worth one direct try:
+            // on the same LAN it usually works, and it takes the traffic off
+            // the relay. It adds no session, so `max_peers` does not apply.
+            let mut upgrade = false;
             if let Some(peer) = peer_of(&addr) {
-                if own.contains(&peer) || self.is_connected(&peer) {
+                if own.contains(&peer) {
                     continue;
                 }
+                if self.is_connected(&peer) {
+                    let circuit = addr.iter().any(|p| p == Protocol::P2pCircuit);
+                    if circuit || self.has_direct_connection(&peer) {
+                        continue;
+                    }
+                    upgrade = true;
+                }
+            }
+            let in_flight = self.inner.dialing.load(Ordering::Relaxed);
+            if !upgrade && self.peer_count() + in_flight >= self.inner.max_peers {
+                continue;
             }
             if !self.inner.attempted.lock().unwrap().insert(addr.clone()) {
                 continue; // already tried
@@ -495,6 +517,51 @@ mod tests {
         assert_eq!(net.dials_in_flight(), 3);
         net.maybe_dial(vec![addr(0)]);
         assert_eq!(net.dials_in_flight(), 4);
+    }
+
+    /// A peer connected only through the relay gets one direct dial to a LAN
+    /// address learned for it, even with every session slot full; a circuit
+    /// address or a peer already reached directly gets none.
+    #[tokio::test]
+    async fn a_relayed_peer_is_dialed_directly_once() {
+        let peer = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
+        let lan: Multiaddr = format!("/ip4/192.168.0.7/tcp/8333/p2p/{peer}").parse().unwrap();
+        let circuit: Multiaddr =
+            format!("/ip4/3.14.123.27/tcp/9000/p2p/{peer}/p2p-circuit/p2p/{peer}").parse().unwrap();
+        let open = |net: &Network, id: &str, relayed: bool| {
+            net.connection_opened(
+                id.to_string(),
+                ConnectionInfo {
+                    peer: peer.to_string(),
+                    address: String::new(),
+                    outbound: true,
+                    relayed,
+                    is_relay: false,
+                    session: false,
+                    since: 1,
+                    label: None,
+                },
+            )
+        };
+
+        let net = network(0); // no session slots: only an upgrade may dial
+        let (dial_tx, mut dial_rx) = mpsc::channel(16);
+        net.set_dialer(dial_tx);
+        net.set_connected(peer, true);
+        open(&net, "relayed", true);
+
+        net.maybe_dial(vec![circuit.clone(), lan.clone()]);
+        assert_eq!(dial_rx.try_recv().ok(), Some(lan.clone()));
+        assert!(dial_rx.try_recv().is_err(), "the circuit address is not dialed");
+        // Learned again while the dial is pending or done: not dialed again.
+        net.maybe_dial(vec![lan.clone()]);
+        assert!(dial_rx.try_recv().is_err());
+
+        // Once a direct connection exists, a new LAN address is not dialed.
+        let other: Multiaddr = format!("/ip4/192.168.0.8/tcp/8333/p2p/{peer}").parse().unwrap();
+        open(&net, "direct", false);
+        net.maybe_dial(vec![other]);
+        assert!(dial_rx.try_recv().is_err());
     }
 
     #[test]

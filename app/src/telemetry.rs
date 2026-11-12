@@ -212,6 +212,7 @@ pub fn classify(text: &str) -> Class {
         "p2p" if starts("could not open a protocol stream") => ("stream_failed", true),
         "p2p" if starts("hole punch") && has("succeeded") => ("hole_punch_ok", false),
         "p2p" if starts("hole punch") => ("hole_punch_failed", true),
+        "p2p" if starts("direct connection to") => ("relay_replaced", false),
         "p2p" if starts("relay reservation accepted") => ("reservation_ok", false),
         "p2p" if has("relay reservation") => ("reservation_lost", false),
         "p2p" if starts("registered with") => ("rendezvous_registered", false),
@@ -340,6 +341,10 @@ mod tests {
         assert_eq!(filed("[p2p] cannot request a relay reservation: x"), ("p2p", "reservation_lost", false));
         assert_eq!(filed("[p2p] connected to 12D3 (out) (peer wire v2, port 8333)"), ("p2p", "peer_connected", false));
         assert_eq!(filed("[p2p] hole punch to 12D3 failed (x); staying on the relay"), ("p2p", "hole_punch_failed", true));
+        assert_eq!(
+            filed("[p2p] direct connection to 12D3 at /ip4/192.168.0.7/tcp/8333; closing 1 relayed connection(s)"),
+            ("p2p", "relay_replaced", false)
+        );
         assert_eq!(filed("[work] won block 4 0000"), ("work", "block_won", false));
         assert_eq!(filed("[gpu] height 4: accepted"), ("gpu", "block_accepted", false));
         assert_eq!(filed("[gpu] height 4: stale"), ("gpu", "block_not_accepted", false));

@@ -14,7 +14,11 @@ the GPU miner. A release publishes it as `JeffyCoin-windows-x86_64.exe` and
 3. Starts a node in the same process, on the real network, connected through
    the public relay. The chain is stored in the data folder.
 4. Shows the connection status, block height, balance, and address, with
-   controls to mine on a GPU and to send coins.
+   controls to mine on a GPU and to send coins. The Network section also
+   shows the time since the last block, the average block time over the last
+   30 blocks, and a "Recent blocks" table (height, age, time after the block
+   before, difficulty, miner). While mining, the Mining section shows the
+   expected time for this computer to find a block if it mined alone.
 
 ## Installing
 

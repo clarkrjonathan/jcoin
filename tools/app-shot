@@ -21,6 +21,8 @@ for arg in "$@"; do
 done
 app="$root/app/target/release/jcoin-app"
 [ -x "$app" ] || { echo "build the app first: tools/check app --build" >&2; exit 1; }
+newer="$(find "$root/app/src" "$root/jcoin/src" "$root/gpu-miner/src" -name '*.rs' -newer "$app" | head -1)"
+[ -z "$newer" ] || { echo "the app binary is older than ${newer#$root/}: run tools/check app --build" >&2; exit 1; }
 home="$(mktemp -d)"; mkdir -p "$(dirname "$out")"
 env XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" HOME="$home" XDG_DATA_HOME="$home/share" \
   JCOIN_APP_NO_TELEMETRY=1 JCOIN_APP_RELAY=none \
