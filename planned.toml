@@ -116,6 +116,27 @@ open = [
 ]
 
 [[item]]
+id = "gpu-kernel"
+release = "backlog"
+title = "A faster SHA-256 kernel for the GPU miner"
+status = "in progress"
+consensus = false
+source = "Jonathan, 2026-11-12"
+problem = '''
+The kernel (`sha256.wgsl`) is a direct transcription of SHA-256: a 64-word
+schedule array and a round loop that indexes a private constant array, and it
+repeats for every nonce the work that does not depend on the nonce's low
+word (rounds 0 to 5 and schedule words 16 to 20).'''
+change = '''
+Kernel variants selectable with `--kernel` and `--workgroup`, each checked
+against the CPU, and `tools/gpu-bench` to compare them and batch sizes on a
+GPU. The default kernel changes only after results from more than one GPU
+maker.'''
+open = [
+  "Which kernel becomes the default, from results on NVIDIA, AMD, and Intel GPUs under Vulkan and DirectX 12.",
+]
+
+[[item]]
 id = "updater-start-check"
 release = "backlog"
 title = "The updater checks that the new program can start"

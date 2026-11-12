@@ -12,7 +12,7 @@ const H0: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
-const K: [u32; 64] = [
+pub const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
     0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
@@ -71,6 +71,40 @@ pub struct GpuWork {
     pub midstate: [u32; 8],
     pub tail: [u32; 5],
     pub target: [u32; 8],
+}
+
+/// The part of the third chunk's compression that is the same for every low
+/// nonce word: the state after rounds 0 to 5 (their message words are the
+/// header tail and `nonce_hi`), and schedule words 16 to 20. Word 6 is the
+/// low nonce word, 7 the padding bit, 8 to 14 zero, 15 the length in bits.
+pub fn prefix(work: &GpuWork, nonce_hi: u32) -> ([u32; 8], [u32; 5]) {
+    let s0 = |x: u32| x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3);
+    let s1 = |x: u32| x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10);
+    let w: [u32; 6] = [work.tail[0], work.tail[1], work.tail[2], work.tail[3], work.tail[4], nonce_hi];
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = work.midstate;
+    for i in 0..6 {
+        let t1 = h
+            .wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25))
+            .wrapping_add((e & f) ^ (!e & g))
+            .wrapping_add(K[i])
+            .wrapping_add(w[i]);
+        let t2 = (a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22))
+            .wrapping_add((a & b) ^ (a & c) ^ (b & c));
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    let w16 = w[0].wrapping_add(s0(w[1]));
+    let w17 = w[1].wrapping_add(s0(w[2])).wrapping_add(s1(HEADER_LEN as u32 * 8));
+    let w18 = w[2].wrapping_add(s0(w[3])).wrapping_add(s1(w16));
+    let w19 = w[3].wrapping_add(s0(w[4])).wrapping_add(s1(w17));
+    let w20 = w[4].wrapping_add(s0(w[5])).wrapping_add(s1(w18));
+    ([a, b, c, d, e, f, g, h], [w16, w17, w18, w19, w20])
 }
 
 pub fn gpu_work(header: &[u8; HEADER_LEN], target: &[u8; 32]) -> GpuWork {

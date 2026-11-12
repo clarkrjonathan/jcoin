@@ -48,17 +48,40 @@ rate falls in proportion. It also applies to `--bench`.
 `--adapter <index>` picks a GPU from `--list`. `--batch` sets nonces per
 dispatch (default 2^22).
 
+## Kernels
+
+`--kernel` picks the shader; all three find the same nonces.
+
+| Kernel | What it is |
+|---|---|
+| `baseline` (default) | `sha256.wgsl`, written by hand: a 64-word schedule array and a round loop over a constant array |
+| `unrolled` | Generated: each schedule word and round is its own statement with the constant written in, and the first hash word is compared before the rest are computed |
+| `precomputed` | `unrolled`, starting after round 5 from a state the CPU computes once per dispatch; schedule words 16 to 20 also come from the CPU. None of these depend on the low nonce word |
+
+`--workgroup <n>` sets threads per workgroup (a power of two, default 256).
+`--bench-matrix <secs>` (or `tools/gpu-bench` from the repository root) checks
+each kernel against the CPU, times it, then tries workgroup sizes 64 and 128
+and batches of 2^20 and 2^24 for the fastest.
+
 The node must be a build that has the `/mining/*` endpoints (added
 2026-11-09). The node does not need `--mine`; the GPU miner does the mining.
 
 ## Measured
 
-| GPU | Backend | Rate |
-|---|---|---|
-| Intel Iris Xe (i7-13700H laptop) | Vulkan | about 155-159 MH/s |
+`tools/gpu-bench`, 2026-11-12, batch 2^22, workgroup 256, in MH/s:
 
-`--self-test` passed on that GPU (12 random headers, including ranges at the
-top of the 32-bit low word, and a target no hash can meet).
+| GPU | Backend | baseline | unrolled | precomputed |
+|---|---|---|---|---|
+| NVIDIA RTX 2000 Ada (laptop) | Vulkan | 694 | 1839 | 1992 |
+| Intel Iris Xe (i7-13700H laptop) | Vulkan | 157 | 522 | 555 |
+
+Workgroup sizes 64 and 128 were within 4% of 256 on both. A batch of 2^20
+was 6% to 12% slower; 2^24 was the same on the NVIDIA GPU and 6% faster on
+the Intel one. Not measured: DirectX 12 and AMD GPUs.
+
+`--self-test` passed for every kernel on both GPUs (12 random headers,
+including ranges at the top of the 32-bit low word, targets one above a
+nonce's own hash, and a target no hash can meet).
 
 ## Known gaps
 

@@ -59,6 +59,7 @@ Run these in place of composing commands. Each prints a few lines.
 | State of a local node or the app | `tools/node-status [PORT] [--peers] [--blocks N]` |
 | Wait for a node state | `tools/node-status PORT --wait direct\|peers=N\|height=N [SECS]` |
 | Read a chain file as a table | `tools/chain-dump [PATH] [--tail N]` |
+| Compare GPU kernels and batch sizes | `tools/gpu-bench [SECS] [--adapter N]` (stop mining first) |
 | Who mined, and every transfer | `tools/chain-dump --who [--not ADDR,...]` |
 | Update the installed app on this laptop | `tools/update-app [VERSION] --yes` (checks checksum and glibc; mining must be restarted in the window) |
 | Throwaway local nodes | `tools/local-net up [N] [mine] [relay]`, `status`, `peers`, `down` |

@@ -4,12 +4,15 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use crate::kernel::Config;
 use crate::pow::GpuWork;
 
-/// Threads per workgroup; must match `@workgroup_size` in sha256.wgsl.
+/// Threads per workgroup in the default configuration.
 pub const WORKGROUP: u32 = 256;
 
-/// Matches `struct Params` in sha256.wgsl (24 words, no implicit padding).
+/// Matches `struct Params` in the shaders (no implicit padding). The
+/// hand-written sha256.wgsl declares only the first 24 words; the generated
+/// kernels (`kernel.rs`) declare all of it.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Params {
@@ -19,9 +22,14 @@ struct Params {
     nonce_lo_base: u32,
     _pad: u32,
     target: [u32; 8],
+    /// `pow::prefix`: the state after round 5 and schedule words 16 to 20.
+    pre: [u32; 8],
+    wpre: [u32; 5],
 }
 
 pub struct Gpu {
+    /// The shader variant and workgroup size this was opened with.
+    pub config: Config,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
@@ -48,8 +56,14 @@ pub fn describe(adapter: &wgpu::Adapter) -> String {
 }
 
 impl Gpu {
-    /// Open adapter `index` from `adapters()`, or the best one wgpu picks.
+    /// Open adapter `index` from `adapters()`, or the best one wgpu picks,
+    /// with the default kernel.
     pub fn open(index: Option<usize>) -> Result<Gpu, String> {
+        Gpu::open_with(index, Config::default())
+    }
+
+    /// `open` with a chosen kernel and workgroup size.
+    pub fn open_with(index: Option<usize>, config: Config) -> Result<Gpu, String> {
         let adapter = match index {
             Some(i) => adapters()
                 .into_iter()
@@ -67,10 +81,14 @@ impl Gpu {
             ..Default::default()
         }))
         .map_err(|e| format!("cannot open {description}: {e}"))?;
+        let most = device.limits().max_compute_workgroup_size_x;
+        if config.workgroup == 0 || config.workgroup > most {
+            return Err(format!("workgroup size {} is not in 1..={most}", config.workgroup));
+        }
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sha256"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("sha256.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::kernel::source(config).into()),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("sha256"),
@@ -114,6 +132,7 @@ impl Gpu {
             ],
         });
         Ok(Gpu {
+            config,
             device,
             queue,
             pipeline,
@@ -127,16 +146,17 @@ impl Gpu {
 
     /// Largest batch one dispatch can cover (the per-dimension workgroup limit).
     pub fn max_batch(&self) -> u32 {
-        self.device.limits().max_compute_workgroups_per_dimension * WORKGROUP
+        self.device.limits().max_compute_workgroups_per_dimension * self.config.workgroup
     }
 
     /// Try nonces `(nonce_hi << 32) | lo` for `lo` in `lo_base .. lo_base +
     /// count`. Returns the smallest such `lo` whose hash meets the target.
-    /// `count` must be a multiple of `WORKGROUP`, at most `max_batch()`, and
-    /// the range must not pass 2^32.
+    /// `count` must be a multiple of the workgroup size, at most
+    /// `max_batch()`, and the range must not pass 2^32.
     pub fn search(&self, work: &GpuWork, nonce_hi: u32, lo_base: u32, count: u32) -> Option<u32> {
-        assert!(count % WORKGROUP == 0 && count <= self.max_batch());
+        assert!(count % self.config.workgroup == 0 && count <= self.max_batch());
         assert!(lo_base.checked_add(count - 1).is_some(), "batch would wrap the low word");
+        let (pre, wpre) = crate::pow::prefix(work, nonce_hi);
         let p = Params {
             midstate: work.midstate,
             tail: work.tail,
@@ -144,6 +164,8 @@ impl Gpu {
             nonce_lo_base: lo_base,
             _pad: 0,
             target: work.target,
+            pre,
+            wpre,
         };
         self.queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&p));
         self.queue
@@ -154,7 +176,7 @@ impl Gpu {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(count / WORKGROUP, 1, 1);
+            pass.dispatch_workgroups(count / self.config.workgroup, 1, 1);
         }
         encoder.copy_buffer_to_buffer(&self.result, 0, &self.readback, 0, 8);
         self.queue.submit([encoder.finish()]);

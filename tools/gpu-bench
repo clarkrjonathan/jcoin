@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Compare the GPU miner's configurations on this computer: every kernel, then
+# workgroup sizes for the fastest kernel, then batch sizes. Each one is
+# checked against the CPU before it is timed. Prints one table.
+#
+#   tools/gpu-bench [SECS] [--adapter N] [--no-build]
+#
+# SECS is the time for each configuration (default 3; about 7 runs).
+# --adapter N picks a GPU by index (tools/gpu-bench --list shows them).
+# Stop other miners on this computer first, or the numbers mean little; the
+# script refuses to run while the installed app is mining.
+# Exits non-zero if a configuration gives wrong results or cannot be opened.
+set -euo pipefail
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+cd "$(dirname "$0")/.."
+secs=3; build=1; extra=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-build) build=0 ;;
+    --adapter) extra+=(--adapter "$2"); shift ;;
+    --list) exec gpu-miner/target/release/gpu-miner --list ;;
+    *) secs="$1" ;;
+  esac
+  shift
+done
+
+log="$HOME/.local/share/jeffycoin/jeffycoin.log"
+if [[ -f "$log" ]] && pgrep -x jeffycoin >/dev/null; then
+  if tac "$log" | grep -m1 '\[app\] status:' | grep -q 'mining yes'; then
+    echo "the installed app is mining; stop mining in its window first" >&2
+    exit 1
+  fi
+fi
+
+if [[ $build -eq 1 ]]; then
+  if ! out="$(cargo build --release --manifest-path gpu-miner/Cargo.toml --bin gpu-miner 2>&1)"; then
+    echo "$out" | tail -20 >&2
+    exit 1
+  fi
+fi
+exec gpu-miner/target/release/gpu-miner --bench-matrix "$secs" "${extra[@]}"
