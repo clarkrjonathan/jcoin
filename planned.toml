@@ -25,6 +25,11 @@
 # block and its items.
 
 [[release]]
+id = "hash-rate"
+kind = "patch"
+title = "The hash rate reading is right after a new template"
+
+[[release]]
 id = "wallet"
 kind = "patch"
 title = "Wallet and block detail"
@@ -34,6 +39,26 @@ id = "overhaul"
 kind = "minor"
 title = "Graphical overhaul"
 
+
+# --- hash-rate -------------------------------------------------------------
+
+[[item]]
+id = "hash-rate-window"
+release = "hash-rate"
+title = "The hash rate reading sometimes doubles"
+status = "in progress"
+consensus = false
+source = "Jonathan, Jons Desktop status lines, 2026-11-12"
+problem = '''
+`miner::mine` reset the start of its 2-second rate window on every new
+template, but kept the window's hash count. The first reading after a new
+template (every 20 s, and after each block) divided hashes from the old
+template by the time on the new one, up to twice the real rate. The app's
+hash rate, its status line, and Sentry showed it; the 30-second average the
+command-line miner prints was right.'''
+change = '''
+One rate window for the whole mining run (`RateWindow`), whose hash count
+and start time both carry over between templates.'''
 
 # --- wallet ----------------------------------------------------------------
 

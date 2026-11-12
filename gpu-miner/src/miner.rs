@@ -143,6 +143,34 @@ struct ChainInfo {
 
 /// Mine against `node` until `control.stop` is set, crediting `miner` (a hex
 /// address). Progress is printed and also published through `control`.
+/// Hashes counted since a start time, read and restarted as a rate.
+struct RateWindow {
+    start: Instant,
+    hashes: u64,
+}
+
+impl RateWindow {
+    fn new(start: Instant) -> RateWindow {
+        RateWindow { start, hashes: 0 }
+    }
+
+    fn add(&mut self, hashes: u64) {
+        self.hashes += hashes;
+    }
+
+    /// Hashes per second since the start, then start again at `now`. `None`
+    /// if no time has passed.
+    fn take(&mut self, now: Instant) -> Option<u64> {
+        let secs = now.saturating_duration_since(self.start).as_secs_f64();
+        if secs <= 0.0 {
+            return None;
+        }
+        let rate = (self.hashes as f64 / secs) as u64;
+        *self = RateWindow::new(now);
+        Some(rate)
+    }
+}
+
 pub fn mine(gpu: &Gpu, node: &str, miner: &str, batch: u32, refresh: Duration, control: &MinerControl) {
     let http = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -152,7 +180,11 @@ pub fn mine(gpu: &Gpu, node: &str, miner: &str, batch: u32, refresh: Duration, c
     let mut rng = rand::thread_rng();
     let mut hashes = 0u64;
     let mut rate_start = Instant::now();
-    let mut window_hashes = 0u64;
+    // One window for the whole run, across templates: its hashes and its
+    // start must both carry over, or a reading after a new template divides
+    // the old template's hashes by the new one's time (up to twice the rate).
+    let mut window = RateWindow::new(Instant::now());
+    let mut last_check = Instant::now();
 
     while !control.stopped() {
         let work: Work = match http
@@ -191,7 +223,6 @@ pub fn mine(gpu: &Gpu, node: &str, miner: &str, batch: u32, refresh: Duration, c
         let mut hi: u32 = rng.gen();
         let mut lo = 0u32;
         let fetched = Instant::now();
-        let mut last_check = Instant::now();
         control.height.store(work.height, Ordering::Relaxed);
 
         while !control.stopped() {
@@ -209,7 +240,7 @@ pub fn mine(gpu: &Gpu, node: &str, miner: &str, batch: u32, refresh: Duration, c
             }
             let batch_hi = hi;
             hashes += batch as u64;
-            window_hashes += batch as u64;
+            window.add(batch as u64);
             match lo.checked_add(batch) {
                 Some(next) => lo = next,
                 None => {
@@ -232,11 +263,9 @@ pub fn mine(gpu: &Gpu, node: &str, miner: &str, batch: u32, refresh: Duration, c
             }
 
             if last_check.elapsed() >= Duration::from_secs(2) {
-                let window = last_check.elapsed().as_secs_f64();
-                control
-                    .hash_rate
-                    .store((window_hashes as f64 / window) as u64, Ordering::Relaxed);
-                window_hashes = 0;
+                if let Some(rate) = window.take(Instant::now()) {
+                    control.hash_rate.store(rate, Ordering::Relaxed);
+                }
                 last_check = Instant::now();
                 if let Ok(info) = http
                     .get(format!("{node}/chain"))
@@ -309,6 +338,22 @@ fn submit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rate_window_divides_its_hashes_by_its_own_time() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut w = RateWindow::new(t0);
+        // 1.5 s on one template, a new template, then 0.5 s more: the
+        // reading covers all 2 s, not only the last 0.5 s.
+        w.add(1_500);
+        w.add(500);
+        assert_eq!(w.take(t0 + s(2)), Some(1_000));
+        // The next window starts at the reading.
+        w.add(4_000);
+        assert_eq!(w.take(t0 + s(4)), Some(2_000));
+        assert_eq!(w.take(t0 + s(4)), None);
+    }
 
     #[test]
     fn rest_keeps_the_gpu_busy_for_the_limit_share() {
