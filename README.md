@@ -5,7 +5,7 @@ relay, and a desktop app that runs all of them in one window.
 
 Download the desktop app from the [latest release](../../releases/latest). What
 changed in each version is in [`CHANGELOG.md`](CHANGELOG.md); planned changes are
-in [`CHANGELOG-PLANNED.md`](CHANGELOG-PLANNED.md).
+in [`planned.toml`](planned.toml).
 
 ## Latest releases
 

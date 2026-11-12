@@ -4,8 +4,7 @@ What changed in each released version. A version is a `v*` tag on `main`; the
 release workflow builds it. Dates are UTC.
 
 Changes that are planned but not released are in
-[`CHANGELOG-PLANNED.md`](CHANGELOG-PLANNED.md). When a version is released, its
-section moves from that file to the top of this one.
+[`planned.toml`](planned.toml); `tools/planned` lists them by version.
 
 Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.

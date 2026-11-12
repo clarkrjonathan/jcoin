@@ -12,13 +12,19 @@ consensus questions himself.
 - "Commit" means a local commit. Push, merge, tag, and delete remote branches
   only when Jonathan says so. Work on a descriptive branch, never on `main`.
 - A release is a `v*` tag on `main`. Use the `release` skill.
-- Before building a change, add it to `CHANGELOG-PLANNED.md` (problem as
-  observed, planned change, `Status:`, `Consensus: yes/no`). When it ships,
-  move it to `CHANGELOG.md`.
+- Before building a change, add it as an `[[item]]` in `planned.toml` (format
+  in the file's header). Edit single fields; never write version numbers
+  there (`tools/planned` works them out). When a release ships, write its
+  `CHANGELOG.md` section and delete its release and items from the file.
 - A consensus change (anything that alters which blocks are valid) needs his
   decision, a higher block version, and a `2.x.0` release. There are no
   required or forced updates; the app only advises.
 - Write plain technical English: short sentences, no hype.
+- When updating context files (guides, handoff, planned changes, known
+  issues), rewrite them to state only what is true now. Delete outdated text
+  and finished reminders; do not add a note that supersedes them. History
+  belongs only where it is the point, such as a post-mortem or a decision
+  record.
 
 ## Where things are
 
@@ -45,6 +51,7 @@ Run these in place of composing commands. Each prints a few lines.
 
 | Task | Command |
 | --- | --- |
+| Planned releases, numbered | `tools/planned` (`show ID\|VERSION\|backlog\|ops`, `check`) |
 | Build and test everything | `tools/check` (`--gpu` adds the GPU tests, `--build` builds programs; failures saved in `.check-logs/`) |
 | Is a failure new? | `tools/check --at main [PACKAGE]` (same checks on another commit) |
 | Is an intermittent test fixed? | `tools/repeat-test PACKAGE FILTER [N] [--ignored]` |
