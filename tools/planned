@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Planned changes from planned.toml, with version numbers worked out.
+
+  tools/planned                  every release, numbered, one line per item
+  tools/planned show WHAT        full text: an item id, a release id, a
+                                 version (2.2.4), "backlog", or "ops"
+  tools/planned check            validate the file; non-zero exit on errors
+
+Versions count from the latest v* tag, in file order within each kind:
+patches are x.y.(z+1), x.y.(z+2), ...; minors x.(y+1).0, ...; majors
+(x+1).0.0, ... Reorder releases by moving their blocks in planned.toml.
+"""
+import subprocess
+import sys
+import textwrap
+import tomllib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+FILE = ROOT / "planned.toml"
+KINDS = ("patch", "minor", "major")
+STATUSES = ("proposed", "to design", "planned", "in progress", "done")
+SPECIAL = ("backlog", "ops")
+
+
+def latest_tag():
+    out = subprocess.run(
+        ["git", "-C", str(ROOT), "tag", "-l", "v*", "--sort=-v:refname"],
+        capture_output=True, text=True, check=True).stdout.split()
+    if not out:
+        sys.exit("planned: no v* tag found")
+    return tuple(int(p) for p in out[0][1:].split("."))
+
+
+def load():
+    with open(FILE, "rb") as f:
+        data = tomllib.load(f)
+    return data.get("release", []), data.get("item", [])
+
+
+def number(releases):
+    major, minor, patch = latest_tag()
+    count = {k: 0 for k in KINDS}
+    versions = {}
+    for r in releases:
+        kind = r.get("kind")
+        if kind not in KINDS:
+            continue
+        count[kind] += 1
+        n = count[kind]
+        versions[r["id"]] = {
+            "patch": f"{major}.{minor}.{patch + n}",
+            "minor": f"{major}.{minor + n}.0",
+            "major": f"{major + n}.0.0",
+        }[kind]
+    return versions
+
+
+def errors(releases, items):
+    errs = []
+    kinds = {}
+    for r in releases:
+        if r.get("kind") not in KINDS:
+            errs.append(f"release {r.get('id')}: kind must be one of {KINDS}")
+        if r.get("id") in kinds or r.get("id") in SPECIAL:
+            errs.append(f"release {r.get('id')}: duplicate or reserved id")
+        kinds[r.get("id")] = r.get("kind")
+    seen = set()
+    for it in items:
+        i = it.get("id", "?")
+        if i in seen:
+            errs.append(f"item {i}: duplicate id")
+        seen.add(i)
+        for field in ("id", "release", "title", "status", "consensus", "change"):
+            if field not in it:
+                errs.append(f"item {i}: missing {field}")
+        rel = it.get("release")
+        if rel not in kinds and rel not in SPECIAL:
+            errs.append(f"item {i}: unknown release {rel!r}")
+        if it.get("status") not in STATUSES:
+            errs.append(f"item {i}: status must be one of {STATUSES}")
+        if it.get("consensus") is True and kinds.get(rel) == "patch":
+            errs.append(f"item {i}: consensus change in patch release {rel}")
+    for r in releases:
+        if not any(it.get("release") == r.get("id") for it in items):
+            errs.append(f"release {r.get('id')}: has no items")
+    return errs
+
+
+def flags(it):
+    f = []
+    if it.get("consensus"):
+        f.append("CONSENSUS")
+    if it.get("issue"):
+        f.append(it["issue"])
+    if it.get("open"):
+        f.append(f"{len(it['open'])} open")
+    return ("  [" + ", ".join(f) + "]") if f else ""
+
+
+def line(it):
+    return f"  {it['id']:<22} {it['status']:<12} {it['title']}{flags(it)}"
+
+
+def overview(releases, items, versions):
+    for r in releases:
+        print(f"{versions.get(r['id'], '?'):<7} {r['kind']:<6} {r['id']}: {r['title']}")
+        for it in items:
+            if it["release"] == r["id"]:
+                print(line(it))
+    for s in SPECIAL:
+        group = [it for it in items if it["release"] == s]
+        print(f"{s}: {len(group)} items (tools/planned show {s})")
+
+
+def para(label, text):
+    print(f"  {label}:")
+    for p in text.strip().split("\n\n"):
+        print(textwrap.fill(" ".join(p.split()), 76,
+                            initial_indent="    ", subsequent_indent="    "))
+
+
+def full(it, versions):
+    rel = it["release"]
+    print(f"{it['id']}: {it['title']}")
+    print(f"  release {versions.get(rel, rel)} ({rel}), status {it['status']}, "
+          f"consensus {'yes' if it['consensus'] else 'no'}"
+          + (f", issue {it['issue']}" if it.get("issue") else ""))
+    if it.get("source"):
+        print(f"  source: {it['source']}")
+    if it.get("problem"):
+        para("problem", it["problem"])
+    para("change", it["change"])
+    for q in it.get("open", []):
+        para("open", q)
+
+
+def show(what, releases, items, versions):
+    byid = {it["id"]: it for it in items}
+    if what in byid:
+        full(byid[what], versions)
+        return
+    rel = next((r for r, v in versions.items() if v == what), what)
+    group = [it for it in items if it["release"] == rel]
+    if not group:
+        sys.exit(f"planned: nothing matches {what!r}")
+    title = next((r["title"] for r in releases if r["id"] == rel), rel)
+    print(f"== {versions.get(rel, rel)} {title}")
+    for it in group:
+        print()
+        full(it, versions)
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    releases, items = load()
+    errs = errors(releases, items)
+    if argv and argv[0] == "check":
+        for e in errs:
+            print(e)
+        print("planned.toml: ok" if not errs else f"{len(errs)} errors")
+        return 1 if errs else 0
+    if errs:
+        print(f"planned.toml has {len(errs)} errors; run tools/planned check",
+              file=sys.stderr)
+    versions = number(releases)
+    if not argv:
+        overview(releases, items, versions)
+    elif argv[0] == "show" and len(argv) == 2:
+        show(argv[1], releases, items, versions)
+    else:
+        print(__doc__.strip())
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

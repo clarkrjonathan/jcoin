@@ -1,0 +1,381 @@
+# Planned changes. Read it with `tools/planned`; check it with
+# `tools/planned check`.
+#
+# [[release]]: a group of items that ship together.
+#   kind = "patch" | "minor" | "major". Version numbers are not written here:
+#   `tools/planned` counts from the latest `v*` tag, in file order within each
+#   kind. The first patch is the next patch after the tag, the first minor is
+#   the next minor, and so on. To reorder releases, move the [[release]]
+#   blocks; nothing is renumbered by hand.
+#
+# [[item]]: one problem and its planned change.
+#   release   a release id, "backlog" (no version yet), or "ops" (needs no
+#             release)
+#   status    proposed (waiting for Jonathan) | to design (problem agreed,
+#             change not) | planned | in progress | done (merged, waiting for
+#             the release)
+#   consensus true if it changes which blocks are valid. Allowed only in a
+#             minor or major release; such a change also needs a higher block
+#             version and Jonathan's decision.
+#   issue     optional `docs/KNOWN-ISSUES.md` id
+#   open      optional list of questions still to settle
+#
+# Edit one field at a time. To move an item, change its `release`. When a
+# release ships, write its `CHANGELOG.md` section and delete its [[release]]
+# block and its items.
+
+[[release]]
+id = "reliability"
+kind = "patch"
+title = "Transfers survive restarts and reorgs; bounded memory"
+
+[[release]]
+id = "wallet"
+kind = "patch"
+title = "Wallet and block detail"
+
+[[release]]
+id = "overhaul"
+kind = "minor"
+title = "Graphical overhaul"
+
+# --- reliability -----------------------------------------------------------
+
+[[item]]
+id = "pending-persist"
+release = "reliability"
+title = "Pending transfers survive a restart"
+status = "planned"
+consensus = false
+source = "found 2026-11-11"
+problem = '''
+Pending transfers are kept in memory only. When the sender's app is closed
+with transfers pending, its node forgets them. They still confirm if another
+node holds them; otherwise they must be sent again. The app's "Sent this
+session" list is also lost, so the sender cannot see which are affected.'''
+change = '''
+Store pending transfers in the data folder and reload them at startup. A
+stored transfer that is no longer valid is dropped. Keep the sent list across
+restarts.'''
+
+[[item]]
+id = "reorg-requeue"
+release = "reliability"
+title = "A reorg puts transfers back in the queue"
+status = "planned"
+consensus = false
+issue = "O1"
+problem = '''
+On a reorg the mempool is only pruned to the new tip. Transfers confirmed
+only on the dropped branch disappear until the sender sends them again.'''
+change = '''
+Pass the dropped branch's transfers back through normal mempool admission;
+invalid ones fall out there.'''
+
+[[item]]
+id = "out-of-order"
+release = "reliability"
+title = "Hold transfers that arrive out of order"
+status = "planned"
+consensus = false
+issue = "O8"
+problem = '''
+The mempool accepts nonce n + 1 only after n. A node that receives n + 1
+from one peer before n from another rejects n + 1 and does not keep it.'''
+change = '''
+Hold out-of-order transfers in a per-sender buffer (up to 16, for up to 10
+minutes) and admit them when the gap fills.'''
+
+[[item]]
+id = "fork-pruning"
+release = "reliability"
+title = "Bound the memory used by forks"
+status = "planned"
+consensus = false
+issue = "V1"
+source = "docs/adr/0005-reliability-patch-2-2-4.md"
+problem = '''
+The chain keeps every valid block it accepts, each with a full State copy. A
+peer can send valid losing fork blocks without end and grow a node's memory
+without limit.'''
+change = '''
+Drop side branches that fork more than 288 blocks (about a day) below the
+tip. A node then refuses a reorg deeper than 288 blocks and logs it.'''
+
+[[item]]
+id = "direct-dupes"
+release = "reliability"
+title = "One direct connection per pair of nodes"
+status = "planned"
+consensus = false
+issue = "O5"
+source = "tools/local-net up 2 relay"
+problem = '''
+Both nodes dial each other's direct address, and a hole punch can add one
+more, so a pair can keep up to three direct connections. Only one carries the
+session; the others stay open.'''
+change = '''
+Track which connection carries the session in the host, then close the other
+direct connections to that peer.'''
+
+# --- wallet ----------------------------------------------------------------
+
+[[item]]
+id = "saved-addresses"
+release = "wallet"
+title = "Saved addresses for sending"
+status = "planned"
+consensus = false
+source = "Jonathan's note, 2026-11-11"
+problem = '''
+Sending needs a 64-character address pasted in each time.'''
+change = '''
+An address book in the app: save an address under a name, pick it when
+sending. Stored in the data folder.'''
+
+[[item]]
+id = "block-view"
+release = "wallet"
+title = "Full block view in the Developer section"
+status = "planned"
+consensus = false
+source = "Jonathan's note, 2026-11-11"
+problem = '''
+The Developer section lists only blocks this node mined, with a few fields.'''
+change = '''
+Any block can be expanded to show all of it: header fields, the coinbase,
+each transfer, with click-through to more detail. Needs a node endpoint that
+returns a block by height or hash.'''
+
+# --- overhaul --------------------------------------------------------------
+
+[[item]]
+id = "modes"
+release = "overhaul"
+title = "A redesigned window with modes"
+status = "planned"
+consensus = false
+problem = '''
+The app is one long page that shows everything to everyone. A person who only
+holds coins sees mining and developer controls; a miner has no view of what
+the GPU is doing.'''
+change = '''
+A window with modes, so each kind of user sees what they need:
+Miner (mining controls and GPU statistics), Wallet (balance, keys, sending,
+receiving), Developer (connections, blocks, the log, diagnostics). GPU
+statistics: hash rate over time, the GPU use limit, blocks found, and where
+the system reports them, temperature, power, and load.'''
+open = [
+  "The exact set of modes and their names.",
+  "Which GPU figures can be read on each system. wgpu does not report temperature, power, or load; each GPU maker and operating system needs its own source.",
+  "Whether the GPU use limit lowers itself while the computer is in use.",
+]
+
+# --- backlog ---------------------------------------------------------------
+
+[[item]]
+id = "peer-scoring"
+release = "backlog"
+title = "Peer scoring and banning"
+status = "to design"
+consensus = false
+issue = "V2"
+problem = '''
+A peer that floods invalid transfers, blocks, or garbage frames is never
+penalized or disconnected.'''
+change = '''
+Score misbehaviour; disconnect and ban on repeated invalid data.'''
+
+[[item]]
+id = "addr-expiry"
+release = "backlog"
+title = "Address book entries expire"
+status = "to design"
+consensus = false
+source = "investigation, 2026-11-11"
+problem = '''
+A node passes on its own circuit address and up to 64 book entries in every
+ADDR. Entries never expire, and the 64 are taken in hash-set order, not the
+most recent.'''
+change = '''
+Expire entries not seen for a while; pass on the most recently seen first.'''
+
+[[item]]
+id = "miner-64"
+release = "backlog"
+title = "The miner fills a block with up to 64 transfers"
+status = "planned"
+consensus = false
+problem = '''
+The node's miner and the mining endpoints select one pending transfer for
+each block. The rules allow 64.'''
+change = '''
+Select up to 64, highest fee first, each sender's transfers in nonce order.'''
+
+[[item]]
+id = "incoming-transfer"
+release = "backlog"
+title = "Show a transfer that is on its way in"
+status = "to design"
+consensus = false
+problem = '''
+The app shows only the confirmed balance. A recipient sees nothing until the
+transfer is in a block.'''
+change = '''
+Show pending incoming transfers next to the balance.'''
+
+[[item]]
+id = "single-instance"
+release = "backlog"
+title = "Only one copy of the app per data folder"
+status = "planned"
+consensus = false
+problem = '''
+A second copy of the app can start while one runs. Both write to the same
+chain file and key folder. A downloaded copy next to the installed one makes
+this easy to do by accident.'''
+change = '''
+A lock in the data folder; a second copy brings the first one's window
+forward and exits.'''
+
+[[item]]
+id = "heavier-chain-notice"
+release = "backlog"
+title = "Notice for a heavier chain with the same block version"
+status = "to design"
+consensus = false
+source = "Jonathan's note, 2026-11-11"
+problem = '''
+The app counts refused blocks that carry a higher version. A refused chain
+with much more work and the same version gets no notice. A block whose
+parent is unknown is also what a node sees during ordinary sync, so it is
+not evidence by itself.'''
+change = '''
+Count such blocks only when they stay unconnected after a sync attempt, and
+show a weaker notice.'''
+
+[[item]]
+id = "peer-rule-version"
+release = "backlog"
+title = "Peers' rule version in the connections list"
+status = "to design"
+consensus = false
+problem = '''
+The connections list does not show which peers run other rules.'''
+change = '''
+Add the version to the handshake (a protocol addition) and show it.'''
+
+[[item]]
+id = "updater-signature"
+release = "backlog"
+title = "The updater checks a signature"
+status = "to design"
+consensus = false
+source = "Jonathan's question, 2026-11-11"
+problem = '''
+`update::install` checks the download against `SHA256SUMS-<platform>.txt`
+from the same GitHub release (`app/src/update.rs`). That catches a corrupt
+download but not a swapped one: the list is not signed, so anyone who can
+publish to the release can supply a matching checksum.'''
+change = '''
+Sign SHA256SUMS in the release workflow with a key whose public half is in
+the app; verify the signature before trusting the list. Low priority while
+only friends use it.'''
+
+[[item]]
+id = "windows-hole-punch"
+release = "backlog"
+title = "Hole punching from Windows"
+status = "to design"
+consensus = false
+problem = '''
+A Windows node dials from a new port, because dialing from the listen port
+fails there (os error 10048). The library's hole-punch dials still use the
+listen port. A friend's Windows node logged four failed hole punches and one
+success.'''
+change = '''
+Fix how the Windows sockets are set up.'''
+
+[[item]]
+id = "merkle-root"
+release = "backlog"
+title = "Merkle root for transfers"
+status = "to design"
+consensus = true
+problem = '''
+A block commits to its transfers with one hash over all of them. A light
+client that checks one transfer without the whole block needs a Merkle root.
+No such client exists. See `docs/adr/0001-restart-consensus-v2.md`.'''
+change = '''
+Deferred until a light client is wanted.'''
+
+# --- operations ------------------------------------------------------------
+
+[[item]]
+id = "sentry-read-token"
+release = "ops"
+title = "Create the Sentry read token"
+status = "planned"
+consensus = false
+change = '''
+Create a Sentry user auth token (scopes org:read, project:read, event:read)
+and save it to `~/.config/jeffycoin/sentry-token`, so `tools/sentry-logs`
+can read the logs.'''
+
+[[item]]
+id = "sentry-auth-secret"
+release = "ops"
+title = "Add the SENTRY_AUTH_TOKEN repository secret"
+status = "planned"
+consensus = false
+change = '''
+So that crash reports show function names and line numbers.'''
+
+[[item]]
+id = "sentry-alerts"
+release = "ops"
+title = "Sentry alerts"
+status = "planned"
+consensus = false
+change = '''
+One alert for any crash, one for `reservation_lost` with no
+`reservation_ok` after it. Nothing notifies anyone today.'''
+
+[[item]]
+id = "sentry-quota"
+release = "ops"
+title = "Check the Sentry log quota"
+status = "planned"
+consensus = false
+change = '''
+Compare the plan's log quota with the volume once several nodes run all day.'''
+
+[[item]]
+id = "relay-deploy"
+release = "ops"
+title = "Deploy a current relay"
+status = "planned"
+consensus = false
+change = '''
+The Lightsail relay runs the pre-2.1.1 relay program. Deploy a current one,
+so refused reservations appear in its log.'''
+
+[[item]]
+id = "imac-deploy"
+release = "ops"
+title = "Deploy a current node to the iMac"
+status = "planned"
+consensus = false
+change = '''
+The iMac reference node runs a build from before 2.2.0 and cannot sync with
+the current chain. Deploy from the home network (LAN only).'''
+
+[[item]]
+id = "server-reporting"
+release = "ops"
+title = "Should the relay and command-line node report to Sentry"
+status = "to design"
+consensus = false
+change = '''
+The relay and the iMac node log locally only. Decide whether they report
+too.'''
