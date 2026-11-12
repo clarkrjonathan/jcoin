@@ -10,6 +10,25 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.3.1 (2026-11-12)
+
+A patch. No consensus change.
+
+### Fixed
+
+- The hash rate in the Mining section, the status line, and Sentry
+  sometimes showed twice the real rate. The miner's 2-second rate window
+  kept its hash count but restarted its clock on every new block template
+  (every 20 seconds, and after each block). Because the status line is
+  written once a minute, it could land on the doubled reading for minutes
+  at a time. On Jons Desktop, 5 of 40 readings on 2.2.4 were doubled (about
+  760 against the real 385 MH/s). The miner now keeps one window for the
+  whole run. The hashing itself was not affected.
+
+Not tested on Windows; the change is in the miner's bookkeeping only.
+
+Consensus: no.
+
 ## 2.3.0 (2026-11-12)
 
 No consensus change: it runs on the same chain as 2.2.0 and connects and
