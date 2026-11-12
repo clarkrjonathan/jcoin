@@ -7,8 +7,11 @@ description: Read the JeffyCoin desktop app's Sentry logs without spending many 
 
 The desktop app (2.1.1 and later) sends every log line to Sentry project
 `iowa-state-pe/jcoin-app`. Each line has attributes: `component`, `event`,
-`device`, `install_id`, `peer_id`, `network`, `address`, `gpu`, `installed`
-(see `app/README.md`, "Reporting").
+`device`, `install_id`, `run`, `peer_id`, `network`, `address`, `gpu`,
+`installed` (see `app/README.md`, "Reporting"). Since 2.2.2 a line may also
+carry its own fields: `run` (one program start), `peer` (6 chars after
+`12D3KooW`), `reason` (a failure class), `via` (`relay`/`direct`), `height`,
+and the status fields. Query by these instead of reading message text.
 
 A raw log query is expensive: one failed-dial line is 300 to 800 characters,
 a node logs dozens on every start, and the MCP tool adds an id and two links
@@ -17,8 +20,12 @@ the next one is needed.
 
 ## The rule
 
-1. **Count before you read.** Start with counts by node, then counts by
-   `event` for the node in question.
+0. **Ask `diagnose` first.** `tools/sentry-logs diagnose NODE` answers "what is
+   wrong with this node" in one call (current state, peers, signals, recent
+   errors) with no raw lines. Start here; only drop to the steps below when it
+   points somewhere specific.
+1. **Count before you read.** Counts by node (`nodes`), then by `event` for the
+   node in question (`events NODE`).
 2. **Read the story, not the log.** Ask only for the events that answer the
    question. Never fetch `dial_failed` lines unless the question is about one
    specific peer that cannot be dialed.
@@ -33,9 +40,12 @@ one line with `(xN)`. It needs a token (see "Token" below). If it prints
 unless they want the cheaper path.
 
 ```
+tools/sentry-logs diagnose NODE -p 2h      # one digest: state, peers, signals, errors (start here)
+tools/sentry-logs status NODE -p 2h        # the latest status line (height, peers, mining, pending, balance)
+tools/sentry-logs peers NODE -p 2h         # who it connected to, by peer and transport
 tools/sentry-logs nodes -p 2h              # who reported: device, install id, OS, release, count, last seen
 tools/sentry-logs events NODE -p 2h        # count of each event for one node
-tools/sentry-logs timeline NODE -p 2h      # the story: startup, reservation, peers, mining, blocks
+tools/sentry-logs timeline NODE -p 2h      # the story for the latest run (--all-runs for every run)
 tools/sentry-logs lines NODE -e EVENT      # only chosen events
 tools/sentry-logs lines NODE --errors      # errors and warnings, without routine noise
 tools/sentry-logs query 'SENTRY QUERY' -f timestamp -f event   # anything else
@@ -43,8 +53,8 @@ tools/sentry-logs query 'SENTRY QUERY' -f timestamp -f event   # anything else
 
 `NODE` is a device label, a 16-hex install id, a peer id, or the 6 characters
 after `12D3KooW`. `all` means every node. Default period is 2 hours; keep it
-as short as the question allows. Lines print as
-`HH:MM:SS <E|W| > event message` in UTC.
+as short as the question allows. `timeline` and `lines` default to the node's
+latest `run`. Lines print as `HH:MM:SS <E|W| > event message` in UTC.
 
 ## With the Sentry MCP tools (no token)
 
@@ -91,7 +101,13 @@ Rules for MCP queries:
 | `hole_punch_ok` / `hole_punch_failed` | A direct connection was or was not made; on failure the relay carries the traffic |
 | `mining_started` / `mining_stopped` / `gpu_limit_set` | Mining controls |
 | `block_won` / `block_accepted` | This node mined a block |
-| `dial_failed`, `stream_failed`, `listening`, `block_candidate` | Routine; noise for most questions |
+| `status` | Once a minute: height, peers, reservation, mining, hash_rate, gpu_limit, pending, balance (see `status`/`diagnose`) |
+| `block_received` / `sync_done` | A block arrived from a peer; a sync caught up (has `height`) |
+| `reorg` | The tip moved to another branch (has `height`, `depth`) |
+| `transfer_sent` / `transfer_confirmed` / `transfer_received` | A transfer this node sent, confirmed, or received |
+| `pending_dropped` | A pending transfer left the mempool without confirming |
+| `update_started` / `update_installed` / `update_failed`, `installed` / `uninstalled` | Update and install flow |
+| `dial_failed`, `stream_failed`, `listening`, `block_candidate` | Routine; noise for most questions. A repeated failed dial (same `peer` + `reason`) reaches Sentry once per `run` |
 
 ## Common questions
 
@@ -104,6 +120,11 @@ Rules for MCP queries:
   and `store_replayed` (tip height). Two nodes on the same chain report the
   same height once synced.
 - **Did a release reach people?** `nodes` shows `sentry.release` per node.
+- **What state is a node in?** `status NODE` (or `diagnose NODE`): the latest
+  `status` line gives height, peers, reservation, mining, hash_rate, pending,
+  and balance in one row, without reading the history.
+- **Is the chain stuck or reorging?** `diagnose` lists `reorg` and
+  `reservation_lost` signals; compare `status` height across nodes.
 
 ## Token
 

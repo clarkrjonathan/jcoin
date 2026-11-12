@@ -272,6 +272,7 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0),
+                            label: None,
                         },
                     );
                     // The dialing side opens the protocol stream, unless a
@@ -282,11 +283,20 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                     }
                 }
                 SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error, .. } => {
-                    if let Some(addr) = pending.remove(&connection_id) {
-                        network.dial_finished(&addr, false);
+                    let addr = pending.remove(&connection_id);
+                    if let Some(addr) = &addr {
+                        network.dial_finished(addr, false);
                     }
                     let who = peer_id.map(|p| p.to_string()).unwrap_or_else(|| "?".into());
-                    crate::log_error!("[p2p] dial to {who} failed: {error}");
+                    let via = addr.as_ref().map(via).unwrap_or("direct");
+                    crate::log_error!(
+                        [
+                            ("peer", peer6(&who)),
+                            ("reason", fail_reason(&error.to_string()).to_string()),
+                            ("via", via.to_string()),
+                        ];
+                        "[p2p] dial to {who} failed: {error}"
+                    );
                 }
                 SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
                     network.connection_closed(&connection_id.to_string());
@@ -301,7 +311,10 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                         Ok(()) => "closed".to_string(),
                         Err(e) => e.to_string(),
                     };
-                    crate::log_error!("[p2p] relay reservation lost ({why}); this node cannot be reached until it is renewed");
+                    crate::log_error!(
+                        [("reason", fail_reason(&why).to_string())];
+                        "[p2p] relay reservation lost ({why}); this node cannot be reached until it is renewed"
+                    );
                     circuit_listener = None;
                     if let Some(addr) = circuit_addr.take() {
                         swarm.remove_external_address(&addr);
@@ -331,8 +344,14 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result })) => {
                     match result {
-                        Ok(_) => crate::log_info!("[p2p] hole punch to {remote_peer_id} succeeded: direct connection"),
-                        Err(e) => crate::log_info!("[p2p] hole punch to {remote_peer_id} failed ({e}); staying on the relay"),
+                        Ok(_) => crate::log_info!(
+                            [("peer", peer6(&remote_peer_id.to_string())), ("via", "direct".to_string())];
+                            "[p2p] hole punch to {remote_peer_id} succeeded: direct connection"
+                        ),
+                        Err(e) => crate::log_info!(
+                            [("peer", peer6(&remote_peer_id.to_string())), ("via", "relay".to_string())];
+                            "[p2p] hole punch to {remote_peer_id} failed ({e}); staying on the relay"
+                        ),
                     }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Rendezvous(event)) => match event {
@@ -370,9 +389,21 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                 let id = opts.connection_id();
                 match swarm.dial(opts) {
                     Ok(()) => { pending.insert(id, addr); }
+                    // Already connected or a dial is in flight: not a failure,
+                    // and logging it was most of the noise. Stay quiet.
+                    Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => {
+                        network.dial_finished(&addr, false);
+                    }
                     Err(e) => {
                         network.dial_finished(&addr, false);
-                        crate::log_error!("[p2p] cannot dial {addr}: {e}");
+                        crate::log_error!(
+                            [
+                                ("peer", peer_of(&addr).map(|p| peer6(&p.to_string())).unwrap_or_else(|| "?".into())),
+                                ("reason", fail_reason(&e.to_string()).to_string()),
+                                ("via", via(&addr).to_string()),
+                            ];
+                            "[p2p] cannot dial {addr}: {e}"
+                        );
                     }
                 }
             }
@@ -527,6 +558,46 @@ fn strip_peer(addr: &Multiaddr) -> Multiaddr {
         addr.pop();
     }
     addr
+}
+
+/// The 6 characters after the `12D3KooW` prefix of a peer id, for the `peer`
+/// log attribute. One run of one peer can then be picked out without the full
+/// 52-character id. Falls back to the first 6 characters.
+pub(crate) fn peer6(peer: &str) -> String {
+    peer.strip_prefix("12D3KooW")
+        .unwrap_or(peer)
+        .chars()
+        .take(6)
+        .collect()
+}
+
+/// Whether an address reaches the peer through the relay (`/p2p-circuit`) or
+/// directly, for the `via` log attribute.
+fn via(addr: &Multiaddr) -> &'static str {
+    if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+        "relay"
+    } else {
+        "direct"
+    }
+}
+
+/// A short class for a dial, connection, or reservation failure, for the
+/// `reason` log attribute. Keeps the full text in the message.
+fn fail_reason(error: &str) -> &'static str {
+    let e = error.to_ascii_lowercase();
+    if e.contains("timed out") || e.contains("timeout") {
+        "timeout"
+    } else if e.contains("refused") {
+        "refused"
+    } else if e.contains("reservation") || e.contains("circuit") || e.contains("relay") {
+        "no_reservation"
+    } else if e.contains("in use") || e.contains("10048") || e.contains("already in use") {
+        "address_in_use"
+    } else if e.contains("handshake") || e.contains("negotiat") {
+        "handshake"
+    } else {
+        "other"
+    }
 }
 
 /// Hosts on loopback: a direct connection, and relay-only nodes that find each

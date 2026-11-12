@@ -66,6 +66,7 @@ same framing works over any byte stream.
 | `0x0002` | `HELLO_ACK` |
 | `0x0003` | `PING` |
 | `0x0004` | `PONG` |
+| `0x0005` | `NODE_INFO` (friendly label, optional; added 2.2.2) |
 | `0x0010` | `NEW_TRANSACTION` |
 | `0x0020` | `GET_ADDR` |
 | `0x0021` | `ADDR` |
@@ -97,6 +98,16 @@ regard to who opened the stream. On receiving a `HELLO`:
 3. Otherwise reply `HELLO_ACK`.
 
 The session is established once each side has received a `HELLO_ACK`.
+
+### `NODE_INFO` (friendly label, optional)
+
+After the handshake, a node that has a device label sends one `NODE_INFO`,
+whose payload is the label as UTF-8 (cleaned to letters, digits, spaces, `-`,
+`_`, at most 32 characters). It is cosmetic: the receiver shows it next to the
+peer id in its connections list. It carries no identity and is not
+authenticated, so the label is whatever the sender chose. It was added in
+2.2.2; older nodes neither send it nor choke on it (an unknown type is
+skipped), so new and old nodes still connect and sync.
 
 ## 4. Heartbeat: `PING` / `PONG`
 

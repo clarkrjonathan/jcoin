@@ -138,6 +138,7 @@ pub async fn run_peer<L: PeerLink + 'static>(mut link: L, network: Network, labe
         }
     };
     crate::log_info!(
+        [("peer", super::host::peer6(&label))];
         "[p2p] connected to {label} (peer wire v{}, port {})",
         peer.version, peer.listen_port
     );
@@ -147,6 +148,12 @@ pub async fn run_peer<L: PeerLink + 'static>(mut link: L, network: Network, labe
     // Advertise our own addresses and ask for the peer's, to grow the mesh.
     let _ = write_message(&mut write_half, &Message::Addr(network.known_addrs())).await;
     let _ = write_message(&mut write_half, &Message::GetAddr).await;
+
+    // Tell the peer our friendly label, if the user named this computer. Older
+    // nodes do not send this and ignore it when received.
+    if let Some(label) = network.own_label() {
+        let _ = write_message(&mut write_half, &Message::NodeInfo(label)).await;
+    }
 
     // Ask the peer for any blocks we are missing (initial block download).
     let _ = start_sync(&network, &mut write_half).await;
@@ -180,6 +187,10 @@ pub async fn run_peer<L: PeerLink + 'static>(mut link: L, network: Network, labe
                 match incoming {
                     Some(msg) => {
                         last_activity = Instant::now();
+                        // The label is keyed by peer id; `label` is that id.
+                        if let Message::NodeInfo(their_label) = &msg {
+                            network.set_peer_label(&label, their_label);
+                        }
                         if !handle_incoming(msg, id, &network, &mut write_half).await {
                             break;
                         }
@@ -211,7 +222,7 @@ pub async fn run_peer<L: PeerLink + 'static>(mut link: L, network: Network, labe
 
     network.remove(id);
     reader.abort();
-    crate::log_info!("[p2p] disconnected from {label}");
+    crate::log_info!([("peer", super::host::peer6(&label))]; "[p2p] disconnected from {label}");
 }
 
 /// Read frames until the stream fails. Decode errors that leave the stream in
@@ -285,7 +296,11 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
                 return true;
             }
             match reply_rx.await {
-                Ok(BlockOutcome::Accepted { is_new: true, .. }) => {
+                Ok(BlockOutcome::Accepted { is_new: true, height, .. }) => {
+                    crate::log_info!(
+                        [("event", "block_received".to_string()), ("height", height.to_string())];
+                        "[p2p] stored new block {height} from a peer"
+                    );
                     network.broadcast_block(&block, Some(peer_id));
                     true
                 }
@@ -317,6 +332,8 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
         Message::Blocks(blocks) => {
             let count = blocks.len();
             let mut advanced = false;
+            let mut applied = 0u64;
+            let mut last_height = 0u64;
             for block in blocks {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 if network
@@ -330,15 +347,27 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
                 {
                     return true;
                 }
-                if let Ok(BlockOutcome::Accepted { is_new: true, .. }) = reply_rx.await {
+                if let Ok(BlockOutcome::Accepted { is_new: true, height, .. }) = reply_rx.await {
                     advanced = true;
+                    applied += 1;
+                    last_height = height;
                 }
             }
+            // A full batch that advanced the chain means there may be more.
             if advanced && count == BLOCK_BATCH {
                 return start_sync(network, write_half).await;
             }
+            // The sync has caught up (this was the last batch).
+            if applied > 0 {
+                crate::log_info!(
+                    [("event", "sync_done".to_string()), ("height", last_height.to_string()), ("blocks", applied.to_string())];
+                    "[p2p] synced up to height {last_height} ({applied} block(s) in the last batch)"
+                );
+            }
             true
         }
+        // Handled in the run loop (stored as the peer's label); nothing to do.
+        Message::NodeInfo(_) => true,
         // A HELLO or HELLO_ACK after the handshake is unexpected; ignore it.
         Message::Hello(_) | Message::HelloAck => true,
     }

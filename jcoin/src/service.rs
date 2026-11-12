@@ -59,6 +59,9 @@ pub struct ServiceConfig {
     pub data_dir: Option<std::path::PathBuf>,
     /// Run on the local test network instead of the real one.
     pub regtest: bool,
+    /// A friendly label for this node, sent to peers after the handshake and
+    /// shown in their connections list. `None` sends nothing.
+    pub label: Option<String>,
 }
 
 /// Shared state for REST handlers: a channel into the node core and the peer set.
@@ -108,6 +111,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), String> {
     tokio::spawn(run_node(node_rx, config.data_dir.clone(), params));
 
     let network = Network::new(node_tx.clone(), listen_port, Vec::new(), config.max_peers);
+    network.set_own_label(config.label.clone());
 
     // P2P host: identity, listener, bootstrap peers, and the optional relay.
     let key_file = config
@@ -336,7 +340,10 @@ async fn submit_mined(network: &Network, block: Block, tag: &str) -> Option<Bloc
     let outcome = ack_rx.await.ok()?;
     match &outcome {
         BlockOutcome::Accepted { is_new: true, height, .. } => {
-            crate::log_info!("[{tag}] won block {height} {}", hex::encode(block.hash()));
+            crate::log_info!(
+                [("height", height.to_string())];
+                "[{tag}] won block {height} {}", hex::encode(block.hash())
+            );
             network.broadcast_block(&block, None);
         }
         BlockOutcome::Accepted { is_new: false, height, .. } => {
@@ -549,6 +556,7 @@ async fn peers(State(state): State<AppState>) -> impl IntoResponse {
                 "is_relay": c.is_relay,
                 "session": c.session,
                 "since": c.since,
+                "label": c.label,
             })
         })
         .collect();

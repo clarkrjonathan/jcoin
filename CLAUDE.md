@@ -52,6 +52,7 @@ Run these in place of composing commands. Each prints a few lines.
 | Throwaway local nodes | `tools/local-net up [N] [mine]`, `status`, `down` |
 | Picture of the app window | `tools/app-shot [--dev] [--tall] [--mainnet]` |
 | Friends' logs (Sentry) | the `sentry-logs` skill, `tools/sentry-logs` |
+| Diagnose one node's logs in one call | `tools/sentry-logs diagnose NODE` (also `status`, `peers`) |
 | The relay's log | `tools/relay-log [SINCE] [PEER]` |
 | Stall simulations | `cd jcoin && cargo test --release stall_report -- --ignored --nocapture` |
 

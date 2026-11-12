@@ -9,10 +9,16 @@
 //! | `event` | The kind of line: `dial_failed`, `reservation_ok`, `block_won`, ... (see `classify`) |
 //! | `device` | The label the user gave this computer, if any |
 //! | `install_id` | A random id made on first run; stable for one data folder |
+//! | `run` | A fresh id made at each program start; selects one run of one node |
 //! | `peer_id` | The node's libp2p peer id (matches the relay's log) |
 //! | `network` | `mainnet` or `regtest` |
 //! | `address` | The address of the key in use |
 //! | `gpu` | The GPU in use while mining |
+//!
+//! A line may also carry its own fields (`peer`, `reason`, `via`, `height`,
+//! ...), passed through the log macros; `before_send_log` turns them into
+//! attributes on that one line. A repeated failed dial (same `peer` and
+//! `reason`) is logged to the file but sent to Sentry only once per run.
 //!
 //! The same values are set as tags on crash reports. Sentry adds the release
 //! (`jcoin-app@<version>`) and the operating system itself.
@@ -20,10 +26,13 @@
 //! Reporting is off when `JCOIN_APP_NO_TELEMETRY=1` is set, and in tests
 //! (nothing initializes it there).
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
+
+use jcoin::log::Field;
 
 /// The project's client key. It is public by design: it only allows sending.
 const DSN: &str =
@@ -54,7 +63,9 @@ pub fn init(data_dir: &Path, regtest: bool) -> Option<sentry::ClientInitGuard> {
             .environment(network)
             // JCOIN_APP_TELEMETRY_DEBUG=1 prints what the SDK sends to stderr.
             .debug(std::env::var("JCOIN_APP_TELEMETRY_DEBUG").is_ok_and(|v| v == "1"))
-            // Scope tags do not reach log lines, so add them here.
+            // Scope tags do not reach log lines, so add them here, then the
+            // line's own structured fields (which win over a tag of the same
+            // name).
             .before_send_log(|mut log| {
                 if let Ok(tags) = tags().read() {
                     for (key, value) in tags.iter() {
@@ -63,10 +74,18 @@ pub fn init(data_dir: &Path, regtest: bool) -> Option<sentry::ClientInitGuard> {
                             .or_insert_with(|| value.clone().into());
                     }
                 }
+                PENDING_FIELDS.with(|fields| {
+                    for (key, value) in fields.borrow().iter() {
+                        log.attributes.insert((*key).to_string(), value.clone().into());
+                    }
+                });
                 Some(log)
             }),
     );
     set_tag("network", network);
+    // A fresh id for this run of the program, so one run's lines can be
+    // selected without a time window.
+    set_tag("run", &hex::encode(rand::random::<[u8; 4]>()));
     let install_id = install_id(data_dir);
     set_tag("install_id", &install_id);
     let device = device_name(data_dir);
@@ -203,6 +222,8 @@ pub fn classify(text: &str) -> Class {
         "p2p" if starts("peer id") => ("identity", false),
         "p2p" if starts("listening on") => ("listening", false),
         "p2p" if starts("host stopped") => ("host_stopped", false),
+        "p2p" if starts("stored new block") => ("block_received", false),
+        "p2p" if starts("synced up to") => ("sync_done", false),
         "work" | "mine" if starts("won block") => ("block_won", false),
         "work" | "mine" if starts("found candidate") => ("block_candidate", false),
         "gpu" if has(": accepted") => ("block_accepted", false),
@@ -212,10 +233,17 @@ pub fn classify(text: &str) -> Class {
         "store" if starts("replayed") => ("store_replayed", false),
         "store" if has("from another chain") => ("chain_moved_aside", false),
         "chain" if has("newer rules") => ("newer_rules", false),
+        "chain" if starts("reorg") => ("reorg", false),
+        "app" if starts("status:") => ("status", false),
+        "app" if starts("transfer") && has(" sent") => ("transfer_sent", false),
+        "app" if starts("transfer") && has("confirmed") => ("transfer_confirmed", false),
+        "app" if starts("transfer") && has("received") => ("transfer_received", false),
+        "node" if starts("pending transfer") && has("dropped") => ("pending_dropped", false),
         "app" if starts("JeffyCoin") && has("starting") => ("startup", false),
         "app" if starts("mining started") => ("mining_started", false),
         "app" if starts("mining stopped") => ("mining_stopped", false),
         "app" if starts("cannot open the GPU") => ("gpu_unavailable", false),
+        "app" if starts("uninstalling") => ("uninstalled", false),
         "app" if starts("install") || starts("running") => ("install", false),
         "app" if starts("GPU use limit") => ("gpu_limit_set", false),
         "app" if starts("update") => ("update", false),
@@ -228,9 +256,40 @@ pub fn classify(text: &str) -> Class {
     }
 }
 
-/// Send one log line to Sentry Logs, filed by `classify`. Does nothing until
-/// `init` has run.
-pub fn log(error: bool, text: &str) {
+// Fields of the line currently being reported, picked up by `before_send_log`
+// and attached to the Sentry log record. Set and cleared around each emit on
+// the same thread, so a thread-local is enough.
+thread_local! {
+    static PENDING_FIELDS: RefCell<Vec<Field>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `(peer, reason)` pairs of failed dials already reported this run. A repeat is
+/// kept in the local log file but not sent again.
+static DIAL_SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// The value of a field by key, if present.
+fn field<'a>(fields: &'a [Field], key: &str) -> Option<&'a str> {
+    fields.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str())
+}
+
+/// True the first time this run a dial to a peer fails for a reason; false for a
+/// repeat. Keeps Sentry from filling with the same unreachable address.
+fn first_dial_failure(fields: &[Field]) -> bool {
+    let key = format!(
+        "{}/{}",
+        field(fields, "peer").unwrap_or("?"),
+        field(fields, "reason").unwrap_or("?")
+    );
+    match DIAL_SEEN.get_or_init(|| Mutex::new(HashSet::new())).lock() {
+        Ok(mut seen) => seen.insert(key),
+        Err(_) => true,
+    }
+}
+
+/// Send one log line to Sentry Logs, filed by `classify` (or by an explicit
+/// `event` field), with its structured `fields` as attributes. Does nothing
+/// until `init` has run.
+pub fn log(error: bool, text: &str, fields: &[Field]) {
     let class = classify(text);
     // Keep the node's identity as a tag, so its lines match the relay's log.
     if class.event == "identity" {
@@ -238,7 +297,16 @@ pub fn log(error: bool, text: &str) {
             set_tag("peer_id", id);
         }
     }
-    let (component, event) = (class.component, class.event);
+    // An explicit `event` field (for a line `classify` does not know) wins.
+    let event = field(fields, "event").unwrap_or(class.event);
+    let component = class.component;
+
+    // A repeated failed dial stays in the local file but is not resent.
+    if event == "dial_failed" && !first_dial_failure(fields) {
+        return;
+    }
+
+    PENDING_FIELDS.with(|f| *f.borrow_mut() = fields.to_vec());
     if error && class.routine {
         sentry::logger_warn!(component = component, event = event, "{}", text);
     } else if error {
@@ -246,6 +314,7 @@ pub fn log(error: bool, text: &str) {
     } else {
         sentry::logger_info!(component = component, event = event, "{}", text);
     }
+    PENDING_FIELDS.with(|f| f.borrow_mut().clear());
 }
 
 #[cfg(test)]
@@ -278,6 +347,14 @@ mod tests {
         assert_eq!(filed("[app] JeffyCoin 2.1.1 starting on mainnet (windows)"), ("app", "startup", false));
         assert_eq!(filed("JeffyCoin node: REST on 127.0.0.1:3000"), ("app", "other", false));
         assert_eq!(filed("[new] something"), ("other", "other", false));
+        // 2.2.2 events.
+        assert_eq!(filed("[app] status: height 4, 2 peers, mining no, 0 h/s, 0 pending"), ("app", "status", false));
+        assert_eq!(filed("[app] transfer abcd sent: 1 JEF to ef01"), ("app", "transfer_sent", false));
+        assert_eq!(filed("[app] uninstalling"), ("app", "uninstalled", false));
+        assert_eq!(filed("[p2p] stored new block 5 from a peer"), ("p2p", "block_received", false));
+        assert_eq!(filed("[p2p] synced up to height 10 (3 block(s) in the last batch)"), ("p2p", "sync_done", false));
+        assert_eq!(filed("[chain] reorg: tip moved to height 9, 2 block(s) abandoned"), ("chain", "reorg", false));
+        assert_eq!(filed("[node] pending transfer abcd dropped without confirming (nonce 3)"), ("node", "pending_dropped", false));
     }
 
     #[test]
@@ -293,5 +370,30 @@ mod tests {
         assert_eq!(set_device_name(&dir, "desk; top").unwrap(), "desk top");
         assert_eq!(device_name(&dir), "desk top");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_repeated_failed_dial_is_reported_once() {
+        let line = |peer: &str, reason: &str| {
+            vec![
+                ("event", "dial_failed".to_string()),
+                ("peer", peer.to_string()),
+                ("reason", reason.to_string()),
+            ]
+        };
+        // First time for a (peer, reason) sends; a repeat does not.
+        assert!(first_dial_failure(&line("AAAAAA", "timeout")));
+        assert!(!first_dial_failure(&line("AAAAAA", "timeout")));
+        // A different peer, or a different reason, is sent again.
+        assert!(first_dial_failure(&line("BBBBBB", "timeout")));
+        assert!(first_dial_failure(&line("AAAAAA", "refused")));
+    }
+
+    #[test]
+    fn an_explicit_event_field_overrides_classify() {
+        let fields = [("event", "status".to_string())];
+        assert_eq!(field(&fields, "event"), Some("status"));
+        // classify would call this an unknown line.
+        assert_eq!(classify("[app] node heartbeat").event, "other");
     }
 }

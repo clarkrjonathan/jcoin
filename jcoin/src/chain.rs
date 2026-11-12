@@ -289,7 +289,9 @@ impl Chain {
 
         let height = parent.height + 1;
         let work = parent.work + block_work(&block.header.target);
-        let new_tip = work > self.blocks[&self.tip].work;
+        let old_tip = self.tip;
+        let old_tip_height = self.blocks[&old_tip].height;
+        let new_tip = work > self.blocks[&old_tip].work;
 
         self.blocks.insert(
             hash,
@@ -302,6 +304,20 @@ impl Chain {
         );
         if new_tip {
             self.tip = hash;
+            // A reorg is a tip switch onto a different branch, abandoning the
+            // blocks after the common parent. A plain extension (parent was the
+            // old tip) is not a reorg.
+            if parent_hash != old_tip {
+                let depth = old_tip_height.saturating_sub(height - 1);
+                crate::log_info!(
+                    [
+                        ("event", "reorg".to_string()),
+                        ("height", height.to_string()),
+                        ("depth", depth.to_string()),
+                    ];
+                    "[chain] reorg: tip moved to height {height}, {depth} block(s) abandoned"
+                );
+            }
         }
         Accept::Stored { new_tip, height }
     }

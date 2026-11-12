@@ -47,6 +47,14 @@ impl AppLog {
     }
 
     pub fn push(&self, error: bool, text: &str) {
+        self.push_with(error, text, &[]);
+    }
+
+    /// Like `push`, but with structured `fields` that reach telemetry as log
+    /// attributes. The fields do not change the file or the window; the file
+    /// still gets every line, so dropping a line from Sentry (a repeated dial)
+    /// never loses it locally.
+    pub fn push_with(&self, error: bool, text: &str, fields: &[jcoin::log::Field]) {
         let time = now();
         if let Ok(mut file) = self.file.lock() {
             if let Some(file) = file.as_mut() {
@@ -65,7 +73,7 @@ impl AppLog {
             });
         }
         // Also report the line, filed by component and event.
-        crate::telemetry::log(error, text);
+        crate::telemetry::log(error, text, fields);
     }
 
     /// The most recent lines, oldest first.

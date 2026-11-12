@@ -59,6 +59,11 @@ struct App {
     install: Install,
     /// The "newer rules" banner was hidden for this session.
     rules_banner_hidden: bool,
+    /// The data folder, for saving the device label from the first-run prompt.
+    data_dir: std::path::PathBuf,
+    /// On first run, the name being typed into "name this computer". `None`
+    /// once it has been answered or skipped.
+    first_run_name: Option<String>,
 }
 
 /// Where this copy of the program stands relative to the installed one.
@@ -201,8 +206,13 @@ struct KeysForm {
 
 impl App {
     fn new(settings: Settings) -> App {
-        let device = telemetry::device_name(&settings.data_dir);
+        let data_dir = settings.data_dir.clone();
+        let device = telemetry::device_name(&data_dir);
         let install = Install::detect(settings.regtest);
+        // Ask for a name the first time the app runs with no label set, so nodes
+        // can be told apart by name and not only by peer id.
+        let first_run_name =
+            (device.is_empty() && !data_dir.join(DEVICE_PROMPTED_FILE).exists()).then(String::new);
         App {
             backend: Backend::start(settings),
             adapter: None,
@@ -216,9 +226,21 @@ impl App {
             device_result: None,
             install,
             rules_banner_hidden: false,
+            data_dir,
+            first_run_name,
         }
     }
+
+    /// Remember that the first-run name prompt has been answered or skipped, so
+    /// it is not shown again.
+    fn mark_name_prompted(&mut self) {
+        let _ = std::fs::write(self.data_dir.join(DEVICE_PROMPTED_FILE), "");
+        self.first_run_name = None;
+    }
 }
+
+/// Marker file: the first-run "name this computer" prompt has been shown.
+const DEVICE_PROMPTED_FILE: &str = "device_prompted";
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -228,6 +250,38 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("JeffyCoin");
+
+                // First run: ask what to call this computer.
+                let mut save = false;
+                let mut skip = false;
+                if let Some(name) = &mut self.first_run_name {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.strong("What should this computer be called?");
+                        ui.label(
+                            "A short name so you and your friends can tell nodes apart in the \
+                             connections list. You can change it later in the Developer section.",
+                        );
+                        let entered = ui.text_edit_singleline(name).lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.horizontal(|ui| {
+                            save = ui.button("Save").clicked() || entered;
+                            skip = ui.button("Skip").clicked();
+                        });
+                    });
+                    ui.add_space(8.0);
+                }
+                if save {
+                    if let Some(name) = self.first_run_name.clone() {
+                        if let Ok(saved) = telemetry::set_device_name(&self.data_dir, &name) {
+                            self.device = saved;
+                        }
+                    }
+                    self.mark_name_prompted();
+                }
+                if skip {
+                    self.mark_name_prompted();
+                }
+
                 let backend = match &mut self.backend {
                     Ok(backend) => backend,
                     Err(e) => {
@@ -237,6 +291,7 @@ impl eframe::App for App {
                     }
                 };
                 backend.pump_miner();
+                backend.log_status_if_due();
                 self.updates.check_if_due();
                 newer_rules_banner(
                     ui,
@@ -646,7 +701,7 @@ fn mining_section(ui: &mut egui::Ui, backend: &mut Backend, adapter: &mut Option
     }
 }
 
-fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, backend: &Backend, not_installed: bool) {
+fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, backend: &mut Backend, not_installed: bool) {
     ui.strong("Updates");
     let state = updates.state.lock().unwrap().clone();
     match state {
@@ -677,8 +732,25 @@ fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, backend: &Backend, 
                 "" => format!("{} ({})", r.tag, r.date),
                 relation => format!("{} ({}, {relation})", r.tag, r.date),
             };
+            let chosen = list.get(updates.selected).cloned();
+            let mining = !matches!(
+                backend.mining_state_peek(),
+                MiningState::Idle | MiningState::Failed(_)
+            );
+            let same = chosen.as_ref().is_some_and(|c| c.relation() == "this version");
+            // Why "Install and restart" is off, if it is. Shown inline, not only
+            // on hover, so it is clear why the button is grey.
+            let reason: Option<&str> = if not_installed {
+                Some("install JeffyCoin first (see the top of the window); updates apply to the installed copy.")
+            } else if same {
+                Some("this version is already running.")
+            } else if mining {
+                Some("mining is running.")
+            } else {
+                None
+            };
             ui.horizontal(|ui| {
-                if let Some(chosen) = list.get(updates.selected) {
+                if let Some(chosen) = &chosen {
                     egui::ComboBox::from_id_salt("release")
                         .selected_text(describe(chosen))
                         .width(240.0)
@@ -687,25 +759,22 @@ fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, backend: &Backend, 
                                 ui.selectable_value(&mut updates.selected, i, describe(r));
                             }
                         });
-                    let mining = !matches!(
-                        backend.mining_state_peek(),
-                        MiningState::Idle | MiningState::Failed(_)
+                    let mut button = ui.add_enabled(
+                        reason.is_none(),
+                        egui::Button::new("Install and restart"),
                     );
-                    let same = chosen.relation() == "this version";
-                    if ui
-                        .add_enabled(
-                            !mining && !same && !not_installed,
-                            egui::Button::new("Install and restart"),
-                        )
-                        .on_disabled_hover_text(if not_installed {
-                            "Install JeffyCoin first (see the top of the window). Updates apply to the installed copy."
-                        } else if same {
-                            "This version is already running"
-                        } else {
-                            "Stop mining before updating"
-                        })
-                        .clicked()
+                    if let Some(reason) = reason {
+                        button = button.on_disabled_hover_text(reason);
+                    }
+                    if button.clicked() {
+                        updates.install(chosen.clone());
+                    }
+                    // When mining is the only thing in the way, offer to stop it
+                    // and install in one click.
+                    if mining && !same && !not_installed
+                        && ui.button("Stop mining and install").clicked()
                     {
+                        backend.stop_mining();
                         updates.install(chosen.clone());
                     }
                 }
@@ -713,6 +782,9 @@ fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, backend: &Backend, 
                     updates.check();
                 }
             });
+            if let Some(reason) = reason {
+                ui.small(format!("“Install and restart” is off: {reason}"));
+            }
             if list.is_empty() {
                 ui.label("No release has a download for this system yet.");
             } else {
@@ -789,8 +861,12 @@ fn developer_section(
         if view.connections.is_empty() {
             ui.label("None yet.");
         }
-        egui::Grid::new("dev-connections").num_columns(5).striped(true).show(ui, |ui| {
+        egui::Grid::new("dev-connections").num_columns(6).striped(true).show(ui, |ui| {
             for c in &view.connections {
+                match &c.label {
+                    Some(label) => ui.label(label),
+                    None => ui.weak("—"),
+                };
                 ui.monospace(short(&c.peer)).on_hover_text(&c.peer);
                 ui.label(connection_kind(c)).on_hover_text(&c.address);
                 ui.label(if c.outbound { "outbound" } else { "inbound" });

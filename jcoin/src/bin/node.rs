@@ -84,6 +84,7 @@ async fn main() {
         cpu_miner,
         data_dir: cli.data_dir,
         regtest: cli.regtest,
+        label: None,
     };
     if let Err(e) = run(config).await {
         eprintln!("error: {e}");

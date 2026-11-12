@@ -129,6 +129,29 @@ pub fn fetch_releases() -> Result<Vec<Release>, String> {
 /// file. The caller then calls `restart`. On any error the running file is
 /// left as it was.
 pub fn install(release: &Release) -> Result<(), String> {
+    jcoin::log_info!(
+        [("event", "update_started".to_string()), ("from", CURRENT.to_string()), ("to", release.tag.clone())];
+        "[app] update started: {CURRENT} to {}", release.tag
+    );
+    match install_inner(release) {
+        Ok(()) => {
+            jcoin::log_info!(
+                [("event", "update_installed".to_string()), ("to", release.tag.clone())];
+                "[app] update installed: {}, restarting", release.tag
+            );
+            Ok(())
+        }
+        Err(e) => {
+            jcoin::log_error!(
+                [("event", "update_failed".to_string()), ("to", release.tag.clone()), ("reason", e.clone())];
+                "[app] update to {} failed: {e}", release.tag
+            );
+            Err(e)
+        }
+    }
+}
+
+fn install_inner(release: &Release) -> Result<(), String> {
     let (program, _) = asset_names().ok_or("there are no builds for this system")?;
     let http = client(Duration::from_secs(600))?;
     let get = |url: &str| {
@@ -231,6 +254,32 @@ mod tests {
         assert_eq!(list[1].date, "2026-11-12");
         assert_eq!(list[1].program_url, "https://x/App");
         assert!(releases_from(&json!({ "message": "Not Found" }), "App", "SUMS").is_empty());
+    }
+
+    #[test]
+    fn reading_the_release_list_twice_keeps_a_newer_release_installable() {
+        let asset = |name: &str| json!({ "name": name, "browser_download_url": format!("https://x/{name}") });
+        let reply = json!([
+            { "tag_name": "v2.10.0", "published_at": "2026-12-01T00:00:00Z",
+              "assets": [asset("App"), asset("SUMS")] },
+            { "tag_name": "v2.0.0", "published_at": "2026-11-11T00:00:00Z",
+              "assets": [asset("App"), asset("SUMS")] },
+        ]);
+        // "Check again" re-reads the list; the newest must still be selectable
+        // and marked newer afterwards (the button's grey state keyed off this).
+        let first = releases_from(&reply, "App", "SUMS");
+        let second = releases_from(&reply, "App", "SUMS");
+        assert_eq!(
+            first.iter().map(|r| r.tag.clone()).collect::<Vec<_>>(),
+            second.iter().map(|r| r.tag.clone()).collect::<Vec<_>>(),
+        );
+        let newest = second.first().expect("a release");
+        assert_eq!(newest.tag, "v2.10.0");
+        assert!(newest.is_newer(), "v2.10.0 must read as newer than {CURRENT}");
+        assert_ne!(newest.relation(), "this version", "a newer release is installable");
+        // The default selection (0) stays in range and points at the newer one.
+        let selected = 0usize.min(second.len().saturating_sub(1));
+        assert!(second[selected].is_newer());
     }
 
     #[test]
