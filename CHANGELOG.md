@@ -10,6 +10,25 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.2.6 (2026-11-12)
+
+A patch. No consensus change. The program code is the same as 2.2.5; only
+the Linux build changed.
+
+### Fixed
+
+- The 2.2.4 and 2.2.5 Linux programs did not start on Ubuntu 24.04: they
+  needed glibc 2.43 ("version `GLIBC_2.43' not found"). The release build
+  used GitHub's `ubuntu-latest`, which moved to Ubuntu 26.04. Linux is now
+  built on Ubuntu 24.04, and the build fails if a Linux program needs a
+  glibc newer than 2.39. Windows was not affected.
+
+A Linux install that updated to 2.2.4 or 2.2.5 in the app no longer starts.
+Install 2.2.6 by hand: download `JeffyCoin-linux-x86_64` from the release,
+run it, and install from its window.
+
+Consensus: no.
+
 ## 2.2.5 (2026-11-12)
 
 A patch. No consensus change.

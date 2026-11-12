@@ -25,11 +25,6 @@
 # block and its items.
 
 [[release]]
-id = "linux-build"
-kind = "patch"
-title = "Linux builds start on Ubuntu 24.04 again"
-
-[[release]]
 id = "wallet"
 kind = "patch"
 title = "Wallet and block detail"
@@ -39,25 +34,6 @@ id = "overhaul"
 kind = "minor"
 title = "Graphical overhaul"
 
-
-# --- linux-build -----------------------------------------------------------
-
-[[item]]
-id = "linux-glibc"
-release = "linux-build"
-title = "The 2.2.4 and 2.2.5 Linux programs need glibc 2.43"
-status = "in progress"
-consensus = false
-source = "tools/update-app on the laptop, 2026-11-12"
-problem = '''
-The release workflow built Linux on `ubuntu-latest`, which GitHub moved from
-Ubuntu 24.04 to 26.04 between the 2.2.3 and 2.2.4 builds. The 2.2.4 and
-2.2.5 Linux programs need glibc 2.43 and exit at once on Ubuntu 24.04
-(glibc 2.39): "version `GLIBC_2.43' not found". A Linux install that updates
-in the app to one of them no longer starts. Windows is not affected.'''
-change = '''
-Build Linux on `ubuntu-24.04`, and fail the build if any Linux program needs
-a glibc newer than 2.39.'''
 
 # --- wallet ----------------------------------------------------------------
 
