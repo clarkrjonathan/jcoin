@@ -10,6 +10,45 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.2.4 (2026-11-12)
+
+A patch. No consensus change: it runs on the same chain as 2.2.0 and
+connects and syncs with 2.2.0 to 2.2.3. Decisions in
+`docs/adr/0005-reliability-patch-2-2-4.md`.
+
+### Fixed
+
+- Pending transfers were lost when the app was closed. The node now keeps
+  them in `pending.dat` in the data folder and has them pending again after
+  a restart. Ones that are no longer valid are dropped.
+- A reorg lost the transfers of the blocks it abandoned. They now go back
+  into the queue and confirm in a later block.
+- A transfer that arrived before the one it follows (nonce `n + 1` before
+  `n`) was refused. It is now held for up to 10 minutes and admitted when
+  the gap fills.
+- A node kept every fork block it was sent, each with a copy of all account
+  balances, so its memory could grow without limit.
+- Two nodes could keep up to three direct connections to each other. Extra
+  ones are now closed.
+
+### Changed
+
+- A node follows a reorg at most 288 blocks (about a day) deep. Side
+  branches that fork deeper are dropped, and a block that forks deeper is
+  refused and logged.
+- The sent list keeps the last 100 transfers across restarts (`sent.txt`)
+  and is now called "Sent".
+
+### Checked
+
+- `tools/check --gpu`: the mine-and-send test passed on a private chain.
+  The test program then crashed on exit (known issue O9; tests only).
+- Direct connections: a local relay and two nodes on this computer.
+
+Not tested on Windows.
+
+Consensus: no.
+
 ## 2.2.3 (2026-11-11)
 
 A patch. No consensus change: it runs on the same chain as 2.2.0 and

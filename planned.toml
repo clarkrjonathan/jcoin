@@ -25,11 +25,6 @@
 # block and its items.
 
 [[release]]
-id = "reliability"
-kind = "patch"
-title = "Transfers survive restarts and reorgs; bounded memory"
-
-[[release]]
 id = "wallet"
 kind = "patch"
 title = "Wallet and block detail"
@@ -38,83 +33,6 @@ title = "Wallet and block detail"
 id = "overhaul"
 kind = "minor"
 title = "Graphical overhaul"
-
-# --- reliability -----------------------------------------------------------
-
-[[item]]
-id = "pending-persist"
-release = "reliability"
-title = "Pending transfers survive a restart"
-status = "in progress"
-consensus = false
-source = "found 2026-11-11"
-problem = '''
-Pending transfers are kept in memory only. When the sender's app is closed
-with transfers pending, its node forgets them. They still confirm if another
-node holds them; otherwise they must be sent again. The app's "Sent this
-session" list is also lost, so the sender cannot see which are affected.'''
-change = '''
-Store pending transfers in the data folder and reload them at startup. A
-stored transfer that is no longer valid is dropped. Keep the sent list across
-restarts.'''
-
-[[item]]
-id = "reorg-requeue"
-release = "reliability"
-title = "A reorg puts transfers back in the queue"
-status = "in progress"
-consensus = false
-problem = '''
-On a reorg the mempool is only pruned to the new tip. Transfers confirmed
-only on the dropped branch disappear until the sender sends them again.'''
-change = '''
-Pass the dropped branch's transfers back through normal mempool admission;
-invalid ones fall out there.'''
-
-[[item]]
-id = "out-of-order"
-release = "reliability"
-title = "Hold transfers that arrive out of order"
-status = "in progress"
-consensus = false
-problem = '''
-The mempool accepts nonce n + 1 only after n. A node that receives n + 1
-from one peer before n from another rejects n + 1 and does not keep it.'''
-change = '''
-Hold out-of-order transfers in a per-sender buffer (up to 16, for up to 10
-minutes) and admit them when the gap fills.'''
-
-[[item]]
-id = "fork-pruning"
-release = "reliability"
-title = "Bound the memory used by forks"
-status = "in progress"
-consensus = false
-source = "docs/adr/0005-reliability-patch-2-2-4.md"
-problem = '''
-The chain keeps every valid block it accepts, each with a full State copy. A
-peer can send valid losing fork blocks without end and grow a node's memory
-without limit.'''
-change = '''
-Drop side branches that fork more than 288 blocks (about a day) below the
-tip. A node then refuses a reorg deeper than 288 blocks and logs it.'''
-
-[[item]]
-id = "direct-dupes"
-release = "reliability"
-title = "One direct connection per pair of nodes"
-status = "in progress"
-consensus = false
-issue = "O5"
-source = "tools/local-net up 2 relay"
-problem = '''
-Both nodes dial each other's direct address, and a hole punch can add one
-more, so a pair can keep up to three direct connections. Only one carries the
-session; the others stay open.'''
-change = '''
-The smaller peer id keeps the direct connection it dialed (else the oldest)
-and closes the others. If the closed one carried the session, the host opens
-it again on the kept one.'''
 
 # --- wallet ----------------------------------------------------------------
 
