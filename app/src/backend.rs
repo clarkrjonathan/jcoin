@@ -36,6 +36,41 @@ pub const MIN_GPU_LIMIT: u32 = 10;
 /// File in the data folder that records which key is in use.
 const ACTIVE_KEY_FILE: &str = "active_key";
 
+/// File in the data folder that lists transfers sent from this app, one per
+/// line: sender, id, recipient, amount, nonce.
+const SENT_FILE: &str = "sent.txt";
+
+/// Most sent transfers kept in `SENT_FILE` (the newest).
+const MAX_SENT: usize = 100;
+
+/// The sent list stored in `dir`; empty if there is none. Bad lines are skipped.
+fn load_sent(dir: &Path) -> Vec<SentTx> {
+    let text = std::fs::read_to_string(dir.join(SENT_FILE)).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let [sender, id, recipient, amount, nonce] = f[..] else {
+                return None;
+            };
+            Some(SentTx {
+                sender: sender.to_string(),
+                id: id.to_string(),
+                recipient: recipient.to_string(),
+                amount: amount.parse().ok()?,
+                nonce: nonce.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+fn save_sent(dir: &Path, sent: &[SentTx]) -> std::io::Result<()> {
+    let text: String = sent
+        .iter()
+        .map(|t| format!("{} {} {} {} {}\n", t.sender, t.id, t.recipient, t.amount, t.nonce))
+        .collect();
+    std::fs::write(dir.join(SENT_FILE), text)
+}
+
 /// Where and how this instance runs. Environment variables override the
 /// defaults, for testing: `JCOIN_APP_DATA` (data folder), `JCOIN_APP_RELAY` (a
 /// relay multiaddr, or `none`), `JCOIN_APP_PEER` (a peer to dial), and
@@ -344,6 +379,7 @@ impl Backend {
             });
         }
 
+        let sent = load_sent(&settings.data_dir);
         let mut backend = Backend {
             settings,
             address,
@@ -360,7 +396,7 @@ impl Backend {
             mining: None,
             mining_error: None,
             gpus,
-            sent: Vec::new(),
+            sent,
             // Emit the first status line about a minute after start.
             last_status: std::time::Instant::now(),
         };
@@ -521,6 +557,11 @@ impl Backend {
             amount,
             nonce,
         });
+        let excess = self.sent.len().saturating_sub(MAX_SENT);
+        self.sent.drain(..excess);
+        if let Err(e) = save_sent(&self.settings.data_dir, &self.sent) {
+            self.log.push(true, &format!("[app] could not save the sent list: {e}"));
+        }
         Ok(id)
     }
 
@@ -947,6 +988,27 @@ mod tests {
 
     /// Keys can be created, imported, and switched, and the choice survives a
     /// restart. Needs no GPU.
+    #[test]
+    fn the_sent_list_is_saved_and_read_back() {
+        let dir = std::env::temp_dir().join(format!("jcoin-app-sent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(load_sent(&dir).is_empty());
+        let tx = SentTx {
+            sender: "aa".into(),
+            id: "bb".into(),
+            recipient: "cc".into(),
+            amount: 5,
+            nonce: 2,
+        };
+        save_sent(&dir, &[tx]).unwrap();
+        std::fs::write(dir.join(SENT_FILE), std::fs::read_to_string(dir.join(SENT_FILE)).unwrap() + "garbage\n").unwrap();
+        let back = load_sent(&dir);
+        assert_eq!(back.len(), 1);
+        assert_eq!((back[0].id.as_str(), back[0].amount, back[0].nonce), ("bb", 5, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn keys_are_created_switched_and_remembered() {
         let dir = std::env::temp_dir().join(format!("jcoin-app-keys-{}", std::process::id()));

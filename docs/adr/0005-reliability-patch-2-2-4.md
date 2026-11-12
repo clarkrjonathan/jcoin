@@ -39,5 +39,9 @@ mempool admission; invalid ones fall out there.
 **Out-of-order transfers**: each sender may have up to 16 held, each for up
 to 10 minutes. They are admitted when the nonce gap fills.
 
-**Direct connections**: the host tracks which connection carries the session.
-Once one does, the other direct connections to that peer are closed.
+**Direct connections**: of a peer's direct connections, the one the smaller
+peer id dialed is kept (the oldest, if several); without one, the oldest.
+Only the smaller peer id closes the others, so the two sides never close
+different ones. The host cannot tell which connection carries the session
+(libp2p-stream gives no connection id); if the closed one did, the session
+ends and the host opens it again on the kept connection.

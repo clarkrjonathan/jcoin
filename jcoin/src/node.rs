@@ -148,6 +148,7 @@ pub async fn run_node(
 
     // Replay persisted blocks (if any) and open the log for appending.
     let mut log: Option<BlockLog> = None;
+    let pending_path = data_dir.as_ref().map(|dir| dir.join(PENDING_FILE));
     if let Some(dir) = data_dir {
         let path = dir.join("blocks.dat");
         match load_and_repair(&path) {
@@ -164,7 +165,7 @@ pub async fn run_node(
                 for block in loaded.blocks {
                     match chain.accept(block) {
                         Accept::Stored { .. } | Accept::AlreadyHave { .. } => {}
-                        Accept::Orphan => rejected += 1,
+                        Accept::Orphan | Accept::TooDeep { .. } => rejected += 1,
                         Accept::Invalid(e) => {
                             rejected += 1;
                             if rejected == 1 {
@@ -210,8 +211,19 @@ pub async fn run_node(
             Err(e) => crate::log_error!("[store] failed to open {} for append: {e}", path.display()),
         }
     }
+    if let Some(path) = pending_path.as_ref() {
+        let restored = load_pending(path, &mut mempool, chain.tip_state());
+        if restored > 0 {
+            crate::log_info!("[store] {restored} pending transfer(s) restored from {}", path.display());
+        }
+    }
+    // What `pending.dat` holds, so it is rewritten only when that changes.
+    let pending_ids = |m: &Mempool| m.pending().iter().map(|tx| tx.tx_id()).collect::<Vec<_>>();
+    let mut saved_pending = pending_ids(&mempool);
 
     while let Some(request) = rx.recv().await {
+        let request_changes_pending =
+            matches!(request, NodeRequest::SubmitTransaction { .. } | NodeRequest::SubmitBlock { .. });
         match request {
             NodeRequest::SubmitTransaction { tx, reply } => {
                 let id = tx.tx_id();
@@ -301,14 +313,23 @@ pub async fn run_node(
                 // Clone for the log only when persisting.
                 let for_log = log.as_ref().map(|_| (*block).clone());
                 let outcome = match chain.accept(*block) {
-                    Accept::Stored { new_tip, height } => {
+                    Accept::Stored { new_tip, height, abandoned } => {
                         if let (Some(log), Some(block)) = (log.as_mut(), for_log.as_ref()) {
                             if let Err(e) = log.append(block) {
                                 crate::log_error!("[store] append failed: {e}");
                             }
                         }
-                        // Drop transactions no longer applicable on the new tip.
+                        // Drop transactions no longer applicable on the new tip,
+                        // then take back those of blocks a reorg abandoned
+                        // (admission drops any the new branch already holds).
                         mempool.prune(chain.tip_state());
+                        let requeued = abandoned
+                            .into_iter()
+                            .filter(|tx| mempool.insert(tx.clone(), chain.tip_state()).is_ok())
+                            .count();
+                        if requeued > 0 {
+                            crate::log_info!("[chain] reorg: {requeued} transfer(s) back in the queue");
+                        }
                         BlockOutcome::Accepted {
                             is_new: true,
                             new_tip,
@@ -323,6 +344,12 @@ pub async fn run_node(
                     Accept::Orphan => BlockOutcome::Orphan,
                     Accept::Invalid(e) => BlockOutcome::Rejected {
                         reason: e.to_string(),
+                    },
+                    Accept::TooDeep { parent_height } => BlockOutcome::Rejected {
+                        reason: format!(
+                            "forks at height {parent_height}, deeper than {} blocks",
+                            crate::chain::MAX_REORG_DEPTH
+                        ),
                     },
                 };
                 let _ = reply.send(outcome);
@@ -378,7 +405,44 @@ pub async fn run_node(
                 let _ = reply.send(chain.blocks_after(&locator, BLOCK_BATCH));
             }
         }
+        if request_changes_pending {
+            if let Some(path) = pending_path.as_ref() {
+                let now = pending_ids(&mempool);
+                if now != saved_pending {
+                    if let Err(e) = save_pending(path, &mempool.pending()) {
+                        crate::log_error!("[store] failed to write {}: {e}", path.display());
+                    }
+                    saved_pending = now;
+                }
+            }
+        }
     }
+}
+
+/// The file in the data folder that holds pending transfers across restarts.
+pub const PENDING_FILE: &str = "pending.dat";
+
+/// Write `pending` as concatenated transfers, through a temporary file so a
+/// crash leaves the old file or the new one, never half of one.
+fn save_pending(path: &std::path::Path, pending: &[Transaction]) -> std::io::Result<()> {
+    let bytes: Vec<u8> = pending.iter().flat_map(|tx| tx.serialize_to_bytes()).collect();
+    let tmp = path.with_extension("dat.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Admit the transfers stored at `path` (in order), skipping any that are
+/// no longer valid. Returns how many were admitted.
+fn load_pending(path: &std::path::Path, mempool: &mut Mempool, state: &State) -> usize {
+    let Ok(bytes) = std::fs::read(path) else {
+        return 0;
+    };
+    bytes
+        .chunks_exact(Transaction::SERIALIZED_LEN)
+        .filter_map(Transaction::from_bytes)
+        .filter(|tx| validate_pending(tx).is_ok())
+        .filter(|tx| mempool.insert(tx.clone(), state) == Ok(Admitted::New))
+        .count()
 }
 
 /// Stateless checks on a loose transaction: a known normal type and a valid
@@ -687,6 +751,40 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[tokio::test]
+    async fn pending_transfers_survive_a_restart() {
+        let dir = temp_dir("pending");
+        let key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let sender = crate::wallet::address_of(&key);
+
+        // First run: fund the sender, queue two transfers, shut down.
+        let (core, rx) = mpsc::channel(16);
+        let run1 = tokio::spawn(run_node(rx, Some(dir.clone()), REGTEST));
+        let j = get_job(&core).await;
+        let funding =
+            build_and_mine(&j.parent, &j.parent_state, j.context.reward, sender, None, j.context.target, 1)
+                .unwrap()
+                .0;
+        assert!(matches!(submit_block(&core, funding).await, BlockOutcome::Accepted { .. }));
+        for nonce in 0..2 {
+            let tx = crate::wallet::sign_transfer(&key, [2u8; 32], 10, 1, nonce);
+            assert!(matches!(submit_tx(&core, tx).await, SubmitResult::Accepted { is_new: true, .. }));
+        }
+        drop(core);
+        run1.await.unwrap();
+
+        // Second run: both are pending again.
+        let (core, rx) = mpsc::channel(16);
+        let run2 = tokio::spawn(run_node(rx, Some(dir.clone()), REGTEST));
+        let info = account(&core, sender).await;
+        assert_eq!((info.next_nonce, info.pending_debit), (2, 22));
+        drop(core);
+        run2.await.unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // A block with a newer version and real proof of work is refused as
     // usual, and is counted as evidence that newer rules are in use.
     #[tokio::test]

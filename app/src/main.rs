@@ -1052,7 +1052,7 @@ fn send_section(
     let sent: Vec<_> = backend.sent.iter().filter(|tx| tx.sender == backend.address).collect();
     if !sent.is_empty() {
         ui.add_space(6.0);
-        ui.label("Sent this session");
+        ui.label("Sent");
         // A transfer is in the chain once the confirmed nonce has passed its own.
         let confirmed_nonce = backend.view().nonce;
         egui::Grid::new("sent").num_columns(3).show(ui, |ui| {

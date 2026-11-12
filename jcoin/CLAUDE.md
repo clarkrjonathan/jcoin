@@ -10,10 +10,10 @@ or `tools/check jcoin` from the repository root.
 | `src/lib.rs` | `Transaction` (153 bytes, Ed25519), ids, signing bytes |
 | `src/consensus.rs` | `Params` (`MAINNET`, `REGTEST`), `LATEST_VERSION`, `consensus_version`, `BlockContext` (`target_at`), `eased_target` (stall fallback) |
 | `src/block.rs` | Header (156 bytes), `Block`, `validate_and_apply` (the whole deterministic rule set), `assemble_block`, `build_and_mine`, `mine_chunk`, `MAX_FUTURE_DRIFT`, `MAX_TXS` |
-| `src/chain.rs` | Block store, fork choice by cumulative work, `lwma_next_target` (difficulty rule), `context_for_child`, `work_since`; the chain simulations are in its tests |
+| `src/chain.rs` | Block store, fork choice by cumulative work, `MAX_REORG_DEPTH` and `prune` (bounded forks), `lwma_next_target` (difficulty rule), `context_for_child`, `work_since`; the chain simulations are in its tests |
 | `src/state.rs` | Account balances and nonces, `state_root` |
-| `src/mempool.rs` | Pending transfers by sender and nonce, `pending`, `best_applicable`, `prune` |
-| `src/node.rs` | Node core: `NodeRequest`, `run_node` (owns chain, mempool, signals; replays `blocks.dat`) |
+| `src/mempool.rs` | Pending transfers by sender and nonce, the out-of-order hold, `pending`, `best_applicable`, `prune` |
+| `src/node.rs` | Node core: `NodeRequest`, `run_node` (owns chain, mempool, signals; replays `blocks.dat`, keeps `pending.dat`; re-queues transfers after a reorg) |
 | `src/signal.rs` | Counts refused blocks with a newer version and real work (`Signals`, `Level`) |
 | `src/service.rs` | The node as an embeddable service: `ServiceConfig`, `run`, REST handlers, built-in CPU miner |
 | `src/wallet.rs` | Key files, `sign_transfer` |
