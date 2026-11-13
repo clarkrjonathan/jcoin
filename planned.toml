@@ -30,11 +30,6 @@ kind = "patch"
 title = "Wallet and block detail"
 
 [[release]]
-id = "api"
-kind = "minor"
-title = "A local API on the desktop app"
-
-[[release]]
 id = "overhaul"
 kind = "minor"
 title = "Graphical overhaul"
@@ -93,30 +88,6 @@ open = [
 ]
 
 # --- backlog ---------------------------------------------------------------
-
-[[item]]
-id = "app-api"
-release = "api"
-title = "A local API on the desktop app for diagnostics and management"
-status = "in progress"
-consensus = false
-source = "Jonathan, 2026-11-12"
-problem = '''
-Scripts such as `tools/node-status` go around the app to the embedded node's
-REST server, and find its port by reading the app's log. They see only what
-the node knows. What the app knows (keys in use, mining state, GPU and its
-limit, the sent list, install and update state, the log) is visible only in
-the window or in Sentry. Managing the app (start or stop mining, set the GPU
-limit, check for or install an update, restart) needs clicks.'''
-change = '''
-The app serves an HTTP API on 127.0.0.1 with everything the window shows and
-does: status, keys (create, import, select, read the secret), sending and the
-sent list, mining and the GPU limit and kernel, updates, install state,
-diagnostics and the log, and the node's chain, blocks and peers passed
-through. Every request needs `Authorization: Bearer <token>`; the port and a
-random token are written to files in the data folder at start. An OpenAPI
-document and a Swagger page describe it. The node's own REST server stays as
-it is. `tools/node-status` moves to the API.'''
 
 [[item]]
 id = "gpu-kernel-default"

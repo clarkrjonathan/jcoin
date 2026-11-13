@@ -10,6 +10,37 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.4.0 (2026-11-13)
+
+A minor release for a new interface. No consensus change: 2.4.0 and 2.3.x
+nodes share one chain.
+
+### Added
+
+- A local API on the desktop app. The app serves HTTP on 127.0.0.1 (port
+  3100 or another free one) with everything the window shows and does:
+  status, keys (create, import, select, read the secret), sending and the
+  sent list, mining (start, stop, GPU, use limit, kernel, blocks mined),
+  GPUs, updates and install, the computer's label, diagnostics, the log,
+  restart, and the node's chain, blocks, peers, balances and transactions
+  passed through. Every request needs `Authorization: Bearer <token>`; the
+  port and the token are in `api_port` and `api_token` in the data folder.
+  `/docs` is a Swagger page and `/openapi.json` the OpenAPI 3.1 document.
+  The node's own REST server is unchanged. See `app/README.md`, "Local API".
+- `tools/app-api` calls the API from this repository. `tools/node-status`
+  reads the app through it (and shows mining); `tools/gpu-bench
+  --pause-app` stops the app's mining for a benchmark and starts it again;
+  `tools/update-app` starts mining again on the same GPU after an update.
+  Each falls back to the app's log for an app before 2.4.0.
+- `tools/imac-deploy` puts a release's node program on the iMac, restarts
+  its mining, and rolls back if it does not start.
+
+Not tested on Windows. The API was tested on Linux through a test that
+drives every endpoint that does not end the process, and by the scripts
+above against the running app.
+
+Consensus: no.
+
 ## 2.3.2 (2026-11-13)
 
 A patch. No consensus change.
