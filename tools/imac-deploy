@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Put a release's node program on the iMac miner and restart its mining.
+
+  tools/imac-deploy [VERSION] [--host ADDR]          say what it would do
+  tools/imac-deploy [VERSION] [--host ADDR] --yes    do it
+
+VERSION defaults to the latest GitHub release. The iMac is found at ADDR, at
+the address that worked last time, at jcoin-miner.local, or else by asking
+every host on this computer's home subnets that answers ssh for its name
+(jcoin-miner). The address it finds is saved for next time.
+
+With --yes: downloads jcoin-node-linux-x86_64 and its checksum list, checks
+the checksum and the iMac's glibc, copies the program over and checks it
+again there, keeps the old one as /usr/local/bin/jcoin-node.prev, replaces
+/usr/local/bin/jcoin-node, and restarts the jcoin-node unit. It always
+restarts, even when the iMac already has this version. It then waits 15 s and
+checks that the unit runs, that its command line has --mine, and that it uses
+the CPU. If the unit does not start, the old program is put back and the
+unit's last log lines are printed. Exits non-zero on any failure.
+"""
+import concurrent.futures, ipaddress, os, re, socket, subprocess, sys, tempfile, time
+
+USER = "miner"
+HOSTNAME = "jcoin-miner"
+UNIT = "jcoin-node"
+BIN = "/usr/local/bin/jcoin-node"
+ASSET = "jcoin-node-linux-x86_64"
+SUMS = "SHA256SUMS-linux-x86_64.txt"
+CACHE = os.path.expanduser("~/.cache/jcoin/imac-host")
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
+            "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR"]
+
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, check=True, input=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, input=input)
+    if check and r.returncode != 0:
+        fail(f"failed: {' '.join(cmd[:3])} ...: {(r.stderr or r.stdout).strip()[-400:]}")
+    return r
+
+
+def ssh(host, script, check=True):
+    return run(["ssh", *SSH_OPTS, f"{USER}@{host}", "bash -s"], check=check, input=script)
+
+
+def is_imac(host):
+    r = run(["ssh", *SSH_OPTS, f"{USER}@{host}", "hostname"], check=False)
+    return r.returncode == 0 and r.stdout.strip() == HOSTNAME
+
+
+def home_subnets():
+    out = run(["ip", "-4", "-o", "addr", "show", "scope", "global"]).stdout
+    nets, own = [], set()
+    for line in out.splitlines():
+        f = line.split()
+        dev, cidr = f[1], f[3]
+        if dev.startswith(("docker", "virbr", "br-", "veth", "tailscale", "wg")):
+            continue
+        iface = ipaddress.ip_interface(cidr)
+        own.add(str(iface.ip))
+        if iface.network.prefixlen >= 24:
+            nets.append(iface.network)
+    return nets, own
+
+
+def ssh_open(ip):
+    try:
+        with socket.create_connection((ip, 22), timeout=0.7):
+            return ip
+    except OSError:
+        return None
+
+
+def find_imac(given):
+    tried = []
+    candidates = [given] if given else []
+    if not given and os.path.exists(CACHE):
+        candidates.append(open(CACHE).read().strip())
+    if not given:
+        candidates.append(f"{HOSTNAME}.local")
+    for c in candidates:
+        if c and c not in tried:
+            tried.append(c)
+            if is_imac(c):
+                return c
+    if given:
+        fail(f"{given} does not answer ssh as {USER}@{HOSTNAME}")
+    nets, own = home_subnets()
+    ips = [str(ip) for n in nets for ip in n.hosts() if str(ip) not in own]
+    with concurrent.futures.ThreadPoolExecutor(64) as pool:
+        open_hosts = [ip for ip in pool.map(ssh_open, ips) if ip]
+    for ip in open_hosts:
+        if is_imac(ip):
+            return ip
+    where = ", ".join(map(str, nets)) or "no home subnet"
+    fail(f"iMac not found: tried {', '.join(tried)}; on {where} {len(open_hosts)} "
+         f"other host(s) answer ssh, none as {HOSTNAME}. Is it on and on the network?")
+
+
+def remote_state(host):
+    r = ssh(host, f"""
+        echo "glibc $(ldd --version | sed -n '1s/.* \\([0-9]\\+\\.[0-9]\\+\\)$/\\1/p')"
+        echo "active $(systemctl is-active {UNIT})"
+        echo "sum $(sha256sum {BIN} 2>/dev/null | cut -d' ' -f1)"
+        echo "version $(cat /usr/local/share/jcoin-node.version 2>/dev/null)"
+        echo "mine $(systemctl show -p ExecStart --value {UNIT} | grep -c -- '--mine')"
+    """)
+    state = {}
+    for line in r.stdout.splitlines():
+        k, _, v = line.partition(" ")
+        state[k] = v.strip()
+    return state
+
+
+def vkey(v):
+    return tuple(int(x) for x in v.split("."))
+
+
+def main():
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(__doc__.strip())
+        return
+    yes = "--yes" in args
+    host = None
+    if "--host" in args:
+        i = args.index("--host")
+        if i + 1 >= len(args):
+            fail("--host needs an address")
+        host = args[i + 1]
+        del args[i:i + 2]
+    rest = [a for a in args if a != "--yes"]
+    if len(rest) > 1 or any(a.startswith("-") for a in rest):
+        fail("usage: tools/imac-deploy [VERSION] [--host ADDR] [--yes]")
+    os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    version = rest[0].lstrip("v") if rest else run(
+        ["gh", "release", "view", "--json", "tagName", "--jq", ".tagName"]).stdout.strip().lstrip("v")
+
+    host = find_imac(host)
+    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+    with open(CACHE, "w") as f:
+        f.write(host + "\n")
+    before = remote_state(host)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run(["gh", "release", "download", f"v{version}", "-D", tmp, "-p", ASSET, "-p", SUMS])
+        expected = next((l.split()[0] for l in open(os.path.join(tmp, SUMS))
+                         if l.split()[-1].lstrip("*") == ASSET), "")
+        program = os.path.join(tmp, ASSET)
+        actual = run(["sha256sum", program]).stdout.split()[0]
+        if not expected or expected != actual:
+            fail(f"checksum mismatch (expected '{expected or 'none'}', got {actual}); nothing changed")
+        syms = run(["objdump", "-T", program]).stdout
+        need = max(re.findall(r"GLIBC_([0-9]+(?:\.[0-9]+)*)", syms), key=vkey, default="0")
+        current = "yes" if before.get("sum") == expected else "no"
+        print(f"iMac at {host}: unit {before.get('active')}; installed "
+              f"{before.get('version') or 'unknown version'} (this release: {current}); "
+              f"release {version}; unit mines: {'yes' if before.get('mine', '0') != '0' else 'NO'}")
+        if vkey(need) > vkey(before.get("glibc") or "0"):
+            fail(f"{version} needs glibc {need}; the iMac has {before.get('glibc')}; nothing changed")
+        if not yes:
+            print("dry run: add --yes to install and restart")
+            return
+
+        run(["scp", *SSH_OPTS, "-q", program, f"{USER}@{host}:/tmp/jcoin-node.new"])
+    r = ssh(host, f"""
+        set -e
+        echo "{expected}  /tmp/jcoin-node.new" | sha256sum -c --quiet
+        if [ -e {BIN} ]; then sudo -n cp -p {BIN} {BIN}.prev; fi
+        sudo -n install -m 755 /tmp/jcoin-node.new {BIN}.new
+        sudo -n mv -f {BIN}.new {BIN}
+        rm -f /tmp/jcoin-node.new
+        echo {version} | sudo -n tee /usr/local/share/jcoin-node.version >/dev/null
+        sudo -n systemctl restart {UNIT}
+    """, check=False)
+    if r.returncode != 0:
+        fail(f"install on the iMac failed: {(r.stderr or r.stdout).strip()[-400:]}")
+
+    time.sleep(15)
+    r = ssh(host, f"""
+        pid=$(systemctl show -p MainPID --value {UNIT})
+        echo "active $(systemctl is-active {UNIT})"
+        echo "restarts $(systemctl show -p NRestarts --value {UNIT})"
+        if [ "$pid" != 0 ]; then
+          echo "mine $(tr '\\0' ' ' < /proc/$pid/cmdline | grep -c -- '--mine')"
+          echo "cpu $(ps -o %cpu= -p $pid | tr -d ' ')"
+        fi
+    """, check=False)
+    after = dict(l.partition(" ")[::2] for l in r.stdout.splitlines())
+    if after.get("active") != "active" or after.get("restarts", "0") not in ("0", ""):
+        ssh(host, f"""
+            if [ -e {BIN}.prev ]; then sudo -n mv -f {BIN}.prev {BIN}; fi
+            echo {before.get('version') or 'unknown'} | sudo -n tee /usr/local/share/jcoin-node.version >/dev/null
+            sudo -n systemctl restart {UNIT}
+        """, check=False)
+        log = ssh(host, f"journalctl -u {UNIT} -n 8 -o cat --no-pager", check=False).stdout.strip()
+        fail(f"{version} did not stay running; the old program is back.\nlast log lines:\n{log}")
+    cpu = float(after.get("cpu") or 0)
+    if after.get("mine", "0") == "0":
+        fail(f"{version} installed and running, but the unit has no --mine: not mining")
+    if cpu < 20:
+        fail(f"{version} installed and running with --mine, but CPU is only {cpu:.0f}%: check the log")
+    print(f"{version} installed and running; mining (CPU {cpu:.0f}%)")
+
+
+if __name__ == "__main__":
+    main()

@@ -244,6 +244,59 @@ fn hide_console(_command: &mut Command) {
     }
 }
 
+/// Where this copy of the program stands relative to the installed one.
+#[derive(Debug, Clone)]
+pub struct Placement {
+    /// The install locations, if this system supports installing.
+    pub layout: Option<Layout>,
+    /// This program file.
+    pub exe: PathBuf,
+    /// This program file is the installed copy.
+    pub installed_copy: bool,
+    /// Offer to install. Off for the installed copy and for test settings.
+    pub offer: bool,
+}
+
+impl Placement {
+    pub fn detect(regtest: bool) -> Placement {
+        let layout = Layout::for_user();
+        let exe = std::env::current_exe().unwrap_or_default();
+        let installed_copy = layout.as_ref().is_some_and(|l| l.is_installed_copy(&exe));
+        if let (true, Some(layout)) = (installed_copy, &layout) {
+            // Keep the record right after an in-app update.
+            layout.record_version(crate::update::CURRENT);
+        }
+        let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+        let test_settings = regtest || set("JCOIN_APP_DATA") || set("JCOIN_APP_NO_INSTALL");
+        Placement {
+            offer: layout.is_some() && !installed_copy && !test_settings,
+            layout,
+            exe,
+            installed_copy,
+        }
+    }
+
+    /// Install this copy (replacing an installed one) and switch to it. Only
+    /// returns on failure.
+    pub fn install_and_switch(&self) -> Result<(), String> {
+        let layout = self.layout.as_ref().ok_or("this system does not support installing")?;
+        layout.install(&self.exe, crate::update::CURRENT)?;
+        hand_over_to(&layout.program)
+    }
+
+    /// Remove the installed app (the data folder stays) and end this process.
+    /// Only for the installed copy; only returns on failure.
+    pub fn uninstall_and_exit(&self) -> Result<(), String> {
+        let layout = self.layout.as_ref().ok_or("this system does not support installing")?;
+        if !self.installed_copy {
+            return Err("this is not the installed copy".to_string());
+        }
+        layout.uninstall(&self.exe)?;
+        crate::telemetry::flush();
+        std::process::exit(0);
+    }
+}
+
 /// Start the program at `path` and end this process.
 pub fn hand_over_to(path: &Path) -> Result<(), String> {
     Command::new(path)

@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Call the desktop app's local API and print the reply compactly.
+
+  tools/app-api [OPTIONS] [METHOD] PATH [JSON]
+  tools/app-api --paths          every endpoint, one line each
+  tools/app-api --docs           the Swagger page's address and the token
+
+METHOD is GET (default), POST, or PUT. PATH may leave out /api, for example
+`status`, `mining`, `node/peers`. JSON is the request body; POST and PUT
+without one send {}. Examples:
+
+  tools/app-api status
+  tools/app-api POST mining/start '{"adapter": 0}'
+  tools/app-api PUT mining/gpu-limit '{"percent": 50}'
+  tools/app-api POST send '{"recipient": "<64 hex>", "amount": "1.5"}'
+  tools/app-api log?lines=20
+
+OPTIONS: --data DIR (the app's data folder; default $JCOIN_APP_DATA or the
+real one), --regtest (the default test-network folder), --raw (the reply as
+JSON, unchanged), --field A.B (only that value of the reply, for shell
+scripts: `tools/app-api --field state mining` prints `running`). A dict prints
+one line per field, a list one line per item. Exits 1 if the app does not
+answer, replies with an error, or has no such field.
+"""
+import json, os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import jcoin_api  # noqa: E402
+
+
+def compact(value):
+    return value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))
+
+
+def show(body):
+    if isinstance(body, dict):
+        for k, v in body.items():
+            print(f"{k}: {compact(v)}")
+    elif isinstance(body, list):
+        for item in body:
+            print(compact(item))
+        if not body:
+            print("(empty list)")
+    else:
+        print(body.rstrip())
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or "-h" in argv or "--help" in argv:
+        print(__doc__.strip())
+        return
+    data = None
+    if "--data" in argv:
+        i = argv.index("--data")
+        data = argv[i + 1]
+        del argv[i:i + 2]
+    field = None
+    if "--field" in argv:
+        i = argv.index("--field")
+        field = argv[i + 1]
+        del argv[i:i + 2]
+    regtest = "--regtest" in argv
+    raw = "--raw" in argv
+    argv = [a for a in argv if a not in ("--regtest", "--raw")]
+    api = jcoin_api.find(data, regtest)
+    if api is None:
+        sys.exit(f"no api_port/api_token in {jcoin_api.data_dir(data, regtest)}: is the app (2.4.0 or later) running?")
+
+    if argv == ["--docs"]:
+        print(f"{api.base}/docs   token: {api.token}")
+        return
+    try:
+        if argv == ["--paths"]:
+            _, doc = api.call("GET", "/openapi.json")
+            for path, ops in doc["paths"].items():
+                for method, op in ops.items():
+                    summary = (op.get("summary") or op.get("description") or "").split("\n")[0]
+                    print(f"{method.upper():<5} {path:<34} {summary}")
+            return
+        method = "GET"
+        if argv and argv[0].upper() in ("GET", "POST", "PUT"):
+            method = argv.pop(0).upper()
+        if not argv:
+            sys.exit("give a PATH; see --help")
+        path = argv.pop(0)
+        body = json.loads(argv[0]) if argv else ({} if method != "GET" else None)
+        status, reply = api.call(method, path, body)
+    except OSError as e:
+        sys.exit(f"the app does not answer at {api.base}: {e}")
+    except json.JSONDecodeError as e:
+        sys.exit(f"the JSON body is not valid: {e}")
+    if status >= 400:
+        error = reply.get("error") if isinstance(reply, dict) else reply
+        sys.exit(f"HTTP {status}: {error}")
+    if field:
+        for part in field.split("."):
+            if not isinstance(reply, dict) or part not in reply:
+                sys.exit(f"no field {field!r} in the reply")
+            reply = reply[part]
+        print(compact(reply))
+    elif raw:
+        print(json.dumps(reply) if not isinstance(reply, str) else reply)
+    else:
+        show(reply)
+
+
+if __name__ == "__main__":
+    main()

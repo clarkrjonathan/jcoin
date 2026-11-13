@@ -10,8 +10,9 @@ end-to-end test (mine, send, confirm on a private regtest chain).
 | --- | --- |
 | `src/main.rs` | The window: one function per section (`network_section`, `wallet_section`, `keys_section`, `mining_section`, `send_section`, `updates_section`, `developer_section`), the banners (`newer_rules_banner`, `install_banner`), `Updates`, `Install` |
 | `src/backend.rs` | Everything behind the window: `Settings` (environment overrides), `Backend` (keys, sending, mining, GPU limit, diagnostics), the node thread, the poller that reads the node's REST endpoints into `NodeView` |
-| `src/install.rs` | Per-user install: `Layout`, menu entry, uninstall |
-| `src/update.rs` | Release list, checksum check, replacing the program file |
+| `src/api.rs` | The local API (axum on 127.0.0.1): `start`, the port and token files, one handler per endpoint with its OpenAPI annotation, `ApiDoc`; its test drives every endpoint that does not end the process |
+| `src/install.rs` | Per-user install: `Layout`, `Placement` (this copy relative to the installed one), menu entry, uninstall |
+| `src/update.rs` | Release list, checksum check, replacing the program file, `Updates` (the check and install the window and the API share) |
 | `src/telemetry.rs` | Sentry setup, tags, `classify` (log line to `component` and `event`) |
 | `src/applog.rs` | The log file and the in-memory tail |
 
@@ -22,8 +23,14 @@ end-to-end test (mine, send, confirm on a private regtest chain).
 - The app talks to its own embedded node over local REST, like the
   command-line tools. To show something new, add it to the node's REST reply,
   read it in the poller (`spawn_poller`), put it in `NodeView`, draw it.
-- Behaviour is tested through `Backend` (`backend.rs` tests), not through the
-  window. Layout is checked with `tools/app-shot`.
+- The window and the local API share the `Backend` behind one mutex. The
+  window holds it for a frame; API handlers take it on a blocking thread.
+  Anything the window can do should also be an API endpoint: add the
+  handler, its `#[utoipa::path]`, its route in `router`, and its name in
+  `ApiDoc`'s `paths`. The test checks every documented GET answers.
+- Behaviour is tested through `Backend` (`backend.rs` tests) and the API
+  (`api.rs` test), not through the window. Layout is checked with
+  `tools/app-shot`. A running app is driven with `tools/app-api`.
 - A new kind of log line gets its `event` by adding a rule and a test case in
   `telemetry::classify`.
 

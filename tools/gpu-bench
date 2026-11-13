@@ -7,21 +7,24 @@
 #
 # SECS is the time for each configuration (default 3; about 7 runs).
 # --adapter N picks a GPU by index (tools/gpu-bench --list shows them).
-# Stop other miners on this computer first, or the numbers mean little; the
-# script refuses to run while the installed app is mining.
+# Other miners on this computer make the numbers mean little: the script
+# refuses to run while the installed app is mining, unless --pause-app, which
+# stops the app's mining through its local API and starts it again on the same
+# GPU afterwards (app 2.4.0 and later).
 # Exits non-zero if a configuration gives wrong results or cannot be opened.
 set -euo pipefail
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 fi
 
 cd "$(dirname "$0")/.."
-secs=3; build=1; extra=()
+secs=3; build=1; pause=0; extra=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-build) build=0 ;;
+    --pause-app) pause=1 ;;
     --adapter) extra+=(--adapter "$2"); shift ;;
     --list) exec gpu-miner/target/release/gpu-miner --list ;;
     *) secs="$1" ;;
@@ -29,11 +32,29 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-log="$HOME/.local/share/jeffycoin/jeffycoin.log"
-if [[ -f "$log" ]] && pgrep -x jeffycoin >/dev/null; then
-  if tac "$log" | grep -m1 '\[app\] status:' | grep -q 'mining yes'; then
-    echo "the installed app is mining; stop mining in its window first" >&2
-    exit 1
+# Is the installed app mining? Ask its API; an app before 2.4.0 has none, so
+# read its last status line (written once a minute) instead.
+if state="$(tools/app-api --field state mining 2>/dev/null)"; then
+  if [[ "$state" == running || "$state" == starting ]]; then
+    if [[ $pause -eq 0 ]]; then
+      echo "the app is mining; add --pause-app, or stop it: tools/app-api POST mining/stop" >&2
+      exit 1
+    fi
+    adapter="$(tools/app-api --field adapter mining)"
+    tools/app-api POST mining/stop >/dev/null
+    # Start it again however the script ends: a signal becomes an exit so the
+    # EXIT trap runs, and a closed output pipe cannot stop the trap.
+    trap 'tools/app-api POST mining/start "{\"adapter\": $adapter}" >/dev/null 2>&1 && echo "app mining started again" >&2 2>/dev/null' EXIT
+    trap 'exit 130' INT TERM HUP PIPE
+    echo "app mining paused"
+  fi
+else
+  log="$HOME/.local/share/jeffycoin/jeffycoin.log"
+  if [[ -f "$log" ]] && pgrep -x jeffycoin >/dev/null; then
+    if tac "$log" | grep -m1 '\[app\] status:' | grep -q 'mining yes'; then
+      echo "the installed app is mining; stop mining in its window first" >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -43,4 +64,7 @@ if [[ $build -eq 1 ]]; then
     exit 1
   fi
 fi
-exec gpu-miner/target/release/gpu-miner --bench-matrix "$secs" "${extra[@]}"
+# Not exec: the trap that starts the app's mining again must still run.
+status=0
+gpu-miner/target/release/gpu-miner --bench-matrix "$secs" "${extra[@]}" || status=$?
+exit $status

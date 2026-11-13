@@ -8,7 +8,8 @@
 //! who made the file: both come from the same release page.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
@@ -18,6 +19,19 @@ const REPOSITORY: &str = "clarkrjonathan/jcoin";
 
 /// The version of this build. A release is tagged `v` plus this.
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+impl Release {
+    /// A release with no download, for tests.
+    pub fn for_test(tag: &str) -> Release {
+        Release {
+            tag: tag.to_string(),
+            date: "2026-01-01".to_string(),
+            program_url: String::new(),
+            sums_url: String::new(),
+        }
+    }
+}
 
 /// The release file names for this system: the program and the checksum list.
 fn asset_names() -> Option<(&'static str, &'static str)> {
@@ -205,6 +219,113 @@ fn replace_program(exe: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// What the update check or an install is doing.
+#[derive(Clone)]
+pub enum UpdateState {
+    Checking,
+    /// The releases with a build for this system, newest first.
+    Listed(Vec<Release>),
+    Installing(String),
+    Failed(String),
+}
+
+/// How often the release list is read again while the app stays open. The
+/// result is information for the user; nothing is installed or stopped by it.
+const CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
+
+/// The release list and any install in progress. Background threads write the
+/// state; the window and the local API read it. Clones share it.
+#[derive(Clone)]
+pub struct Updates {
+    state: Arc<Mutex<UpdateState>>,
+    /// When the release list was last asked for.
+    checked: Arc<Mutex<Instant>>,
+}
+
+impl Updates {
+    /// Clean up after a previous update and start the first check.
+    pub fn start() -> Updates {
+        clean_up();
+        let updates = Updates {
+            state: Arc::new(Mutex::new(UpdateState::Checking)),
+            checked: Arc::new(Mutex::new(Instant::now())),
+        };
+        updates.check();
+        updates
+    }
+
+    /// Updates holding `state`, with no check started, for tests.
+    #[cfg(test)]
+    pub fn with_state(state: UpdateState) -> Updates {
+        Updates {
+            state: Arc::new(Mutex::new(state)),
+            checked: Arc::new(Mutex::new(Instant::now())),
+        }
+    }
+
+    pub fn state(&self) -> UpdateState {
+        self.state.lock().unwrap().clone()
+    }
+
+    /// Read the release list again if it is due and nothing is in progress.
+    pub fn check_if_due(&self) {
+        let idle = matches!(self.state(), UpdateState::Listed(_) | UpdateState::Failed(_));
+        if idle && self.checked.lock().unwrap().elapsed() >= CHECK_EVERY {
+            self.check();
+        }
+    }
+
+    /// The newest release, if it is newer than this build.
+    pub fn newer_release(&self) -> Option<String> {
+        match self.state() {
+            UpdateState::Listed(list) => list.first().filter(|r| r.is_newer()).map(|r| r.tag.clone()),
+            _ => None,
+        }
+    }
+
+    /// Read the release list again, in the background.
+    pub fn check(&self) {
+        *self.checked.lock().unwrap() = Instant::now();
+        let state = self.state.clone();
+        *state.lock().unwrap() = UpdateState::Checking;
+        std::thread::spawn(move || {
+            let result = match fetch_releases() {
+                Ok(list) => UpdateState::Listed(list),
+                Err(e) => UpdateState::Failed(e),
+            };
+            *state.lock().unwrap() = result;
+        });
+    }
+
+    /// Download and install `release` in the background, then restart into it.
+    pub fn install(&self, release: Release) {
+        let state = self.state.clone();
+        *state.lock().unwrap() = UpdateState::Installing(release.tag.clone());
+        std::thread::spawn(move || {
+            // `restart` only returns on failure.
+            let result = install(&release).and_then(|exe| restart(&exe));
+            if let Err(e) = result {
+                *state.lock().unwrap() = UpdateState::Failed(e);
+            }
+        });
+    }
+}
+
+/// Why "install `release`" is refused now, if it is: the same reasons the
+/// window greys out its button for. `not_installed`: this is not the
+/// installed copy (updates apply to it).
+pub fn install_refusal(release: &Release, not_installed: bool, mining: bool) -> Option<&'static str> {
+    if not_installed {
+        Some("install JeffyCoin first (see the top of the window); updates apply to the installed copy.")
+    } else if release.relation() == "this version" {
+        Some("this version is already running.")
+    } else if mining {
+        Some("mining is running.")
+    } else {
+        None
+    }
+}
+
 /// Remove the file a previous update left behind. Call at startup.
 pub fn clean_up() {
     if let Ok(exe) = std::env::current_exe() {
@@ -226,6 +347,16 @@ pub fn restart(exe: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_install_is_refused_for_the_reasons_the_window_shows() {
+        let newer = Release::for_test("v99.0.0");
+        let same = Release::for_test(&format!("v{CURRENT}"));
+        assert_eq!(install_refusal(&newer, false, false), None);
+        assert!(install_refusal(&newer, true, false).unwrap().contains("install JeffyCoin first"));
+        assert!(install_refusal(&same, false, false).unwrap().contains("already running"));
+        assert!(install_refusal(&newer, false, true).unwrap().contains("mining"));
+    }
 
     #[test]
     fn versions_parse_and_order() {
@@ -323,7 +454,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("prog");
         std::fs::copy("/bin/sleep", &exe).unwrap();
-        let mut child = std::process::Command::new(&exe).arg("30").spawn().unwrap();
+        // A process another test thread starts while the copy is open for
+        // writing holds that handle until it runs its own program, and until
+        // then starting `prog` fails with "text file busy". Try again.
+        let mut tries = 0;
+        let mut child = loop {
+            match std::process::Command::new(&exe).arg("30").spawn() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => break result.unwrap(),
+            }
+        };
         let running = || std::fs::read_link(format!("/proc/{}/exe", child.id())).unwrap();
         // Right after spawn the child may not have started `prog` yet.
         let start = std::time::Instant::now();

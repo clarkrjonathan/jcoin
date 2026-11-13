@@ -8,6 +8,7 @@
 // No console window on Windows.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod api;
 mod applog;
 mod backend;
 mod install;
@@ -45,8 +46,9 @@ fn main() -> eframe::Result {
 }
 
 struct App {
-    /// The running backend, or the reason it could not start.
-    backend: Result<Backend, String>,
+    /// The running backend, or the reason it could not start. The local API
+    /// shares it.
+    backend: Result<Arc<Mutex<Backend>>, String>,
     /// Selected GPU: `None` lets the system choose.
     adapter: Option<usize>,
     recipient: String,
@@ -55,7 +57,9 @@ struct App {
     /// Result of the last send: the transaction id, or the error.
     send_result: Option<Result<String, String>>,
     keys: KeysForm,
-    updates: Updates,
+    updates: update::Updates,
+    /// Index of the selected release in the Updates list.
+    release_selected: usize,
     /// The label for this computer, as typed in the Developer section.
     device: String,
     device_result: Option<Result<String, String>>,
@@ -69,132 +73,13 @@ struct App {
     first_run_name: Option<String>,
 }
 
-/// Where this copy of the program stands relative to the installed one.
+/// The install banner and the uninstall row: the placement, and their state.
 struct Install {
-    /// The install locations, if this system supports installing.
-    layout: Option<install::Layout>,
-    /// This program file.
-    exe: std::path::PathBuf,
-    /// This program file is the installed copy.
-    installed_copy: bool,
-    /// Offer to install. Off for the installed copy and for test settings.
-    offer: bool,
+    place: install::Placement,
     /// Why the last install or removal failed.
     error: Option<String>,
     /// The Uninstall button was pressed once and waits for confirmation.
     confirm_uninstall: bool,
-}
-
-impl Install {
-    fn detect(regtest: bool) -> Install {
-        let layout = install::Layout::for_user();
-        let exe = std::env::current_exe().unwrap_or_default();
-        let installed_copy = layout.as_ref().is_some_and(|l| l.is_installed_copy(&exe));
-        if let (true, Some(layout)) = (installed_copy, &layout) {
-            // Keep the record right after an in-app update.
-            layout.record_version(update::CURRENT);
-        }
-        let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
-        let test_settings = regtest || set("JCOIN_APP_DATA") || set("JCOIN_APP_NO_INSTALL");
-        Install {
-            offer: layout.is_some() && !installed_copy && !test_settings,
-            layout,
-            exe,
-            installed_copy,
-            error: None,
-            confirm_uninstall: false,
-        }
-    }
-
-    /// Install this copy (replacing an installed one) and switch to it.
-    fn install_and_switch(&mut self) {
-        let Some(layout) = &self.layout else { return };
-        let result = layout
-            .install(&self.exe, update::CURRENT)
-            .and_then(|()| install::hand_over_to(&layout.program));
-        // `hand_over_to` only returns on failure.
-        self.error = result.err();
-    }
-}
-
-/// What the update check or an install is doing.
-#[derive(Clone)]
-enum UpdateState {
-    Checking,
-    /// The releases with a build for this system, newest first.
-    Listed(Vec<update::Release>),
-    Installing(String),
-    Failed(String),
-}
-
-/// The Updates section: a background thread writes `state`.
-struct Updates {
-    state: Arc<Mutex<UpdateState>>,
-    /// Index of the selected release in the list.
-    selected: usize,
-    /// When the release list was last asked for.
-    checked: std::cell::Cell<std::time::Instant>,
-}
-
-/// How often the release list is read again while the app stays open. The
-/// result is information for the user; nothing is installed or stopped by it.
-const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
-
-impl Updates {
-    fn start() -> Updates {
-        update::clean_up();
-        let updates = Updates {
-            state: Arc::new(Mutex::new(UpdateState::Checking)),
-            selected: 0,
-            checked: std::cell::Cell::new(std::time::Instant::now()),
-        };
-        updates.check();
-        updates
-    }
-
-    /// Read the release list again if it is due and nothing is in progress.
-    fn check_if_due(&self) {
-        let idle = matches!(
-            *self.state.lock().unwrap(),
-            UpdateState::Listed(_) | UpdateState::Failed(_)
-        );
-        if idle && self.checked.get().elapsed() >= UPDATE_CHECK_EVERY {
-            self.check();
-        }
-    }
-
-    /// The newest release, if it is newer than this build.
-    fn newer_release(&self) -> Option<String> {
-        match &*self.state.lock().unwrap() {
-            UpdateState::Listed(list) => list.first().filter(|r| r.is_newer()).map(|r| r.tag.clone()),
-            _ => None,
-        }
-    }
-
-    fn check(&self) {
-        self.checked.set(std::time::Instant::now());
-        let state = self.state.clone();
-        *state.lock().unwrap() = UpdateState::Checking;
-        std::thread::spawn(move || {
-            let result = match update::fetch_releases() {
-                Ok(list) => UpdateState::Listed(list),
-                Err(e) => UpdateState::Failed(e),
-            };
-            *state.lock().unwrap() = result;
-        });
-    }
-
-    fn install(&self, release: update::Release) {
-        let state = self.state.clone();
-        *state.lock().unwrap() = UpdateState::Installing(release.tag.clone());
-        std::thread::spawn(move || {
-            // `restart` only returns on failure.
-            let result = update::install(&release).and_then(|exe| update::restart(&exe));
-            if let Err(e) = result {
-                *state.lock().unwrap() = UpdateState::Failed(e);
-            }
-        });
-    }
 }
 
 /// Input fields and the last result of the Keys section.
@@ -211,23 +96,37 @@ impl App {
     fn new(settings: Settings) -> App {
         let data_dir = settings.data_dir.clone();
         let device = telemetry::device_name(&data_dir);
-        let install = Install::detect(settings.regtest);
+        let place = install::Placement::detect(settings.regtest);
         // Ask for a name the first time the app runs with no label set, so nodes
         // can be told apart by name and not only by peer id.
         let first_run_name =
             (device.is_empty() && !data_dir.join(DEVICE_PROMPTED_FILE).exists()).then(String::new);
+        let updates = update::Updates::start();
+        let backend = Backend::start(settings).map(|b| Arc::new(Mutex::new(b)));
+        if let Ok(backend) = &backend {
+            api::start(api::Shared {
+                backend: backend.clone(),
+                updates: updates.clone(),
+                place: place.clone(),
+            });
+        }
         App {
-            backend: Backend::start(settings),
+            backend,
             adapter: None,
             recipient: String::new(),
             amount: String::new(),
             fee: String::new(),
             send_result: None,
             keys: KeysForm::default(),
-            updates: Updates::start(),
+            updates,
+            release_selected: 0,
             device,
             device_result: None,
-            install,
+            install: Install {
+                place,
+                error: None,
+                confirm_uninstall: false,
+            },
             rules_banner_hidden: false,
             data_dir,
             first_run_name,
@@ -243,7 +142,7 @@ impl App {
 }
 
 /// Marker file: the first-run "name this computer" prompt has been shown.
-const DEVICE_PROMPTED_FILE: &str = "device_prompted";
+pub const DEVICE_PROMPTED_FILE: &str = "device_prompted";
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -285,14 +184,17 @@ impl eframe::App for App {
                     self.mark_name_prompted();
                 }
 
-                let backend = match &mut self.backend {
-                    Ok(backend) => backend,
+                let shared = match &self.backend {
+                    Ok(backend) => backend.clone(),
                     Err(e) => {
                         ui.add_space(8.0);
                         ui.colored_label(ui.visuals().error_fg_color, format!("Cannot start: {e}"));
                         return;
                     }
                 };
+                // Held for the frame; the local API waits for it in between.
+                let mut guard = shared.lock().unwrap();
+                let backend = &mut *guard;
                 backend.pump_miner();
                 backend.log_status_if_due();
                 self.updates.check_if_due();
@@ -324,7 +226,7 @@ impl eframe::App for App {
                     &mut self.send_result,
                 );
                 ui.add_space(12.0);
-                updates_section(ui, &mut self.updates, backend, self.install.offer);
+                updates_section(ui, &self.updates, &mut self.release_selected, backend, self.install.place.offer);
                 ui.add_space(12.0);
                 developer_section(ui, backend, &mut self.device, &mut self.device_result);
                 ui.add_space(12.0);
@@ -397,10 +299,10 @@ fn newer_rules_banner(
 /// Shown at the top when this copy is not the installed one: offers to
 /// install, or to switch to (or replace) the copy that is installed.
 fn install_banner(ui: &mut egui::Ui, state: &mut Install) {
-    if !state.offer {
+    if !state.place.offer {
         return;
     }
-    let Some(layout) = state.layout.clone() else { return };
+    let Some(layout) = state.place.layout.clone() else { return };
     let menu = if cfg!(windows) { "Start menu" } else { "application menu" };
     egui::Frame::group(ui.style()).show(ui, |ui| {
         match layout.installed_version() {
@@ -410,7 +312,7 @@ fn install_banner(ui: &mut egui::Ui, state: &mut Install) {
                     install::APP_NAME
                 ));
                 if ui.button("Install JeffyCoin").clicked() {
-                    state.install_and_switch();
+                    state.error = state.place.install_and_switch().err();
                 }
             }
             Some(installed) => {
@@ -428,7 +330,7 @@ fn install_banner(ui: &mut egui::Ui, state: &mut Install) {
                             .button(format!("Replace it with this version ({})", update::CURRENT))
                             .clicked()
                     {
-                        state.install_and_switch();
+                        state.error = state.place.install_and_switch().err();
                     }
                 });
             }
@@ -444,10 +346,10 @@ fn install_banner(ui: &mut egui::Ui, state: &mut Install) {
 /// For the installed copy: a two-step button that removes the app. The data
 /// folder (keys and chain) stays.
 fn uninstall_row(ui: &mut egui::Ui, state: &mut Install) {
-    if !state.installed_copy {
+    if !state.place.installed_copy {
         return;
     }
-    let Some(layout) = state.layout.clone() else { return };
+    let Some(layout) = state.place.layout.clone() else { return };
     ui.horizontal(|ui| {
         ui.small(format!("Installed at {}", display_path(&layout.program)));
         if !state.confirm_uninstall {
@@ -456,13 +358,8 @@ fn uninstall_row(ui: &mut egui::Ui, state: &mut Install) {
             }
         } else {
             if ui.small_button("Confirm: remove the app, keep my data").clicked() {
-                match layout.uninstall(&state.exe) {
-                    Ok(()) => {
-                        telemetry::flush();
-                        std::process::exit(0);
-                    }
-                    Err(e) => state.error = Some(e),
-                }
+                // Only returns on failure.
+                state.error = state.place.uninstall_and_exit().err();
             }
             if ui.small_button("Cancel").clicked() {
                 state.confirm_uninstall = false;
@@ -771,10 +668,16 @@ fn mining_section(ui: &mut egui::Ui, backend: &mut Backend, adapter: &mut Option
     }
 }
 
-fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, backend: &mut Backend, not_installed: bool) {
+fn updates_section(
+    ui: &mut egui::Ui,
+    updates: &update::Updates,
+    selected: &mut usize,
+    backend: &mut Backend,
+    not_installed: bool,
+) {
+    use update::UpdateState;
     ui.strong("Updates");
-    let state = updates.state.lock().unwrap().clone();
-    match state {
+    match updates.state() {
         UpdateState::Checking => {
             ui.label(format!("Version {}. Checking for updates…", update::CURRENT));
         }
@@ -797,12 +700,12 @@ fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, backend: &mut Backe
                 ),
                 None => ui.label(format!("Version {}. This is the newest version.", update::CURRENT)),
             };
-            updates.selected = updates.selected.min(list.len().saturating_sub(1));
+            *selected = (*selected).min(list.len().saturating_sub(1));
             let describe = |r: &update::Release| match r.relation() {
                 "" => format!("{} ({})", r.tag, r.date),
                 relation => format!("{} ({}, {relation})", r.tag, r.date),
             };
-            let chosen = list.get(updates.selected).cloned();
+            let chosen = list.get(*selected).cloned();
             let mining = !matches!(
                 backend.mining_state_peek(),
                 MiningState::Idle | MiningState::Failed(_)
@@ -810,15 +713,9 @@ fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, backend: &mut Backe
             let same = chosen.as_ref().is_some_and(|c| c.relation() == "this version");
             // Why "Install and restart" is off, if it is. Shown inline, not only
             // on hover, so it is clear why the button is grey.
-            let reason: Option<&str> = if not_installed {
-                Some("install JeffyCoin first (see the top of the window); updates apply to the installed copy.")
-            } else if same {
-                Some("this version is already running.")
-            } else if mining {
-                Some("mining is running.")
-            } else {
-                None
-            };
+            let reason = chosen
+                .as_ref()
+                .and_then(|c| update::install_refusal(c, not_installed, mining));
             ui.horizontal(|ui| {
                 if let Some(chosen) = &chosen {
                     egui::ComboBox::from_id_salt("release")
@@ -826,7 +723,7 @@ fn updates_section(ui: &mut egui::Ui, updates: &mut Updates, backend: &mut Backe
                         .width(240.0)
                         .show_ui(ui, |ui| {
                             for (i, r) in list.iter().enumerate() {
-                                ui.selectable_value(&mut updates.selected, i, describe(r));
+                                ui.selectable_value(selected, i, describe(r));
                             }
                         });
                     let mut button = ui.add_enabled(

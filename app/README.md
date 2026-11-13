@@ -164,6 +164,31 @@ separate releases repository) must be public. The app's version in
 `app/Cargo.toml` must equal the release tag without the `v`; the release
 workflow checks this, and builds only for a tag whose commit is on `main`.
 
+## Local API
+
+The app serves an HTTP API on 127.0.0.1 with what the window shows and does:
+status, keys (create, import, select, read the secret), sending and the sent
+list, mining (start, stop, GPU, limit, kernel, blocks mined), updates and
+install, the computer's label, diagnostics, the log, restart, and the node's
+chain, blocks, peers, balances and transactions passed through from its REST
+server. It listens only on 127.0.0.1, port 3100 or another free one.
+
+At start the app writes two files to the data folder: `api_port` (the port)
+and `api_token` (64 hex characters, created once and kept; readable by this
+user only on Linux). Every request under `/api` needs
+`Authorization: Bearer <token>`. The token stops web pages in a browser from
+driving the app; it does not protect against programs run by the same user,
+which can read the key files anyway.
+
+`/docs` is a Swagger page for reading and trying the API (press Authorize and
+paste the token); `/openapi.json` is the OpenAPI 3.1 document. Neither needs
+the token. From this repository, `tools/app-api` calls the API and
+`tools/node-status` reads the app's node through it.
+
+Actions that end the program (`/api/restart`, `/api/install`,
+`/api/uninstall`, `/api/updates/install`) reply first with 202 and act half a
+second later. Mining does not resume after a restart.
+
 ## Structure
 
 - `jcoin::service` (in `jcoin/`) is the node as an embeddable service. The
@@ -174,7 +199,8 @@ workflow checks this, and builds only for a tag whose commit is on `main`.
   `MinerControl` to stop it and read the hash rate.
 - `app/src/backend.rs` runs those on background threads and talks to the
   embedded node over its local REST endpoints. `app/src/main.rs` is the window
-  (egui through eframe).
+  (egui through eframe). `app/src/api.rs` is the local API; it shares the
+  backend with the window.
 
 eframe is pinned to 0.35: later versions need a `js-sys` version that conflicts
 with the one libp2p 0.57 pins.

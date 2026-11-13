@@ -2,9 +2,13 @@
 """The state of a local node, in a few lines.
 
   tools/node-status [PORT] [ADDR] [--peers] [--blocks N] [--wait COND [SECS]]
+                    [--data DIR]
 
   PORT        a node whose REST server is on 127.0.0.1:PORT; without it, the
-              desktop app's node on this computer (found from its log)
+              desktop app on this computer, through its local API (2.4.0 and
+              later; the line then also says whether it mines), or for an
+              older app its node, found from the app's log
+  --data DIR  the app's data folder, for an app started with JCOIN_APP_DATA
   ADDR        also the balance of this address (64 hex)
   --peers     one line per open connection: peer, label, direct or relayed,
               whether it carries a session, its address
@@ -15,19 +19,47 @@
                 direct     a direct (not relayed) session with another node
                 peers=N    at least N connections with a session
                 height=N   the chain is at height N or more
+                nonce=ADDR:N  ADDR's confirmed nonce is N or more: a
+                           transfer it sent with nonce N-1 is in a block
 
 The first line always gives height, difficulty, connections, the newer-rules
 signal, and the balance if an address is known.
 """
 import json, math, os, re, sys, time, urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import jcoin_api  # noqa: E402
 
-def get(port, path):
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=3) as r:
-            return json.load(r)
-    except Exception:
-        return None
+
+class Node:
+    """A node's own REST server."""
+
+    def __init__(self, port):
+        self.port = port
+        self.label = f"127.0.0.1:{port}"
+        self.api = None
+
+    def get(self, path):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=3) as r:
+                return json.load(r)
+        except Exception:
+            return None
+
+
+class App:
+    """The desktop app's node, through the app's local API."""
+
+    NODE_PATHS = {"/network/signal": "/api/node/signal"}
+
+    def __init__(self, api):
+        self.api = api
+        self.label = f"app ({api.base})"
+
+    def get(self, path):
+        base, _, query = path.partition("?")
+        mapped = self.NODE_PATHS.get(base, "/api/node" + base)
+        return self.api.get(mapped + ("?" + query if query else ""))
 
 
 def app_log():
@@ -49,12 +81,12 @@ def span(secs):
     return f"{secs // 3600} h {secs % 3600 // 60} min"
 
 
-def summary(port, address):
-    chain = get(port, "/chain")
+def summary(src, address):
+    chain = src.get("/chain")
     if chain is None:
         return None
     parts = [f"height {chain['height']}", f"tip {bits(chain['target']):.1f} bits"]
-    peers = get(port, "/peers")
+    peers = src.get("/peers")
     if peers:
         conns = peers["connections"]
         sessions = sum(1 for c in conns if c["session"])
@@ -62,18 +94,24 @@ def summary(port, address):
         parts.append(f"{len(conns)} connections ({sessions} exchanging blocks, {relayed} through the relay)")
     else:
         parts.append(f"{chain.get('peers', '?')} peers")
-    signal = get(port, "/network/signal")
+    signal = src.get("/network/signal")
     if signal and signal["level"] != "none":
         parts.append(f"newer rules: {signal['level']} (version {signal['newest_version']}, {signal['blocks']} blocks)")
     if address:
-        account = get(port, f"/balance/{address}")
+        account = src.get(f"/balance/{address}")
         if account:
             parts.append(f"balance {account['balance'] / 1e8:g} JEF, pending {account['pending'] / 1e8:g}, nonce {account['nonce']}")
-    return f"127.0.0.1:{port}: " + "; ".join(parts)
+    if src.api:
+        m = src.api.get("/api/mining")
+        if m and m["state"] == "running":
+            parts.append(f"mining {m['hash_rate'] / 1e6:.1f} MH/s at {m['gpu_limit']}%")
+        elif m:
+            parts.append(f"mining {m['state']}" + (f" ({m['error']})" if m.get("error") else ""))
+    return f"{src.label}: " + "; ".join(parts)
 
 
-def print_peers(port):
-    peers = get(port, "/peers") or {"connections": []}
+def print_peers(src):
+    peers = src.get("/peers") or {"connections": []}
     for c in peers["connections"]:
         kind = "relay" if c["is_relay"] else ("relayed" if c["relayed"] else "direct")
         label = c.get("label") or "-"
@@ -83,8 +121,8 @@ def print_peers(port):
         print("  no connections")
 
 
-def print_blocks(port, n):
-    recent = get(port, f"/chain/recent?count={n}")
+def print_blocks(src, n):
+    recent = src.get(f"/chain/recent?count={n}")
     if recent is None:
         print("  no /chain/recent (node older than 2.2.3?)")
         return
@@ -96,16 +134,20 @@ def print_blocks(port, n):
         print(f"  average {span(recent['average_gap'])}; last block {span(recent['since_tip'] or 0)} ago")
 
 
-def holds(port, cond):
+def holds(src, cond):
     if cond == "direct":
-        peers = get(port, "/peers") or {"connections": []}
+        peers = src.get("/peers") or {"connections": []}
         return any(c["session"] and not c["relayed"] and not c["is_relay"] for c in peers["connections"])
     name, _, value = cond.partition("=")
     if name == "peers":
-        peers = get(port, "/peers") or {"connections": []}
+        peers = src.get("/peers") or {"connections": []}
         return len({c["peer"] for c in peers["connections"] if c["session"]}) >= int(value)
+    if name == "nonce":
+        address, _, n = value.partition(":")
+        account = src.get(f"/balance/{address}")
+        return account is not None and account["nonce"] >= int(n)
     if name == "height":
-        chain = get(port, "/chain")
+        chain = src.get("/chain")
         return chain is not None and chain["height"] >= int(value)
     sys.exit(f"unknown condition {cond!r}; see --help")
 
@@ -117,7 +159,7 @@ def main():
         return
     show_peers = "--peers" in argv
     argv = [a for a in argv if a != "--peers"]
-    blocks = wait = None
+    blocks = wait = data = None
     timeout = 60
     rest = []
     i = 0
@@ -125,6 +167,9 @@ def main():
         a = argv[i]
         if a == "--blocks":
             blocks = min(int(argv[i + 1]), 100)
+            i += 2
+        elif a == "--data":
+            data = argv[i + 1]
             i += 2
         elif a == "--wait":
             wait = argv[i + 1]
@@ -139,32 +184,42 @@ def main():
             i += 1
     port = rest[0] if rest else None
     address = rest[1] if len(rest) > 1 else None
-    if port is None:
-        log = app_log()
-        ports = re.findall(r"REST on 127\.0\.0\.1:(\d+)", log)
-        keys = re.findall(r"key '[^']+' ([0-9a-f]{64})", log)
-        if not ports:
-            sys.exit("no app log found; give a port")
-        port, address = ports[-1], (keys[-1] if keys else None)
+    if port is not None:
+        src = Node(port)
+    else:
+        api = jcoin_api.find(data)
+        status = api.get("/api/status") if api else None
+        if status:
+            src = App(api)
+            address = address or status["key"]["address"]
+        else:
+            # An app before 2.4.0 (no API): its node's port is in the log.
+            log = app_log()
+            ports = re.findall(r"REST on 127\.0\.0\.1:(\d+)", log)
+            keys = re.findall(r"key '[^']+' ([0-9a-f]{64})", log)
+            if not ports:
+                sys.exit("no app answers on its API and no app log found; give a port")
+            src = Node(ports[-1])
+            address = address or (keys[-1] if keys else None)
 
     if wait:
         start = time.time()
-        while not holds(port, wait):
+        while not holds(src, wait):
             if time.time() - start > timeout:
-                print(f"127.0.0.1:{port}: '{wait}' did not hold within {timeout} s")
-                print(summary(port, address) or f"no node answers on 127.0.0.1:{port}")
+                print(f"{src.label}: '{wait}' did not hold within {timeout} s")
+                print(summary(src, address) or f"no node answers at {src.label}")
                 sys.exit(1)
             time.sleep(1)
-        print(f"127.0.0.1:{port}: '{wait}' holds after {time.time() - start:.0f} s")
+        print(f"{src.label}: '{wait}' holds after {time.time() - start:.0f} s")
 
-    line = summary(port, address)
+    line = summary(src, address)
     if line is None:
-        sys.exit(f"no node answers on 127.0.0.1:{port}")
+        sys.exit(f"no node answers at {src.label}")
     print(line)
     if show_peers:
-        print_peers(port)
+        print_peers(src)
     if blocks:
-        print_blocks(port, blocks)
+        print_blocks(src, blocks)
 
 
 if __name__ == "__main__":

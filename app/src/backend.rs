@@ -496,6 +496,17 @@ impl Backend {
         self.gpus.lock().unwrap().clone()
     }
 
+    /// The embedded node's REST address, `http://127.0.0.1:PORT`.
+    pub fn node_url(&self) -> &str {
+        &self.node_url
+    }
+
+    /// The GPU the running miner was started on: `Some(None)` for the one the
+    /// system chose, `None` when not mining.
+    pub fn mining_adapter(&self) -> Option<Option<usize>> {
+        self.mining.as_ref().map(|m| m.adapter)
+    }
+
     pub fn key_file(&self) -> PathBuf {
         wallet::key_path(&self.settings.data_dir, &self.key_name)
     }

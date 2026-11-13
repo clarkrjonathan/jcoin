@@ -33,8 +33,10 @@ states only what is true now.
   Sentry is untested.
 - Relay: AWS Lightsail `3.14.123.27:9000`, ssh `ubuntu@3.14.123.27` with
   `~/jcoin-relay.pem`. It runs the pre-2.1.1 relay program.
-- iMac reference node: `miner@jcoin-miner.local`, LAN only. It runs a build
-  from before 2.2.0 and cannot sync with the current chain.
+- iMac reference node: `miner@jcoin-miner.local`, LAN only; its address
+  changes with DHCP and mDNS does not always resolve it. It mines on the CPU
+  with the command-line node (unit `jcoin-node`). `tools/imac-deploy --yes`
+  finds it, installs a release, and restarts it.
 
 **Pending operations**: `tools/planned show ops`.
 
