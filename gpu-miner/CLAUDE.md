@@ -4,7 +4,7 @@ A library plus a program; usage is in `README.md` in this folder.
 
 | File | Holds |
 | --- | --- |
-| `src/gpu.rs` | wgpu setup, `Gpu::open` (default kernel), `Gpu::open_with` (a `kernel::Config`), `Gpu::search` (one dispatch over a nonce range) |
+| `src/gpu.rs` | wgpu setup, `Gpu::open` (default kernel), `Gpu::open_with` (a `kernel::Config`), `Gpu::search` (one dispatch over a nonce range; an error means the GPU was lost and must be opened again) |
 | `src/kernel.rs` | The shader variants (`Kernel`: baseline, unrolled, precomputed), `Config` (kernel and workgroup size), `source` (the WGSL text; the last two are generated) |
 | `src/sha256.wgsl` | The hand-written baseline kernel, the default for mining |
 | `src/pow.rs` | Header midstate for the GPU, `prefix` (rounds 0 to 5 and schedule words 16 to 20, for the precomputed kernel), CPU check `meets_target` |

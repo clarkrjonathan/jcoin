@@ -12,6 +12,7 @@ end-to-end test (mine, send, confirm on a private regtest chain).
 | `src/backend.rs` | Everything behind the window: `Settings` (environment overrides), `Backend` (keys, sending, mining, GPU limit, diagnostics), the node thread, the poller that reads the node's REST endpoints into `NodeView` |
 | `src/install.rs` | Per-user install: `Layout`, menu entry, uninstall |
 | `src/update.rs` | Release list, checksum check, replacing the program file |
+| `src/recover.rs` | Restart after a crash while mining: panic hook, `--after-crash`, waiting for the old copy |
 | `src/telemetry.rs` | Sentry setup, tags, `classify` (log line to `component` and `event`) |
 | `src/applog.rs` | The log file and the in-memory tail |
 

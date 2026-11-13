@@ -11,6 +11,7 @@
 mod applog;
 mod backend;
 mod install;
+mod recover;
 mod telemetry;
 mod update;
 
@@ -28,19 +29,30 @@ use backend::{
 fn main() -> eframe::Result {
     // Start reporting before the window and the backend's threads, so a
     // panic anywhere is reported. The guard sends what is queued at exit.
+    // A copy started after a crash waits here for the old copy to exit.
+    let resume_mining = recover::after_crash();
     let settings = Settings::from_env();
     let _telemetry = telemetry::init(&settings.data_dir, settings.regtest);
+    recover::install_hook();
 
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([520.0, 720.0])
             .with_min_inner_size([420.0, 480.0]),
         ..Default::default()
     };
+    // Draw the window on the low-power GPU (the built-in one on a laptop with
+    // two). eframe's default is the high-performance GPU, which is the one
+    // that mines: when the driver reset it, the window's renderer panicked
+    // and closed the app (JCOIN-APP-2..4, 2.3.1). WGPU_POWER_PREF overrides.
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        setup.power_preference =
+            eframe::wgpu::PowerPreference::from_env().unwrap_or(eframe::wgpu::PowerPreference::LowPower);
+    }
     eframe::run_native(
         "JeffyCoin",
         options,
-        Box::new(move |_cc| Ok(Box::new(App::new(settings)))),
+        Box::new(move |_cc| Ok(Box::new(App::new(settings, resume_mining)))),
     )
 }
 
@@ -208,7 +220,9 @@ struct KeysForm {
 }
 
 impl App {
-    fn new(settings: Settings) -> App {
+    /// `resume_mining`: this copy was started after a crash while mining on
+    /// that GPU (see `recover`); mining starts again at once.
+    fn new(settings: Settings, resume_mining: Option<Option<usize>>) -> App {
         let data_dir = settings.data_dir.clone();
         let device = telemetry::device_name(&data_dir);
         let install = Install::detect(settings.regtest);
@@ -216,9 +230,17 @@ impl App {
         // can be told apart by name and not only by peer id.
         let first_run_name =
             (device.is_empty() && !data_dir.join(DEVICE_PROMPTED_FILE).exists()).then(String::new);
+        let mut backend = Backend::start(settings);
+        if let (Ok(backend), Some(adapter)) = (&mut backend, resume_mining) {
+            jcoin::log_info!(
+                [("event", "crash_restarted".to_string())];
+                "[app] started again after a crash; mining again"
+            );
+            backend.start_mining(adapter);
+        }
         App {
-            backend: Backend::start(settings),
-            adapter: None,
+            backend,
+            adapter: resume_mining.flatten(),
             recipient: String::new(),
             amount: String::new(),
             fee: String::new(),
@@ -249,7 +271,6 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // The figures change without input, so redraw on a timer.
         ui.ctx().request_repaint_after(Duration::from_millis(500));
-
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("JeffyCoin");

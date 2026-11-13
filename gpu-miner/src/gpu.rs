@@ -81,6 +81,17 @@ impl Gpu {
             ..Default::default()
         }))
         .map_err(|e| format!("cannot open {description}: {e}"))?;
+        // wgpu's default handler panics on any error. Once the device is lost
+        // every call reports one; `search` returns the loss as an error, so
+        // only errors before a loss (a real bug) still panic.
+        let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = lost.clone();
+        device.set_device_lost_callback(move |_, _| flag.store(true, std::sync::atomic::Ordering::Relaxed));
+        device.on_uncaptured_error(std::sync::Arc::new(move |e| {
+            if !lost.load(std::sync::atomic::Ordering::Relaxed) {
+                panic!("wgpu error: {e}");
+            }
+        }));
         let most = device.limits().max_compute_workgroup_size_x;
         if config.workgroup == 0 || config.workgroup > most {
             return Err(format!("workgroup size {} is not in 1..={most}", config.workgroup));
@@ -153,7 +164,11 @@ impl Gpu {
     /// count`. Returns the smallest such `lo` whose hash meets the target.
     /// `count` must be a multiple of the workgroup size, at most
     /// `max_batch()`, and the range must not pass 2^32.
-    pub fn search(&self, work: &GpuWork, nonce_hi: u32, lo_base: u32, count: u32) -> Option<u32> {
+    ///
+    /// An error means the GPU stopped answering: the driver reset it, or the
+    /// device was lost (sleep, a power-state switch, a driver update). This
+    /// `Gpu` is then unusable; open a new one.
+    pub fn search(&self, work: &GpuWork, nonce_hi: u32, lo_base: u32, count: u32) -> Result<Option<u32>, String> {
         assert!(count % self.config.workgroup == 0 && count <= self.max_batch());
         assert!(lo_base.checked_add(count - 1).is_some(), "batch would wrap the low word");
         let (pre, wpre) = crate::pow::prefix(work, nonce_hi);
@@ -182,16 +197,26 @@ impl Gpu {
         self.queue.submit([encoder.finish()]);
 
         let slice = self.readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map readback"));
+        let (sender, mapped) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = sender.send(r);
+        });
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU poll failed");
+            .map_err(|e| format!("the GPU stopped answering: {e}"))?;
+        match mapped.try_recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("the GPU stopped answering: reading the result failed ({e})")),
+            Err(_) => return Err("the GPU stopped answering: the result was never read".to_string()),
+        }
         let (found, lo) = {
-            let data = slice.get_mapped_range().expect("map range");
+            let data = slice
+                .get_mapped_range()
+                .map_err(|e| format!("the GPU stopped answering: {e}"))?;
             let words: &[u32] = bytemuck::cast_slice(&data);
             (words[0], words[1])
         };
         self.readback.unmap();
-        (found != 0).then_some(lo)
+        Ok((found != 0).then_some(lo))
     }
 }

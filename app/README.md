@@ -184,6 +184,20 @@ workflow checks this, and builds only for a tag whose commit is on `main`.
   embedded node over its local REST endpoints. `app/src/main.rs` is the window
   (egui through eframe).
 
+## When the GPU fails
+
+- The window draws on the low-power GPU (the built-in one on a laptop with
+  two), so a driver reset of the mining GPU does not reach it.
+  `WGPU_POWER_PREF=high` draws on the high-performance one instead.
+- If the GPU stops answering while mining (a driver reset, sleep, a
+  power-state switch), the miner logs `gpu_lost`, opens the GPU again every 5
+  seconds, and mines on (`gpu_reopened`).
+- If the app crashes while mining (a panic on the window's thread),
+  `app/src/recover.rs` starts a new copy with `--after-crash`. The new copy
+  waits until the old one has exited (its standard input is a pipe that only
+  the old copy holds), then mines on the same GPU. A copy that was itself
+  restarted does not restart again within 10 minutes. Release builds only.
+
 eframe is pinned to 0.35: later versions need a `js-sys` version that conflicts
 with the one libp2p 0.57 pins.
 
