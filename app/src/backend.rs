@@ -35,6 +35,10 @@ const GPU_LIMIT_FILE: &str = "gpu_limit";
 /// name). Missing means the baseline kernel.
 const GPU_KERNEL_FILE: &str = "gpu_kernel";
 
+/// After the GPU is lost while mining, how long to wait before each attempt
+/// to open it again.
+const GPU_REOPEN_EVERY: Duration = Duration::from_secs(5);
+
 /// The lowest GPU use limit the app offers, in percent.
 pub const MIN_GPU_LIMIT: u32 = 10;
 
@@ -648,6 +652,7 @@ impl Backend {
             return;
         }
         self.mining_error = None;
+        crate::recover::set_mining(Some(adapter));
         self.log.push(
             false,
             &format!("[app] mining started, rewards to {}, kernel {}", self.address, self.kernel.name()),
@@ -664,7 +669,7 @@ impl Backend {
             let (control, opened) = (control.clone(), opened.clone());
             let (node, miner) = (self.node_url.clone(), self.address.clone());
             std::thread::spawn(move || {
-                let gpu = match Gpu::open_with(adapter, config) {
+                let mut gpu = match Gpu::open_with(adapter, config) {
                     Ok(gpu) => gpu,
                     Err(e) => {
                         *opened.lock().unwrap() = Some(Err(e));
@@ -673,8 +678,35 @@ impl Backend {
                 };
                 crate::telemetry::set_tag("gpu", &gpu.description);
                 *opened.lock().unwrap() = Some(Ok(gpu.description.clone()));
-                let batch = ((1u32 << 22) / WORKGROUP * WORKGROUP).min(gpu.max_batch());
-                mine(&gpu, &node, &miner, batch, Duration::from_secs(20), &control);
+                loop {
+                    let batch = ((1u32 << 22) / WORKGROUP * WORKGROUP).min(gpu.max_batch());
+                    let Err(e) = mine(&gpu, &node, &miner, batch, Duration::from_secs(20), &control) else {
+                        return; // stopped
+                    };
+                    // The driver reset the GPU or it was lost (sleep, a
+                    // power-state switch). Open it again and carry on.
+                    drop(gpu);
+                    control.log(true, format!("lost the GPU: {e}; opening it again"));
+                    let mut attempts = 0;
+                    gpu = loop {
+                        control.pause(GPU_REOPEN_EVERY);
+                        if control.stopped() {
+                            return;
+                        }
+                        match Gpu::open_with(adapter, config) {
+                            Ok(gpu) => break gpu,
+                            Err(e) => {
+                                attempts += 1;
+                                control.set_status(format!("lost the GPU; cannot open it again yet: {e}"));
+                                if attempts == 1 {
+                                    control.log(true, format!("cannot open the GPU again yet: {e}; still trying"));
+                                }
+                            }
+                        }
+                    };
+                    control.set_status(String::new());
+                    control.log(false, format!("GPU opened again: {}", gpu.description));
+                }
             })
         };
         self.mining = Some(Mining {
@@ -687,6 +719,7 @@ impl Backend {
 
     /// Ask the mining thread to stop. It returns within one GPU dispatch.
     pub fn stop_mining(&mut self) {
+        crate::recover::set_mining(None);
         self.pump_miner();
         if let Some(m) = self.mining.take() {
             m.control.stop();

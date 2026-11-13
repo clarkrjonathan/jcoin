@@ -231,6 +231,8 @@ pub fn classify(text: &str) -> Class {
         "gpu" if starts("height") => ("block_not_accepted", false),
         "gpu" if starts("cannot get work") => ("work_unavailable", false),
         "gpu" if starts("submit failed") => ("submit_failed", false),
+        "gpu" if starts("lost the GPU") || starts("cannot open the GPU again") => ("gpu_lost", false),
+        "gpu" if starts("GPU opened again") => ("gpu_reopened", false),
         "store" if starts("replayed") => ("store_replayed", false),
         "store" if has("from another chain") => ("chain_moved_aside", false),
         "chain" if has("newer rules") => ("newer_rules", false),
@@ -350,6 +352,9 @@ mod tests {
         assert_eq!(filed("[work] won block 4 0000"), ("work", "block_won", false));
         assert_eq!(filed("[gpu] height 4: accepted"), ("gpu", "block_accepted", false));
         assert_eq!(filed("[gpu] height 4: stale"), ("gpu", "block_not_accepted", false));
+        assert_eq!(filed("[gpu] lost the GPU: the GPU stopped answering: x; opening it again"), ("gpu", "gpu_lost", false));
+        assert_eq!(filed("[gpu] cannot open the GPU again yet: x; still trying"), ("gpu", "gpu_lost", false));
+        assert_eq!(filed("[gpu] GPU opened again: NVIDIA (Vulkan)"), ("gpu", "gpu_reopened", false));
         assert_eq!(filed("[store] replayed 63 blocks; tip height 63"), ("store", "store_replayed", false));
         assert_eq!(filed("[app] JeffyCoin 2.1.1 starting on mainnet (windows)"), ("app", "startup", false));
         assert_eq!(filed("JeffyCoin node: REST on 127.0.0.1:3000"), ("app", "other", false));

@@ -159,6 +159,14 @@ renames the running program to `<name>.old`, puts the download in its place,
 and starts it. The checksum catches a damaged download; it does not prove who
 built the file.
 
+The list comes from GitHub's API, which allows 60 requests an hour from one
+internet address without signing in, shared by everyone behind it. When the
+API refuses (403 or 429), the app reads the releases feed
+(`github.com/<repo>/releases.atom`) instead: the newest 10 releases, each
+offered if its checksum list for this system names the program. A failed
+check is logged as `update_check_failed`, a check that used the feed as
+`update_check_limited`.
+
 The release list must be readable without signing in, so the repository (or a
 separate releases repository) must be public. The app's version in
 `app/Cargo.toml` must equal the release tag without the `v`; the release
@@ -201,6 +209,20 @@ second later. Mining does not resume after a restart.
   embedded node over its local REST endpoints. `app/src/main.rs` is the window
   (egui through eframe). `app/src/api.rs` is the local API; it shares the
   backend with the window.
+
+## When the GPU fails
+
+- The window draws on the low-power GPU (the built-in one on a laptop with
+  two), so a driver reset of the mining GPU does not reach it.
+  `WGPU_POWER_PREF=high` draws on the high-performance one instead.
+- If the GPU stops answering while mining (a driver reset, sleep, a
+  power-state switch), the miner logs `gpu_lost`, opens the GPU again every 5
+  seconds, and mines on (`gpu_reopened`).
+- If the app crashes while mining (a panic on the window's thread),
+  `app/src/recover.rs` starts a new copy with `--after-crash`. The new copy
+  waits until the old one has exited (its standard input is a pipe that only
+  the old copy holds), then mines on the same GPU. A copy that was itself
+  restarted does not restart again within 10 minutes. Release builds only.
 
 eframe is pinned to 0.35: later versions need a `js-sys` version that conflicts
 with the one libp2p 0.57 pins.

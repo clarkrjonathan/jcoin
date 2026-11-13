@@ -84,14 +84,14 @@ impl MinerControl {
         self.events.lock().map(|mut e| std::mem::take(&mut *e)).unwrap_or_default()
     }
 
-    fn set_status(&self, text: String) {
+    pub fn set_status(&self, text: String) {
         if let Ok(mut s) = self.status.lock() {
             *s = text;
         }
     }
 
     /// Print a line and keep it for `take_events`.
-    fn log(&self, is_error: bool, text: String) {
+    pub fn log(&self, is_error: bool, text: String) {
         if is_error {
             eprintln!("[gpu] {text}");
         } else {
@@ -109,7 +109,7 @@ impl MinerControl {
     /// of at most 100 ms and never past the end: a rest of 10 ms takes 10 ms.
     /// (Until 2.1.2 every step was a full 100 ms, so any GPU use limit below
     /// 100% rested at least 100 ms per dispatch and they all behaved alike.)
-    fn pause(&self, total: Duration) {
+    pub fn pause(&self, total: Duration) {
         let end = Instant::now() + total;
         while !self.stopped() {
             let left = end.saturating_duration_since(Instant::now());
@@ -171,7 +171,16 @@ impl RateWindow {
     }
 }
 
-pub fn mine(gpu: &Gpu, node: &str, miner: &str, batch: u32, refresh: Duration, control: &MinerControl) {
+/// Mine until `control` is stopped (`Ok`), or until the GPU stops answering
+/// (`Err`, from `Gpu::search`; the caller may open the GPU again).
+pub fn mine(
+    gpu: &Gpu,
+    node: &str,
+    miner: &str,
+    batch: u32,
+    refresh: Duration,
+    control: &MinerControl,
+) -> Result<(), String> {
     let http = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -232,7 +241,13 @@ pub fn mine(gpu: &Gpu, node: &str, miner: &str, batch: u32, refresh: Duration, c
                 lo = 0;
             }
             let dispatched = Instant::now();
-            let hit = gpu.search(&gw, hi, lo, batch);
+            let hit = match gpu.search(&gw, hi, lo, batch) {
+                Ok(hit) => hit,
+                Err(e) => {
+                    control.hash_rate.store(0, Ordering::Relaxed);
+                    return Err(e);
+                }
+            };
             // Under a limit, rest after the dispatch so the GPU is busy for
             // about that share of the time. A found nonce is handled first.
             if hit.is_none() {
@@ -293,6 +308,7 @@ pub fn mine(gpu: &Gpu, node: &str, miner: &str, batch: u32, refresh: Duration, c
         }
     }
     control.hash_rate.store(0, Ordering::Relaxed);
+    Ok(())
 }
 
 fn submit(

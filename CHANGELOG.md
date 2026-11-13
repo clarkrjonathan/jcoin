@@ -10,6 +10,49 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.3.2 (2026-11-13)
+
+A patch. No consensus change.
+
+### Fixed
+
+- The Updates section could show "403 rate limit exceeded" and no
+  releases. The app read the release list from GitHub's API without
+  signing in, which GitHub allows 60 times an hour from one internet
+  address, shared by everyone behind it; on a shared network others use
+  them up. Two friends' apps hit this on 2026-11-13. When the API refuses
+  (403 or 429), the app now reads GitHub's releases feed instead, which has
+  no such limit. It lists the newest 10 releases; a release is offered if
+  its checksum list for this system names the program. Downloads and the
+  checksum check are unchanged.
+- A GPU driver reset while mining closed the app (JCOIN-APP-2, -3, -4 on
+  Holden's laptop, 2026-11-13). The window drew on the high-performance GPU,
+  the same one that mines, so the reset broke both the miner and the
+  window, and both panicked. Three changes:
+  - The window now draws on the low-power GPU: the built-in one on a laptop
+    with two, so a reset of the mining GPU does not touch it.
+    `WGPU_POWER_PREF=high` restores the old choice.
+  - The miner treats a lost GPU as an error instead of panicking. The app
+    logs it (`gpu_lost`), opens the GPU again every 5 seconds, and goes on
+    mining (`gpu_reopened`).
+  - If the app crashes while mining (a panic in the window), it starts a
+    new copy that waits for the old one to exit and starts mining on the
+    same GPU (`crash_restart`, `crash_restarted`). A copy that was itself
+    restarted does not restart again within 10 minutes.
+
+### Added
+
+- A failed release check is logged (`update_check_failed`), and a check
+  that used the feed is logged as `update_check_limited`, so both reach
+  Sentry.
+
+Not tested on Windows. The release-list fallback was tested against a local
+server that refuses the API; the real feed and download addresses were
+checked by hand. The restart after a crash was tested on Linux with a
+deliberate panic; a real GPU reset could not be caused here.
+
+Consensus: no.
+
 ## 2.3.1 (2026-11-12)
 
 A patch. No consensus change.

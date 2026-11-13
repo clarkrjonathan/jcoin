@@ -108,6 +108,9 @@ Rules for MCP queries:
 | `transfer_sent` / `transfer_confirmed` / `transfer_received` | A transfer this node sent, confirmed, or received |
 | `pending_dropped` | A pending transfer left the mempool without confirming |
 | `update_started` / `update_installed` / `update_failed`, `installed` / `uninstalled` | Update and install flow |
+| `gpu_lost` / `gpu_reopened` | The GPU stopped answering while mining (driver reset, sleep); the miner opened it again (2.3.2+) |
+| `crash_restart` / `crash_restarted` / `crash_restart_skipped` / `crash_restart_failed` | The app crashed while mining and started a new copy, which mines again; skipped within 10 minutes of the last restart (2.3.2+) |
+| `update_check_failed` / `update_check_limited` | The release list could not be read; or GitHub's API refused it (rate limit) and the releases feed was read instead (2.3.2+) |
 | `dial_failed`, `stream_failed`, `listening`, `block_candidate` | Routine; noise for most questions. A repeated failed dial (same `peer` + `reason`) reaches Sentry once per `run` |
 
 ## Common questions

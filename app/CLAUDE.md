@@ -12,7 +12,8 @@ end-to-end test (mine, send, confirm on a private regtest chain).
 | `src/backend.rs` | Everything behind the window: `Settings` (environment overrides), `Backend` (keys, sending, mining, GPU limit, diagnostics), the node thread, the poller that reads the node's REST endpoints into `NodeView` |
 | `src/api.rs` | The local API (axum on 127.0.0.1): `start`, the port and token files, one handler per endpoint with its OpenAPI annotation, `ApiDoc`; its test drives every endpoint that does not end the process |
 | `src/install.rs` | Per-user install: `Layout`, `Placement` (this copy relative to the installed one), menu entry, uninstall |
-| `src/update.rs` | Release list, checksum check, replacing the program file, `Updates` (the check and install the window and the API share) |
+| `src/update.rs` | Release list (API, then the releases feed when rate-limited), checksum check, replacing the program file, `Updates` (the check and install the window and the API share) |
+| `src/recover.rs` | Restart after a crash while mining: panic hook, `--after-crash`, waiting for the old copy |
 | `src/telemetry.rs` | Sentry setup, tags, `classify` (log line to `component` and `event`) |
 | `src/applog.rs` | The log file and the in-memory tail |
 

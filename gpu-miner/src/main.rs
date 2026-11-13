@@ -118,14 +118,17 @@ fn main() {
     if cli.limit < 100 {
         println!("GPU use limited to {}%", cli.limit);
     }
-    mine(
+    if let Err(e) = mine(
         &gpu,
         &cli.node,
         miner,
         batch,
         Duration::from_secs(cli.refresh),
         &control,
-    );
+    ) {
+        eprintln!("[gpu] {e}");
+        std::process::exit(1);
+    }
 }
 
 fn random_header(rng: &mut impl Rng) -> [u8; HEADER_LEN] {
@@ -177,7 +180,7 @@ fn self_test(gpu: &Gpu, cases: u32, verbose: bool) -> bool {
             easy
         };
         let work = gpu_work(&header, &target);
-        let got = gpu.search(&work, hi, lo_base, count);
+        let got = gpu.search(&work, hi, lo_base, count).expect("GPU search");
         let want = (0..count).map(|i| lo_base + i).find(|&lo| {
             meets_target(&header, ((hi as u64) << 32) | lo as u64, &target)
         });
@@ -192,7 +195,7 @@ fn self_test(gpu: &Gpu, cases: u32, verbose: bool) -> bool {
     }
     // A target no hash can meet: the GPU must report nothing.
     let header = random_header(&mut rng);
-    let none = gpu.search(&gpu_work(&header, &[0u8; 32]), 0, 0, count);
+    let none = gpu.search(&gpu_work(&header, &[0u8; 32]), 0, 0, count).expect("GPU search");
     ok &= none.is_none();
     if verbose || none.is_some() {
         println!("zero target: gpu {none:?} {}", if none.is_none() { "ok" } else { "MISMATCH" });
@@ -291,7 +294,7 @@ fn bench_matrix(adapter: Option<usize>, secs: u64) -> bool {
 fn bench(gpu: &Gpu, batch: u32, secs: u64, limit: u32) -> f64 {
     let mut rng = rand::thread_rng();
     let work = gpu_work(&random_header(&mut rng), &[0u8; 32]);
-    gpu.search(&work, 0, 0, batch); // warm-up: pipeline creation, first submit
+    gpu.search(&work, 0, 0, batch).expect("GPU search"); // warm-up: pipeline creation, first submit
     let start = Instant::now();
     let mut hashes = 0u64;
     let mut lo = 0u32;
@@ -300,7 +303,7 @@ fn bench(gpu: &Gpu, batch: u32, secs: u64, limit: u32) -> f64 {
             lo = 0;
         }
         let dispatched = Instant::now();
-        gpu.search(&work, 1, lo, batch);
+        gpu.search(&work, 1, lo, batch).expect("GPU search");
         std::thread::sleep(rest_after(dispatched.elapsed(), limit));
         lo = lo.wrapping_add(batch);
         hashes += batch as u64;
