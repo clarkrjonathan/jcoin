@@ -113,16 +113,101 @@ fn client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| format!("cannot create the HTTP client: {e}"))
 }
 
-/// Ask GitHub for the releases that have a build for this system.
+/// The tag and date (`YYYY-MM-DD`) of each release in GitHub's Atom feed of
+/// releases, in feed order. The tag is read from the entry's link
+/// (`.../releases/tag/<tag>`), since the title is the release's name.
+fn feed_entries(feed: &str) -> Vec<(String, String)> {
+    let between = |text: &str, start: &str, end: &str| -> Option<String> {
+        let from = text.find(start)? + start.len();
+        Some(text[from..][..text[from..].find(end)?].to_string())
+    };
+    feed.split("<entry>")
+        .skip(1)
+        .filter_map(|entry| {
+            let tag = between(entry, "/releases/tag/", "\"")?;
+            let date = between(entry, "<updated>", "</updated>").unwrap_or_default();
+            Some((tag, date.chars().take(10).collect()))
+        })
+        .collect()
+}
+
+/// Where a repository's releases are read from: the API's release list, the
+/// releases feed, and the base of the file download addresses.
+struct Source {
+    api: String,
+    feed: String,
+    downloads: String,
+}
+
+impl Source {
+    fn github() -> Source {
+        Source {
+            api: format!("https://api.github.com/repos/{REPOSITORY}/releases?per_page=30"),
+            feed: format!("https://github.com/{REPOSITORY}/releases.atom"),
+            downloads: format!("https://github.com/{REPOSITORY}/releases/download"),
+        }
+    }
+}
+
+/// Ask GitHub for the releases that have a build for this system. A failure
+/// is logged as well as returned, so it reaches the reports.
 pub fn fetch_releases() -> Result<Vec<Release>, String> {
+    let result = fetch_from(&Source::github());
+    if let Err(e) = &result {
+        jcoin::log_error!(
+            [("event", "update_check_failed".to_string()), ("reason", e.clone())];
+            "[app] update check failed: {e}"
+        );
+    }
+    result
+}
+
+/// The API's release list first. Without signing in, GitHub allows 60 API
+/// requests an hour from one internet address, shared by everyone behind it
+/// (a dormitory or campus network uses them up). When it refuses (403 or
+/// 429), the releases feed is read instead: it is not limited that way, but
+/// it lists only the newest 10 releases, does not say which files they have,
+/// and does not mark prereleases (this project publishes none).
+fn fetch_from(source: &Source) -> Result<Vec<Release>, String> {
     let (program, sums) = asset_names().ok_or("there are no builds for this system")?;
-    let reply: serde_json::Value = client(Duration::from_secs(15))?
-        .get(format!("https://api.github.com/repos/{REPOSITORY}/releases?per_page=30"))
+    let http = client(Duration::from_secs(15))?;
+    let refused = match http
+        .get(&source.api)
         .send()
         .and_then(|r| r.error_for_status())
-        .and_then(|r| r.json())
-        .map_err(|e| format!("cannot read the release list: {e}"))?;
-    Ok(releases_from(&reply, program, sums))
+        .and_then(|r| r.json::<serde_json::Value>())
+    {
+        Ok(reply) => return Ok(releases_from(&reply, program, sums)),
+        Err(e) if matches!(e.status().map(|s| s.as_u16()), Some(403 | 429)) => e,
+        Err(e) => return Err(format!("cannot read the release list: {e}")),
+    };
+    jcoin::log_info!(
+        [("event", "update_check_limited".to_string()), ("reason", refused.to_string())];
+        "[app] update check: GitHub refused the release list ({refused}); reading the releases feed"
+    );
+    let get = |url: &str| http.get(url).send().and_then(|r| r.error_for_status());
+    let feed = get(&source.feed)
+        .and_then(|r| r.text())
+        .map_err(|e| format!("GitHub refused the release list (rate limit) and the releases feed cannot be read: {e}"))?;
+    let mut list = Vec::new();
+    for (tag, date) in feed_entries(&feed) {
+        if parse_version(&tag).is_none() {
+            continue;
+        }
+        let url_of = |name: &str| format!("{}/{tag}/{name}", source.downloads);
+        // A release has a build for this system if its checksum list for this
+        // system names the program. A missing list (404) means it has none.
+        let listed = match get(&url_of(sums)).and_then(|r| r.text()) {
+            Ok(text) => expected_hash(&text, program).is_some(),
+            Err(e) if e.status().map(|s| s.as_u16()) == Some(404) => false,
+            Err(e) => return Err(format!("cannot read the checksum list of {tag}: {e}")),
+        };
+        if listed {
+            list.push(Release { program_url: url_of(program), sums_url: url_of(sums), tag, date });
+        }
+    }
+    list.sort_by_key(|r| std::cmp::Reverse(parse_version(&r.tag)));
+    Ok(list)
 }
 
 /// Download `release`, check it, and put it in place of the running program
@@ -283,6 +368,103 @@ mod tests {
         // The default selection (0) stays in range and points at the newer one.
         let selected = 0usize.min(second.len().saturating_sub(1));
         assert!(second[selected].is_newer());
+    }
+
+    /// A local HTTP server that answers each path from `routes` (status,
+    /// body), and 404 for any other. Returns its base address.
+    fn serve(routes: Vec<(String, u16, String)>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&request);
+                let path = text.split(' ').nth(1).unwrap_or("").to_string();
+                let (status, body) = routes
+                    .iter()
+                    .find(|(p, _, _)| *p == path)
+                    .map(|(_, s, b)| (*s, b.clone()))
+                    .unwrap_or((404, "Not Found".to_string()));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        base
+    }
+
+    fn feed_entry(tag: &str, date: &str) -> String {
+        format!(
+            "<entry>\n<id>tag:github.com,2008:Repository/1/{tag}</id>\n<updated>{date}T09:50:13Z</updated>\n\
+             <link rel=\"alternate\" type=\"text/html\" href=\"https://github.com/o/r/releases/tag/{tag}\"/>\n\
+             <title>Release {tag}</title>\n<content>No content.</content>\n</entry>\n"
+        )
+    }
+
+    #[test]
+    fn the_feed_gives_tags_from_links_and_dates() {
+        let feed = format!(
+            "<feed><id>x</id><updated>2026-11-12T00:00:00Z</updated>{}{}</feed>",
+            feed_entry("v2.3.1", "2026-11-12"),
+            feed_entry("v2.3.0", "2026-11-11")
+        );
+        assert_eq!(
+            feed_entries(&feed),
+            [("v2.3.1".to_string(), "2026-11-12".to_string()), ("v2.3.0".to_string(), "2026-11-11".to_string())]
+        );
+        assert!(feed_entries("<html>rate limited</html>").is_empty());
+    }
+
+    #[test]
+    fn a_rate_limited_api_falls_back_to_the_feed() {
+        let (program, sums) = asset_names().unwrap();
+        let feed = format!(
+            "<feed>{}{}{}{}</feed>",
+            feed_entry("v2.3.1", "2026-11-12"),
+            feed_entry("v2.3.0", "2026-11-11"),
+            feed_entry("v2.2.0", "2026-11-10"),
+            feed_entry("nightly", "2026-11-09"),
+        );
+        let hash = "a".repeat(64);
+        let routes = |api_status: u16| {
+            vec![
+                ("/api".to_string(), api_status, r#"{"message":"API rate limit exceeded"}"#.to_string()),
+                ("/feed".to_string(), 200, feed.clone()),
+                // v2.3.1 has this system's build; v2.3.0's list names another
+                // file; v2.2.0 has no list for this system (404).
+                (format!("/dl/v2.3.1/{sums}"), 200, format!("{hash}  {program}\n")),
+                (format!("/dl/v2.3.0/{sums}"), 200, format!("{hash}  other\n")),
+            ]
+        };
+        let source = |base: &str| Source {
+            api: format!("{base}/api"),
+            feed: format!("{base}/feed"),
+            downloads: format!("{base}/dl"),
+        };
+        for status in [403, 429] {
+            let base = serve(routes(status));
+            let list = fetch_from(&source(&base)).unwrap();
+            let tags: Vec<&str> = list.iter().map(|r| r.tag.as_str()).collect();
+            assert_eq!(tags, ["v2.3.1"], "after {status}");
+            assert_eq!(list[0].date, "2026-11-12");
+            assert_eq!(list[0].program_url, format!("{base}/dl/v2.3.1/{program}"));
+            assert_eq!(list[0].sums_url, format!("{base}/dl/v2.3.1/{sums}"));
+        }
+        // Another failure of the API is reported, not hidden by the feed.
+        let base = serve(routes(500));
+        let e = fetch_from(&source(&base)).unwrap_err();
+        assert!(e.starts_with("cannot read the release list"), "{e}");
     }
 
     #[test]

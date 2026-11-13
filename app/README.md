@@ -159,6 +159,14 @@ renames the running program to `<name>.old`, puts the download in its place,
 and starts it. The checksum catches a damaged download; it does not prove who
 built the file.
 
+The list comes from GitHub's API, which allows 60 requests an hour from one
+internet address without signing in, shared by everyone behind it. When the
+API refuses (403 or 429), the app reads the releases feed
+(`github.com/<repo>/releases.atom`) instead: the newest 10 releases, each
+offered if its checksum list for this system names the program. A failed
+check is logged as `update_check_failed`, a check that used the feed as
+`update_check_limited`.
+
 The release list must be readable without signing in, so the repository (or a
 separate releases repository) must be public. The app's version in
 `app/Cargo.toml` must equal the release tag without the `v`; the release
