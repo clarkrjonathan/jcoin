@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::block::{Block, BlockHeader, MAX_FUTURE_DRIFT};
+use crate::block::{Block, BlockHeader, MAX_FUTURE_DRIFT, MAX_TXS};
 use crate::chain::{Accept, Chain};
 use crate::consensus::{BlockContext, Params};
 use crate::mempool::{Admitted, Mempool, SeenCache, MAX_MEMPOOL, SEEN_CAPACITY};
@@ -111,7 +111,8 @@ pub enum BlockOutcome {
 pub struct MiningJob {
     pub parent: BlockHeader,
     pub parent_state: State,
-    pub normal: Option<Transaction>,
+    /// The pending transactions to include, in order (up to `MAX_TXS`).
+    pub normals: Vec<Transaction>,
     /// What consensus requires of the block (height, reward, target, minimum
     /// timestamp), from the same function that validates it.
     pub context: BlockContext,
@@ -361,11 +362,11 @@ pub async fn run_node(
 
             NodeRequest::GetMiningJob { reply } => {
                 let parent = chain.tip_header();
-                let normal = mempool.best_applicable(chain.tip_state());
+                let normals = mempool.select_for_block(chain.tip_state(), MAX_TXS);
                 let _ = reply.send(MiningJob {
                     parent,
                     parent_state: chain.tip_state().clone(),
-                    normal,
+                    normals,
                     context: chain.next_context(),
                 });
             }
@@ -519,7 +520,7 @@ mod tests {
             &j1.parent_state,
             REGTEST.initial_reward,
             miner,
-            j1.normal,
+            j1.normals,
             REGTEST.pow_limit,
             1,
         )
@@ -549,13 +550,13 @@ mod tests {
 
         // Block 2: the job should now carry the mempool tx.
         let j2 = get_job(&core).await;
-        assert!(j2.normal.is_some(), "mining job did not include the mempool tx");
+        assert_eq!(j2.normals.len(), 1, "mining job did not include the mempool tx");
         let (b2, _) = build_and_mine(
             &j2.parent,
             &j2.parent_state,
             REGTEST.initial_reward,
             miner,
-            j2.normal,
+            j2.normals,
             REGTEST.pow_limit,
             2,
         )
@@ -659,7 +660,7 @@ mod tests {
                 &job.parent_state,
                 job.context.reward,
                 [7u8; 32],
-                job.normal,
+                job.normals,
                 job.context.target,
                 timestamp.max(job.context.min_timestamp),
             )
@@ -697,16 +698,17 @@ mod tests {
             ));
         }
 
-        // Three mined blocks carry the three transfers in order.
-        for expected_nonce in 0..3u64 {
-            let job = get_job(&core).await;
-            assert_eq!(job.normal.as_ref().map(|t| t.nonce), Some(expected_nonce));
-            assert!(matches!(submit_block(&core, mine(job)).await, BlockOutcome::Accepted { .. }));
-        }
+        // One mined block carries all three transfers, in nonce order.
+        let job = get_job(&core).await;
+        let nonces: Vec<u64> = job.normals.iter().map(|t| t.nonce).collect();
+        assert_eq!(nonces, [0, 1, 2]);
+        let block = mine(job);
+        assert_eq!(block.transactions[0].amount, REGTEST.initial_reward + 3, "fees go to the miner");
+        assert!(matches!(submit_block(&core, block).await, BlockOutcome::Accepted { .. }));
         let info = account(&core, sender).await;
         assert_eq!((info.nonce, info.next_nonce, info.pending_debit), (3, 3, 0));
         assert_eq!(info.balance, REGTEST.initial_reward - 33);
-        assert!(get_job(&core).await.normal.is_none());
+        assert!(get_job(&core).await.normals.is_empty());
     }
 
     #[tokio::test]

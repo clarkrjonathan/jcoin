@@ -312,15 +312,55 @@ impl Mempool {
             .collect()
     }
 
-    /// The pending transaction to mine next on top of `state`: among those that
+    /// The first transaction `select_for_block` would take: among those that
     /// apply now (the head of each sender's chain), the highest fee, with ties
     /// broken by the smallest id so the choice is deterministic.
     pub fn best_applicable(&self, state: &State) -> Option<Transaction> {
-        self.by_id
-            .iter()
-            .filter(|(_, tx)| state.check(tx).is_ok())
-            .max_by(|(a_id, a), (b_id, b)| a.fee.cmp(&b.fee).then(b_id.cmp(a_id)))
-            .map(|(_, tx)| tx.clone())
+        self.select_for_block(state, 1).into_iter().next()
+    }
+
+    /// Up to `max` pending transactions for one block on top of `state`, in
+    /// the order to apply them. Each step takes, among the next transaction
+    /// of every sender's chain that applies to the state left by the ones
+    /// already taken, the highest fee (ties: the smallest id). So each
+    /// sender's transactions go in nonce order, and the body applies in full.
+    pub fn select_for_block(&self, state: &State, max: usize) -> Vec<Transaction> {
+        let mut working = state.clone();
+        // Each sender's pending ids in nonce order, and how many are taken.
+        let chains: Vec<Vec<&TxId>> = self.by_sender.values().map(|c| c.values().collect()).collect();
+        let mut taken = vec![0usize; chains.len()];
+        let mut picked = Vec::new();
+        while picked.len() < max {
+            let mut best: Option<(usize, &TxId, &Transaction)> = None;
+            for (i, chain) in chains.iter().enumerate() {
+                // Skip what the state already includes (confirmed nonces).
+                while let Some(id) = chain.get(taken[i]) {
+                    match self.by_id.get(*id) {
+                        Some(tx) if tx.nonce < working.nonce(&tx.sender) => taken[i] += 1,
+                        _ => break,
+                    }
+                }
+                let Some(id) = chain.get(taken[i]) else { continue };
+                let Some(tx) = self.by_id.get(*id) else { continue };
+                if working.check(tx).is_err() {
+                    continue;
+                }
+                let better = match best {
+                    None => true,
+                    Some((_, best_id, best_tx)) => tx.fee > best_tx.fee || (tx.fee == best_tx.fee && *id < best_id),
+                };
+                if better {
+                    best = Some((i, id, tx));
+                }
+            }
+            let Some((i, _, tx)) = best else { break };
+            if working.apply(tx).is_err() {
+                break; // `check` passed, so this does not happen
+            }
+            picked.push(tx.clone());
+            taken[i] += 1;
+        }
+        picked
     }
 
     /// Re-check every sender's pending chain against `state` (the new tip):
@@ -640,6 +680,60 @@ mod tests {
         pool.insert(tx(2, 1, 5, 50), &state).unwrap();
         let best = pool.best_applicable(&state).unwrap();
         assert_eq!((best.sender, best.nonce), ([2u8; 32], 0));
+    }
+
+    /// A block takes every sender's chain in nonce order: at each step the
+    /// highest fee among the transactions that apply next, so a sender's later
+    /// transaction with a high fee follows its earlier one at once.
+    #[test]
+    fn a_block_takes_chains_in_nonce_order_by_fee() {
+        let state = funded();
+        let mut pool = Mempool::new(10);
+        pool.insert(tx(1, 0, 5, 1), &state).unwrap();
+        pool.insert(tx(2, 0, 5, 9), &state).unwrap();
+        pool.insert(tx(3, 0, 5, 4), &state).unwrap();
+        pool.insert(tx(2, 1, 5, 50), &state).unwrap();
+        let order = |txs: Vec<Transaction>| -> Vec<(u8, u64)> { txs.iter().map(|t| (t.sender[0], t.nonce)).collect() };
+        assert_eq!(order(pool.select_for_block(&state, 64)), [(2, 0), (2, 1), (3, 0), (1, 0)]);
+        assert_eq!(order(pool.select_for_block(&state, 2)), [(2, 0), (2, 1)], "capped at max");
+        assert!(pool.select_for_block(&state, 0).is_empty());
+    }
+
+    /// What the state no longer allows is left out: a sender that cannot pay
+    /// on this state, and a chain's transactions the state already includes.
+    #[test]
+    fn a_block_leaves_out_what_does_not_apply() {
+        let state = funded();
+        let mut pool = Mempool::new(10);
+        pool.insert(tx(1, 0, 5, 0), &state).unwrap();
+        pool.insert(tx(1, 1, 5, 0), &state).unwrap();
+        pool.insert(tx(3, 0, 5, 0), &state).unwrap();
+
+        // Sender 3 holds nothing here; sender 1's nonce 0 is already in.
+        let mut other = State::new();
+        other.apply(&Transaction::coinbase([1u8; 32], REWARD)).unwrap();
+        other.apply(&tx(1, 0, 5, 0)).unwrap();
+        let picked = pool.select_for_block(&other, 64);
+        assert_eq!(picked.iter().map(|t| (t.sender[0], t.nonce)).collect::<Vec<_>>(), [(1, 1)]);
+    }
+
+    /// More pending than fits (3 senders x 25) fills a block up to `MAX_TXS`,
+    /// each sender's part in nonce order; the rest waits.
+    #[test]
+    fn a_block_holds_at_most_max_txs() {
+        let state = funded();
+        let mut pool = Mempool::new(200);
+        for sender in [1u8, 2, 3] {
+            for nonce in 0..MAX_PENDING_PER_SENDER as u64 {
+                pool.insert(tx(sender, nonce, 1, 0), &state).unwrap();
+            }
+        }
+        let picked = pool.select_for_block(&state, crate::block::MAX_TXS);
+        assert_eq!(picked.len(), crate::block::MAX_TXS);
+        for sender in [1u8, 2, 3] {
+            let nonces: Vec<u64> = picked.iter().filter(|t| t.sender[0] == sender).map(|t| t.nonce).collect();
+            assert!(nonces.iter().enumerate().all(|(i, n)| *n == i as u64), "sender {sender}: {nonces:?}");
+        }
     }
 
     // Mining the head moves the chain forward: the included transaction goes,

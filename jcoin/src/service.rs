@@ -290,7 +290,7 @@ async fn new_template(
     let MiningJob {
         parent,
         parent_state,
-        normal,
+        normals,
         context,
     } = job_rx.await.ok()?;
 
@@ -307,7 +307,7 @@ async fn new_template(
             &parent_state,
             context.reward,
             miner,
-            normal,
+            normals,
             // The stall fallback makes the required target depend on the
             // block's own timestamp.
             context.target_at(timestamp),

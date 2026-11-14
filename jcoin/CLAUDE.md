@@ -12,7 +12,7 @@ or `tools/check jcoin` from the repository root.
 | `src/block.rs` | Header (156 bytes), `Block`, `validate_and_apply` (the whole deterministic rule set), `assemble_block`, `build_and_mine`, `mine_chunk`, `MAX_FUTURE_DRIFT`, `MAX_TXS` |
 | `src/chain.rs` | Block store, fork choice by cumulative work, `MAX_REORG_DEPTH` and `prune` (bounded forks), `lwma_next_target` (difficulty rule), `context_for_child`, `work_since`; the chain simulations are in its tests |
 | `src/state.rs` | Account balances and nonces, `state_root` |
-| `src/mempool.rs` | Pending transfers by sender and nonce, the out-of-order hold, `pending`, `best_applicable`, `prune` |
+| `src/mempool.rs` | Pending transfers by sender and nonce, the out-of-order hold, `pending`, `select_for_block` (a block's transfers), `prune` |
 | `src/node.rs` | Node core: `NodeRequest`, `run_node` (owns chain, mempool, signals; replays `blocks.dat`, keeps `pending.dat`; re-queues transfers after a reorg) |
 | `src/signal.rs` | Counts refused blocks with a newer version and real work (`Signals`, `Level`) |
 | `src/service.rs` | The node as an embeddable service: `ServiceConfig`, `run`, REST handlers, built-in CPU miner |
@@ -35,8 +35,9 @@ REST routes (`service.rs`): `POST /wallet/transaction`,
 
 ## Consensus facts (version 3, since 2.2.0)
 
-- Account model. A block is a coinbase plus up to 64 transfers; the miners
-  pack at most one.
+- Account model. A block is a coinbase plus up to 64 transfers (`MAX_TXS`);
+  the node's mining template fills it from the mempool
+  (`Mempool::select_for_block`).
 - Proof of work: `SHA256(header) < target`. Fork choice: most cumulative work.
 - Difficulty: LWMA over 30 blocks, one solve time capped at 6 x 300 s,
   adjusting from block 1. Stall fallback: the target doubles when a block's

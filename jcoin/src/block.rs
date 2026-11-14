@@ -303,28 +303,34 @@ impl Block {
 
 /// Assemble the next block on top of `parent` without searching for a nonce.
 ///
-/// Builds the coinbase (reward plus the normal transaction's fee) to `miner`,
+/// Builds the coinbase (reward plus the normal transactions' fees) to `miner`,
 /// applies the body to the parent state, and returns a header with `nonce = 0`
-/// plus the body and resulting state. The caller searches nonces (all at once
-/// with `build_and_mine`, or in chunks with `mine_chunk` so mining can be
-/// abandoned when the chain moves).
+/// plus the body and resulting state. `normals` are applied in the order
+/// given (an `Option` works for zero or one); more than `MAX_TXS` is an error.
+/// The caller searches nonces (all at once with `build_and_mine`, or in
+/// chunks with `mine_chunk` so mining can be abandoned when the chain moves).
 pub fn assemble_block(
     parent: &BlockHeader,
     parent_state: &State,
     reward: u64,
     miner: [u8; 32],
-    normal: Option<Transaction>,
+    normals: impl IntoIterator<Item = Transaction>,
     target: [u8; 32],
     timestamp: u64,
 ) -> Result<(BlockHeader, Vec<Transaction>, State), BlockError> {
-    let fees = normal.as_ref().map(|t| t.fee).unwrap_or(0);
+    let normals: Vec<Transaction> = normals.into_iter().collect();
+    if normals.len() > MAX_TXS {
+        return Err(BlockError::BadBody);
+    }
+    let fees = normals
+        .iter()
+        .try_fold(0u64, |sum, t| sum.checked_add(t.fee))
+        .ok_or(BlockError::CoinbaseTooLarge)?;
     let coinbase_amount = reward.checked_add(fees).ok_or(BlockError::CoinbaseTooLarge)?;
     let coinbase = Transaction::coinbase(miner, coinbase_amount);
 
     let mut transactions = vec![coinbase];
-    if let Some(tx) = normal {
-        transactions.push(tx);
-    }
+    transactions.extend(normals);
 
     // Apply normals then coinbase to get the resulting state and its root.
     let mut state = parent_state.clone();
@@ -370,12 +376,12 @@ pub fn build_and_mine(
     parent_state: &State,
     reward: u64,
     miner: [u8; 32],
-    normal: Option<Transaction>,
+    normals: impl IntoIterator<Item = Transaction>,
     target: [u8; 32],
     timestamp: u64,
 ) -> Result<(Block, State), BlockError> {
     let (mut header, transactions, state) =
-        assemble_block(parent, parent_state, reward, miner, normal, target, timestamp)?;
+        assemble_block(parent, parent_state, reward, miner, normals, target, timestamp)?;
     while !header.meets_target() {
         header.nonce = header.nonce.wrapping_add(1);
     }
@@ -450,6 +456,52 @@ mod tests {
             .unwrap();
         assert_eq!(applied.balance(&miner), REGTEST.initial_reward);
         assert_eq!(new_state.balance(&miner), REGTEST.initial_reward);
+    }
+
+    /// Several transfers from two senders, one sending two in nonce order, in
+    /// one block: it validates, and the miner gets the reward plus every fee.
+    /// More than `MAX_TXS` cannot be assembled.
+    #[test]
+    fn block_with_many_transfers_validates() {
+        let genesis = Block::genesis(&REGTEST);
+        let (a, b) = (SigningKey::generate(&mut OsRng), SigningKey::generate(&mut OsRng));
+        let (b1, s1) = build_and_mine(
+            &genesis.header, &State::new(), REGTEST.initial_reward,
+            a.verifying_key().to_bytes(), None, REGTEST.pow_limit, 1,
+        )
+        .unwrap();
+        let (b2, s2) = build_and_mine(
+            &b1.header, &s1, REGTEST.initial_reward,
+            b.verifying_key().to_bytes(), None, REGTEST.pow_limit, 2,
+        )
+        .unwrap();
+        let signed = |key: &SigningKey, nonce: u64, fee: u64| {
+            let mut tx = Transaction {
+                tx_type: crate::tx_type::NORMAL,
+                sender: key.verifying_key().to_bytes(),
+                recipient: [9u8; 32],
+                amount: 10,
+                fee,
+                nonce,
+                signature: [0u8; 64],
+            };
+            tx.signature = key.sign(&tx.signing_bytes()).to_bytes();
+            tx
+        };
+        let txs = vec![signed(&a, 0, 1), signed(&b, 0, 2), signed(&a, 1, 3)];
+        let (b3, s3) =
+            build_and_mine(&b2.header, &s2, REGTEST.initial_reward, [8u8; 32], txs, REGTEST.pow_limit, 3)
+                .unwrap();
+        assert_eq!(b3.transactions.len(), 4);
+        validate_with(&b3, &b2.header, &s2, REGTEST.initial_reward, &REGTEST.pow_limit).unwrap();
+        assert_eq!(s3.balance(&[9u8; 32]), 30);
+        assert_eq!(s3.balance(&[8u8; 32]), REGTEST.initial_reward + 6);
+
+        let too_many: Vec<Transaction> = (0..=MAX_TXS as u64).map(|n| signed(&a, n, 0)).collect();
+        assert!(matches!(
+            assemble_block(&b2.header, &s2, REGTEST.initial_reward, [8u8; 32], too_many, REGTEST.pow_limit, 3),
+            Err(BlockError::BadBody)
+        ));
     }
 
     #[test]
