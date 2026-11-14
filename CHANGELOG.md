@@ -10,6 +10,27 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.4.2 (2026-11-14)
+
+A patch. No consensus change.
+
+### Changed
+
+- A mined block carries up to 64 transfers instead of one. The node's
+  mining template (used by the app's GPU miner, `gpu-miner`, and the
+  command-line node's `--mine`) takes pending transfers highest fee first,
+  each sender's in nonce order, each checked against the state the ones
+  before it leave, and the miner receives every fee. The rules have allowed
+  64 since 2.0; older nodes accept these blocks. Until a miner updates, its
+  blocks still carry one transfer.
+
+Not tested on Windows. Tested by unit tests (selection order, the 64 cap,
+transfers that no longer apply, a block from two senders validated in full)
+and on a local network, where three transfers from one sender, mined by the
+GPU miner, landed in one block that the second node accepted.
+
+Consensus: no.
+
 ## 2.4.1 (2026-11-14)
 
 A patch. No consensus change.
