@@ -10,6 +10,47 @@ Each entry says whether it affects **consensus**. A consensus change makes old
 and new nodes disagree on which blocks are valid, so every node must update.
 All other changes are compatible with older nodes on the same chain.
 
+## 2.4.1 (2026-11-14)
+
+A patch. No consensus change.
+
+### Added
+
+- Saved addresses for sending. Typing a valid address that is not saved
+  shows a field to save it under a name. The "Saved" list next to the
+  address field offers the saved addresses and up to five unsaved addresses
+  the key in use sent to recently. The "Sent" list shows a saved
+  recipient's name. "Saved addresses" lists them with Use and Remove. They
+  are stored in `addresses.txt` in the data folder. The local API has
+  `GET /api/addresses`, `POST /api/addresses` and
+  `DELETE /api/addresses/{address}`.
+- Nodes keep their address book in `peers.txt` in the data folder and read
+  it at start, so a restarted node reconnects to its saved peers without
+  the relay or `--peer`. Every 10 seconds a node dials from the book, each
+  address at most once every 10 minutes: the direct addresses of peers it
+  reaches only through the relay, then, while below its peer cap, random
+  addresses of peers it is not connected to. A relayed connection to a
+  node with a public address therefore becomes direct even if the first
+  direct dial failed. An address is dropped after 7 days unless the peer it
+  names sends it again or a dial to it succeeds.
+- `tools/public-node-deploy` installs a release on the public node on the
+  relay server. `tools/node-status --ssh relay|imac` reads those nodes.
+  `tools/local-net restart [norelay]` restarts the local nodes on their data.
+  `tools/chain-dump --balances` lists every address's confirmed balance.
+
+### Changed
+
+- Each `ADDR` message carries a random sample of the address book, not
+  mostly the same 64 entries.
+
+Not tested on Windows. The address book was tested by unit tests and by
+three local nodes that found each other through a local relay and, after a
+restart without the relay or `--peer`, reconnected from their saved books.
+Saved addresses were tested through the backend and API tests; the picture
+of the window was checked, clicks were not.
+
+Consensus: no.
+
 ## 2.4.0 (2026-11-13)
 
 A minor release for a new interface. No consensus change: 2.4.0 and 2.3.x
