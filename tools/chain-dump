@@ -10,6 +10,8 @@
                                    longest gap) and every transfer, instead
                                    of the block table; --not leaves out
                                    addresses (6+ hex characters each)
+  tools/chain-dump --balances      every address's confirmed balance (full
+                                   address, JEF, blocks mined), largest first
 
 Columns: height, time (UTC), seconds since the block before, difficulty in
 leading zero bits, miner (first 6 hex characters of the address), transfers.
@@ -47,6 +49,8 @@ def load(path):
             "target": int.from_bytes(h[116:148], "big"),
             # The coinbase is first: type (1), sender (32), recipient (32).
             "miner": body[33:65].hex()[:6] if len(body) >= TX else "?",
+            # Its amount is the reward plus the block's fees.
+            "coinbase": parse_tx(body[:TX]) if len(body) >= TX else None,
             "transfers": max(count - 1, 0),
             "txs": [parse_tx(body[i * TX:(i + 1) * TX]) for i in range(1, count) if len(body) >= (i + 1) * TX],
         }
@@ -93,6 +97,25 @@ def who(chain, skip):
         print(f"  h{b['height']}  {stamp(b['time'])}  {t['sender'][:6]} -> {t['recipient'][:6]}  {jef(t['amount'])} JEF (fee {jef(t['fee'])}, nonce {t['nonce']})")
 
 
+def balances(chain):
+    """Every address's confirmed balance from the chain: block rewards (with
+    fees) received, plus transfers received, less transfers sent and their
+    fees. Pending transfers are not counted."""
+    held, mined = {}, {}
+    for b in chain[1:]:
+        cb = b["coinbase"]
+        if cb:
+            held[cb["recipient"]] = held.get(cb["recipient"], 0) + cb["amount"]
+            mined[cb["recipient"]] = mined.get(cb["recipient"], 0) + 1
+        for t in b["txs"]:
+            held[t["sender"]] = held.get(t["sender"], 0) - t["amount"] - t["fee"]
+            held[t["recipient"]] = held.get(t["recipient"], 0) + t["amount"]
+    total = sum(held.values())
+    print(f"at height {chain[-1]['height']}: {jef(total)} JEF held by {len(held)} addresses")
+    for address, units in sorted(held.items(), key=lambda kv: -kv[1]):
+        print(f"  {address}  {jef(units):>10} JEF  {mined.get(address, 0):4d} blocks")
+
+
 def canonical(blocks):
     """The chain with the most work, oldest block first."""
     work = {}
@@ -128,6 +151,9 @@ def main():
     last = len(chain) - 1
     if "--who" in args:
         who(chain, skip)
+        return
+    if "--balances" in args:
+        balances(chain)
         return
     for i, b in enumerate(chain):
         if tail is not None:
