@@ -2,13 +2,18 @@
 """The state of a local node, in a few lines.
 
   tools/node-status [PORT] [ADDR] [--peers] [--blocks N] [--wait COND [SECS]]
-                    [--data DIR]
+                    [--data DIR] [--ssh SERVER]
 
   PORT        a node whose REST server is on 127.0.0.1:PORT; without it, the
               desktop app on this computer, through its local API (2.4.0 and
               later; the line then also says whether it mines), or for an
               older app its node, found from the app's log
   --data DIR  the app's data folder, for an app started with JCOIN_APP_DATA
+  --ssh SERVER  a node on another computer, read through an ssh tunnel to
+              its 127.0.0.1:PORT (PORT defaults to 3000). SERVER is `relay`
+              (the public node on ubuntu@3.14.123.27, key ~/jcoin-relay.pem),
+              `imac` (miner@ the address tools/imac-deploy last found, else
+              jcoin-miner.local), or USER@HOST
   ADDR        also the balance of this address (64 hex)
   --peers     one line per open connection: peer, label, direct or relayed,
               whether it carries a session, its address
@@ -25,7 +30,7 @@
 The first line always gives height, difficulty, connections, the newer-rules
 signal, and the balance if an address is known.
 """
-import json, math, os, re, sys, time, urllib.request
+import atexit, json, math, os, re, socket, subprocess, sys, time, urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jcoin_api  # noqa: E402
@@ -45,6 +50,39 @@ class Node:
                 return json.load(r)
         except Exception:
             return None
+
+
+def ssh_target(server):
+    """`ssh` arguments (options and USER@HOST) for a --ssh SERVER name."""
+    opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "-o", "LogLevel=ERROR",
+            "-o", "StrictHostKeyChecking=accept-new", "-o", "ExitOnForwardFailure=yes"]
+    if server == "relay":
+        return opts + ["-i", os.path.expanduser("~/jcoin-relay.pem"), "ubuntu@3.14.123.27"]
+    if server == "imac":
+        cache = os.path.expanduser("~/.cache/jcoin/imac-host")
+        host = open(cache).read().strip() if os.path.exists(cache) else "jcoin-miner.local"
+        return opts + [f"miner@{host}"]
+    return opts + [server]
+
+
+def tunnel(server, remote_port):
+    """Forward a free local port to the server's 127.0.0.1:remote_port for the
+    life of this program; returns the local port."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        local = s.getsockname()[1]
+    proc = subprocess.Popen(["ssh", "-N", "-L", f"{local}:127.0.0.1:{remote_port}", *ssh_target(server)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    atexit.register(proc.terminate)
+    for _ in range(80):
+        if proc.poll() is not None:
+            sys.exit(f"ssh to {server} failed: {proc.stderr.read().strip()[-300:]}")
+        try:
+            with socket.create_connection(("127.0.0.1", local), timeout=0.2):
+                return local
+        except OSError:
+            time.sleep(0.1)
+    sys.exit(f"ssh tunnel to {server} did not open")
 
 
 class App:
@@ -159,7 +197,7 @@ def main():
         return
     show_peers = "--peers" in argv
     argv = [a for a in argv if a != "--peers"]
-    blocks = wait = data = None
+    blocks = wait = data = server = None
     timeout = 60
     rest = []
     i = 0
@@ -170,6 +208,9 @@ def main():
             i += 2
         elif a == "--data":
             data = argv[i + 1]
+            i += 2
+        elif a == "--ssh":
+            server = argv[i + 1]
             i += 2
         elif a == "--wait":
             wait = argv[i + 1]
@@ -184,7 +225,10 @@ def main():
             i += 1
     port = rest[0] if rest else None
     address = rest[1] if len(rest) > 1 else None
-    if port is not None:
+    if server:
+        src = Node(tunnel(server, port or "3000"))
+        src.label = f"{server}:{port or 3000}"
+    elif port is not None:
         src = Node(port)
     else:
         api = jcoin_api.find(data)

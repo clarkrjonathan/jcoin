@@ -15,6 +15,27 @@
 > relay exits 1 at startup (libp2p reads network interfaces over netlink). The
 > fix is in `deploy/jcoin-relay.service`.
 
+## The public node on the same server
+
+A non-mining node runs next to the relay under the `jcoin-node` unit
+(`deploy/jcoin-node.service`). It listens on TCP 8333 and advertises
+`/ip4/3.14.123.27/tcp/8333`, so a home node behind NAT can dial it directly
+and it passes blocks and transfers between them, with no hole punching. It
+also registers with the relay's rendezvous, so apps that find it there get
+its direct address. Its REST server answers on 127.0.0.1:3000 only. Data
+(chain, address book, `node_key`) is in `/var/lib/jcoin-node`, a link to
+`/var/lib/private/jcoin-node` (the unit runs as a dynamic user). Its address:
+
+```
+/ip4/3.14.123.27/tcp/8333/p2p/12D3KooWM2SQ8eRiM2zg6prqcbFWARWgTTKESLqEdYEzMjY4jw2v
+```
+
+`tools/public-node-deploy [VERSION] --yes` installs a release program and the
+unit, adds a 1 GB swap file when there is none (the server has 412 MB of
+memory), restarts the node, rolls back if it does not start, and checks from
+this computer that port 8333 is open. The Lightsail firewall must allow TCP
+8333.
+
 
 The relay (`src/bin/relay.rs` → `p2p::relay_host`) is a chain-blind libp2p node:
 a circuit relay (v2) that carries encrypted connections for nodes behind NAT,

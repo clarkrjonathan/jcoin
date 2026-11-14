@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Put a release's node program on the relay server as a public node (no mining).
+
+  tools/public-node-deploy [VERSION]          say what it would do, and
+                                              whether port 8333 is open
+  tools/public-node-deploy [VERSION] --yes    do it
+
+VERSION defaults to the latest GitHub release. The server is
+ubuntu@3.14.123.27 with the key ~/jcoin-relay.pem.
+
+With --yes: downloads jcoin-node-linux-x86_64 and its checksum list, checks
+the checksum and the server's glibc, copies the program over and checks it
+again there, keeps the old one as /usr/local/bin/jcoin-node.prev, installs
+deploy/jcoin-node.service (public IP and the relay's address filled in) as
+the jcoin-node unit, adds a 1 GB swap file if the server has no swap, and
+restarts the unit. It then waits 15 s and checks that the unit runs and its
+REST server answers. If the unit does not start, the old program is put back
+and the unit's last log lines are printed. Last, it prints the node's
+address and checks from this computer that port 8333 is reachable (the
+Lightsail firewall must allow it). Exits non-zero on any failure.
+"""
+import os, re, socket, subprocess, sys, tempfile, time
+
+HOST = "3.14.123.27"
+USER = "ubuntu"
+KEY = os.path.expanduser("~/jcoin-relay.pem")
+UNIT = "jcoin-node"
+BIN = "/usr/local/bin/jcoin-node"
+ASSET = "jcoin-node-linux-x86_64"
+SUMS = "SHA256SUMS-linux-x86_64.txt"
+PORT = 8333
+SSH_OPTS = ["-i", KEY, "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR"]
+
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, check=True, input=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, input=input)
+    if check and r.returncode != 0:
+        fail(f"failed: {' '.join(cmd[:3])} ...: {(r.stderr or r.stdout).strip()[-400:]}")
+    return r
+
+
+def ssh(script, check=True):
+    return run(["ssh", *SSH_OPTS, f"{USER}@{HOST}", "bash -s"], check=check, input=script)
+
+
+def fields(text):
+    return {k: v.strip() for k, _, v in (l.partition(" ") for l in text.splitlines())}
+
+
+def remote_state():
+    return fields(ssh(f"""
+        echo "glibc $(ldd --version | sed -n '1s/.* \\([0-9]\\+\\.[0-9]\\+\\)$/\\1/p')"
+        echo "active $(systemctl is-active {UNIT})"
+        echo "sum $(sha256sum {BIN} 2>/dev/null | cut -d' ' -f1)"
+        echo "version $(cat /usr/local/share/jcoin-node.version 2>/dev/null)"
+        echo "swap $(swapon --show --noheadings | wc -l)"
+        echo "relay $(journalctl -u jcoin-relay --no-pager -o cat | grep -o 'reachable at /ip4/[^ ]*' | tail -1 | cut -d' ' -f3)"
+    """).stdout)
+
+
+def vkey(v):
+    return tuple(int(x) for x in v.split("."))
+
+
+def port_open():
+    try:
+        with socket.create_connection((HOST, PORT), timeout=5):
+            return True
+    except OSError:
+        return False
+
+
+def main():
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(__doc__.strip())
+        return
+    yes = "--yes" in args
+    rest = [a for a in args if a != "--yes"]
+    if len(rest) > 1 or any(a.startswith("-") for a in rest):
+        fail("usage: tools/public-node-deploy [VERSION] [--yes]")
+    os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    if not os.path.exists(KEY):
+        fail(f"no ssh key at {KEY}")
+    version = rest[0].lstrip("v") if rest else run(
+        ["gh", "release", "view", "--json", "tagName", "--jq", ".tagName"]).stdout.strip().lstrip("v")
+
+    before = remote_state()
+    relay = before.get("relay", "")
+    if not relay.startswith(f"/ip4/{HOST}/"):
+        fail(f"cannot read the relay's address from its log (got '{relay}'); nothing changed")
+    unit = open("deploy/jcoin-node.service").read()
+    unit = unit.replace("PUBLIC_IP", HOST).replace("RELAY_ADDR", relay)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run(["gh", "release", "download", f"v{version}", "-D", tmp, "-p", ASSET, "-p", SUMS])
+        expected = next((l.split()[0] for l in open(os.path.join(tmp, SUMS))
+                         if l.split()[-1].lstrip("*") == ASSET), "")
+        program = os.path.join(tmp, ASSET)
+        actual = run(["sha256sum", program]).stdout.split()[0]
+        if not expected or expected != actual:
+            fail(f"checksum mismatch (expected '{expected or 'none'}', got {actual}); nothing changed")
+        syms = run(["objdump", "-T", program]).stdout
+        need = max(re.findall(r"GLIBC_([0-9]+(?:\.[0-9]+)*)", syms), key=vkey, default="0")
+        current = "yes" if before.get("sum") == expected else "no"
+        print(f"server {HOST}: unit {before.get('active')}; installed "
+              f"{before.get('version') or 'nothing'} (this release: {current}); release {version}; "
+              f"swap {'yes' if before.get('swap', '0') != '0' else 'none (1 GB will be added)'}")
+        if vkey(need) > vkey(before.get("glibc") or "0"):
+            fail(f"{version} needs glibc {need}; the server has {before.get('glibc')}; nothing changed")
+        if not yes:
+            print(f"port {PORT} {'reachable' if port_open() else 'NOT reachable'} from here")
+            print("dry run: add --yes to install and restart")
+            return
+        unit_file = os.path.join(tmp, "jcoin-node.service")
+        with open(unit_file, "w") as f:
+            f.write(unit)
+        run(["scp", *SSH_OPTS, "-q", program, unit_file, f"{USER}@{HOST}:/tmp/"])
+
+    r = ssh(f"""
+        set -e
+        echo "{expected}  /tmp/{ASSET}" | sha256sum -c --quiet
+        if [ -z "$(swapon --show --noheadings)" ]; then
+          if [ ! -e /swapfile ]; then
+            sudo -n fallocate -l 1G /swapfile
+            sudo -n chmod 600 /swapfile
+            sudo -n mkswap /swapfile >/dev/null
+          fi
+          sudo -n swapon /swapfile
+          grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo -n tee -a /etc/fstab >/dev/null
+        fi
+        if [ -e {BIN} ]; then sudo -n cp -p {BIN} {BIN}.prev; fi
+        sudo -n install -m 755 /tmp/{ASSET} {BIN}.new
+        sudo -n mv -f {BIN}.new {BIN}
+        sudo -n install -m 644 /tmp/jcoin-node.service /etc/systemd/system/{UNIT}.service
+        rm -f /tmp/{ASSET} /tmp/jcoin-node.service
+        echo {version} | sudo -n tee /usr/local/share/jcoin-node.version >/dev/null
+        sudo -n systemctl daemon-reload
+        sudo -n systemctl enable --quiet {UNIT}
+        sudo -n systemctl restart {UNIT}
+    """, check=False)
+    if r.returncode != 0:
+        fail(f"install on the server failed: {(r.stderr or r.stdout).strip()[-400:]}")
+
+    time.sleep(15)
+    after = fields(ssh(f"""
+        echo "active $(systemctl is-active {UNIT})"
+        echo "restarts $(systemctl show -p NRestarts --value {UNIT})"
+        echo "chain $(curl -s -m 5 http://127.0.0.1:3000/chain | tr -d '\\n' | cut -c1-200)"
+        echo "peer $(journalctl -u {UNIT} --no-pager -o cat | grep -o 'peer id 12D3[A-Za-z0-9]*' | tail -1 | cut -d' ' -f3)"
+    """, check=False).stdout)
+    if after.get("active") != "active" or after.get("restarts", "0") not in ("0", "") or not after.get("chain"):
+        ssh(f"""
+            if [ -e {BIN}.prev ]; then sudo -n mv -f {BIN}.prev {BIN}; fi
+            echo {before.get('version') or 'none'} | sudo -n tee /usr/local/share/jcoin-node.version >/dev/null
+            sudo -n systemctl restart {UNIT}
+        """, check=False)
+        log = ssh(f"journalctl -u {UNIT} -n 8 -o cat --no-pager", check=False).stdout.strip()
+        fail(f"{version} did not stay running or its REST server did not answer; the old program is back.\n"
+             f"last log lines:\n{log}")
+    height = re.search(r'"height":\s*(\d+)', after["chain"])
+    print(f"{version} installed and running; height {height.group(1) if height else '?'}")
+    print(f"address: /ip4/{HOST}/tcp/{PORT}/p2p/{after.get('peer') or '?'}")
+    if not port_open():
+        fail(f"port {PORT} is not reachable from here: open TCP {PORT} in the Lightsail firewall "
+             "(instance jeffy-relay, Networking tab)")
+    print(f"port {PORT} reachable from here")
+
+
+if __name__ == "__main__":
+    main()

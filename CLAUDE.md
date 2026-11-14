@@ -56,15 +56,17 @@ Run these in place of composing commands. Each prints a few lines.
 | Is a failure new? | `tools/check --at main [PACKAGE]` (same checks on another commit) |
 | Is an intermittent test fixed? | `tools/repeat-test PACKAGE FILTER [N] [--ignored]` |
 | Release a version | `tools/release 2.2.1 --yes` (only when told; see the `release` skill) |
-| State of a local node or the app | `tools/node-status [PORT] [--peers] [--blocks N]` (the app through its API) |
+| State of a local node or the app | `tools/node-status [PORT] [--peers] [--blocks N]` (the app through its API; `--ssh relay` or `--ssh imac` for those servers' nodes) |
 | Read or drive the running app (anything the window does) | `tools/app-api [METHOD] PATH [JSON]`, `--paths` lists endpoints, `--docs` the Swagger page |
 | Wait for a node state | `tools/node-status PORT --wait direct\|peers=N\|height=N [SECS]` |
 | Read a chain file as a table | `tools/chain-dump [PATH] [--tail N]` |
 | Compare GPU kernels and batch sizes | `tools/gpu-bench [SECS] [--adapter N] [--pause-app]` (`--pause-app` stops the app's mining and starts it again after) |
 | Who mined, and every transfer | `tools/chain-dump --who [--not ADDR,...]` |
+| Every address's balance | `tools/chain-dump --balances` |
 | Update the installed app on this laptop | `tools/update-app [VERSION] --yes` (checks checksum and glibc; mining starts again by itself once the new version has the API) |
 | Put a release on the iMac and restart its mining | `tools/imac-deploy [VERSION] --yes` (finds the iMac on the LAN, rolls back if it does not start) |
-| Throwaway local nodes | `tools/local-net up [N] [mine] [relay]`, `status`, `peers`, `down` |
+| Put a release on the relay server's public node | `tools/public-node-deploy [VERSION] --yes` (rolls back if it does not start; checks port 8333 from here) |
+| Throwaway local nodes | `tools/local-net up [N] [mine] [relay]`, `restart [norelay]`, `status`, `peers`, `down` |
 | Picture of the app window | `tools/app-shot [--dev] [--tall] [--mainnet]` |
 | Friends' logs (Sentry) | the `sentry-logs` skill, `tools/sentry-logs` |
 | Diagnose one node's logs in one call | `tools/sentry-logs diagnose NODE` (also `status`, `peers`) |

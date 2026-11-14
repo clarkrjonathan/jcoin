@@ -33,9 +33,18 @@ states only what is true now.
   Sentry is untested.
 - Relay: AWS Lightsail `3.14.123.27:9000`, ssh `ubuntu@3.14.123.27` with
   `~/jcoin-relay.pem`. It runs the pre-2.1.1 relay program.
+- Public node on the same server: unit `jcoin-node` (no mining, 2.4.0,
+  data in `/var/lib/jcoin-node`), address
+  `/ip4/3.14.123.27/tcp/8333/p2p/12D3KooWM2SQ8eRiM2zg6prqcbFWARWgTTKESLqEdYEzMjY4jw2v`.
+  The Lightsail firewall allows TCP 8333. Its `node_key` is backed up in
+  `~/Documents/senior_year/jcoin-backups/public-node/`.
+  `tools/public-node-deploy --yes` installs a release. Read it with
+  `tools/node-status --ssh relay --peers`.
 - iMac reference node: `miner@jcoin-miner.local`, LAN only; its address
   changes with DHCP and mDNS does not always resolve it. It mines on the CPU
-  with the command-line node (unit `jcoin-node`). `tools/imac-deploy --yes`
+  with the command-line node (unit `jcoin-node`), rewards to Jonathan's
+  address `53e2e0…`; the `--miner` flag is in
+  `/etc/systemd/system/jcoin-node.service`. `tools/imac-deploy --yes`
   finds it, installs a release, and restarts it.
 
 **Pending operations**: `tools/planned show ops`.

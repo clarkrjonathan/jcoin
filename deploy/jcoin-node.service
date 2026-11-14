@@ -1,0 +1,31 @@
+[Unit]
+Description=JeffyCoin public node (no mining) next to the relay
+After=network-online.target jcoin-relay.service
+Wants=network-online.target
+
+[Service]
+# Installed by tools/public-node-deploy, which fills in PUBLIC_IP and
+# RELAY_ADDR. REST answers on 127.0.0.1 only. Peers dial port 8333 on the
+# public address; --advertise puts that address in its ADDR messages and its
+# rendezvous registration, so apps that find it through the relay dial it
+# directly. Inbound peers are not capped; --max-peers caps its own dials.
+ExecStart=/usr/local/bin/jcoin-node --rest-addr 127.0.0.1:3000 --p2p-addr 0.0.0.0:8333 --advertise /ip4/PUBLIC_IP/tcp/8333 --relay RELAY_ADDR --max-peers 32 --data-dir /var/lib/jcoin-node
+# The chain, pending transfers, the address book and node_key (its peer id,
+# part of its address) live here and survive restarts.
+StateDirectory=jcoin-node
+Restart=always
+RestartSec=3
+# The box has about 400 MB of memory; keep room for the relay.
+MemoryMax=250M
+
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# AF_NETLINK: libp2p reads the network interfaces over netlink at startup.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
