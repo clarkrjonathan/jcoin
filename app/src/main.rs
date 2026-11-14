@@ -25,6 +25,7 @@ use jcoin_gpu_miner::kernel::Kernel;
 
 use backend::{
     connection_kind, display_path, expected_seconds, short, span, zero_bits, Backend, MiningState, Settings,
+    MAX_ADDRESS_NAME,
 };
 
 fn main() -> eframe::Result {
@@ -63,11 +64,7 @@ struct App {
     backend: Result<Arc<Mutex<Backend>>, String>,
     /// Selected GPU: `None` lets the system choose.
     adapter: Option<usize>,
-    recipient: String,
-    amount: String,
-    fee: String,
-    /// Result of the last send: the transaction id, or the error.
-    send_result: Option<Result<String, String>>,
+    send: SendForm,
     keys: KeysForm,
     updates: update::Updates,
     /// Index of the selected release in the Updates list.
@@ -92,6 +89,20 @@ struct Install {
     error: Option<String>,
     /// The Uninstall button was pressed once and waits for confirmation.
     confirm_uninstall: bool,
+}
+
+/// Input fields and the last results of the Send section.
+#[derive(Default)]
+struct SendForm {
+    recipient: String,
+    amount: String,
+    fee: String,
+    /// Result of the last send: the transaction id, or the error.
+    result: Option<Result<String, String>>,
+    /// The name typed to save the address in `recipient`.
+    save_name: String,
+    /// What the last address-book action did, or why it failed.
+    book_result: Option<Result<String, String>>,
 }
 
 /// Input fields and the last result of the Keys section.
@@ -135,10 +146,7 @@ impl App {
         App {
             backend,
             adapter: resume_mining.flatten(),
-            recipient: String::new(),
-            amount: String::new(),
-            fee: String::new(),
-            send_result: None,
+            send: SendForm::default(),
             keys: KeysForm::default(),
             updates,
             release_selected: 0,
@@ -238,14 +246,7 @@ impl eframe::App for App {
                 ui.add_space(12.0);
                 mining_section(ui, backend, &mut self.adapter);
                 ui.add_space(12.0);
-                send_section(
-                    ui,
-                    backend,
-                    &mut self.recipient,
-                    &mut self.amount,
-                    &mut self.fee,
-                    &mut self.send_result,
-                );
+                send_section(ui, backend, &mut self.send);
                 ui.add_space(12.0);
                 updates_section(ui, &self.updates, &mut self.release_selected, backend, self.install.place.offer);
                 ui.add_space(12.0);
@@ -942,39 +943,89 @@ fn developer_section(
     });
 }
 
-fn send_section(
-    ui: &mut egui::Ui,
-    backend: &mut Backend,
-    recipient: &mut String,
-    amount: &mut String,
-    fee: &mut String,
-    result: &mut Option<Result<String, String>>,
-) {
+fn send_section(ui: &mut egui::Ui, backend: &mut Backend, form: &mut SendForm) {
     ui.strong("Send");
+    let saved = backend.addresses().to_vec();
+    let recent = backend.recent_recipients(5);
     egui::Grid::new("send").num_columns(2).show(ui, |ui| {
         ui.label("To address");
-        ui.add(
-            egui::TextEdit::singleline(recipient)
-                .desired_width(340.0)
-                .hint_text("64 hex characters"),
-        );
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut form.recipient)
+                    .desired_width(340.0)
+                    .hint_text("64 hex characters"),
+            );
+            egui::ComboBox::from_id_salt("saved-address")
+                .selected_text("Saved")
+                .show_ui(ui, |ui| {
+                    if saved.is_empty() && recent.is_empty() {
+                        ui.label("No saved addresses yet");
+                    }
+                    for a in &saved {
+                        let text = format!("{}  {}", a.name, short(&a.address));
+                        if ui.selectable_label(form.recipient == a.address, text).clicked() {
+                            form.recipient = a.address.clone();
+                        }
+                    }
+                    if !recent.is_empty() {
+                        ui.separator();
+                        ui.weak("Sent to recently");
+                        for r in &recent {
+                            if ui.selectable_label(form.recipient == *r, short(r)).clicked() {
+                                form.recipient = r.clone();
+                            }
+                        }
+                    }
+                });
+        });
         ui.end_row();
+
+        // Under a valid address: its saved name, or a field to save it.
+        if let Ok(bytes) = jcoin::wallet::decode_address(form.recipient.trim()) {
+            let address = hex::encode(bytes);
+            ui.label("");
+            ui.horizontal(|ui| match backend.address_name(&address) {
+                Some(name) => {
+                    ui.label(format!("Saved as {name}"));
+                }
+                None => {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.save_name)
+                            .desired_width(160.0)
+                            .char_limit(MAX_ADDRESS_NAME)
+                            .hint_text("name"),
+                    );
+                    if ui.button("Save address").clicked() {
+                        form.book_result = Some(
+                            backend
+                                .save_address(&form.save_name, &address)
+                                .map(|a| format!("Saved {} as {}", short(&a.address), a.name)),
+                        );
+                        if matches!(form.book_result, Some(Ok(_))) {
+                            form.save_name.clear();
+                        }
+                    }
+                }
+            });
+            ui.end_row();
+        }
+
         ui.label("Amount (JEF)");
-        ui.add(egui::TextEdit::singleline(amount).desired_width(120.0));
+        ui.add(egui::TextEdit::singleline(&mut form.amount).desired_width(120.0));
         ui.end_row();
         ui.label("Fee (JEF)");
-        ui.add(egui::TextEdit::singleline(fee).desired_width(120.0).hint_text("0"));
+        ui.add(egui::TextEdit::singleline(&mut form.fee).desired_width(120.0).hint_text("0"));
         ui.end_row();
     });
     if ui.button("Send").clicked() {
-        *result = Some(backend.send(recipient, amount, fee));
-        if matches!(result, Some(Ok(_))) {
-            recipient.clear();
-            amount.clear();
-            fee.clear();
+        form.result = Some(backend.send(&form.recipient, &form.amount, &form.fee));
+        if matches!(form.result, Some(Ok(_))) {
+            form.recipient.clear();
+            form.amount.clear();
+            form.fee.clear();
         }
     }
-    match result {
+    match &form.result {
         Some(Ok(id)) => {
             ui.label(format!("Sent. Transaction {}", short(id)));
         }
@@ -993,7 +1044,10 @@ fn send_section(
         egui::Grid::new("sent").num_columns(3).show(ui, |ui| {
             for tx in sent.iter().rev() {
                 ui.label(format!("{} JEF", format_jef(tx.amount)));
-                ui.monospace(format!("to {}", short(&tx.recipient)));
+                match backend.address_name(&tx.recipient) {
+                    Some(name) => ui.label(format!("to {name}")).on_hover_text(&tx.recipient),
+                    None => ui.monospace(format!("to {}", short(&tx.recipient))),
+                };
                 let status = if confirmed_nonce > tx.nonce {
                     "confirmed"
                 } else {
@@ -1004,5 +1058,37 @@ fn send_section(
                 ui.end_row();
             }
         });
+    }
+
+    match &form.book_result {
+        Some(Ok(message)) => {
+            ui.label(message.as_str());
+        }
+        Some(Err(e)) => {
+            ui.colored_label(ui.visuals().error_fg_color, e.as_str());
+        }
+        None => {}
+    }
+    if !saved.is_empty() {
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new(format!("Saved addresses ({})", saved.len()))
+            .id_salt("saved_addresses")
+            .show(ui, |ui| {
+                egui::Grid::new("saved").num_columns(4).show(ui, |ui| {
+                    for a in &saved {
+                        ui.label(a.name.as_str());
+                        ui.monospace(short(&a.address)).on_hover_text(&a.address);
+                        if ui.button("Use").clicked() {
+                            form.recipient = a.address.clone();
+                        }
+                        if ui.button("Remove").clicked() {
+                            form.book_result = Some(
+                                backend.remove_address(&a.address).map(|()| format!("Removed {}", a.name)),
+                            );
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
     }
 }

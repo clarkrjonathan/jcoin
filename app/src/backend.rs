@@ -80,6 +80,39 @@ fn save_sent(dir: &Path, sent: &[SentTx]) -> std::io::Result<()> {
     std::fs::write(dir.join(SENT_FILE), text)
 }
 
+/// File in the data folder that lists saved addresses, one per line: the
+/// address (64 hex), a space, the name.
+const ADDRESSES_FILE: &str = "addresses.txt";
+
+/// Longest name for a saved address, in characters.
+pub const MAX_ADDRESS_NAME: usize = 40;
+
+/// The saved addresses stored in `dir`, sorted by name; empty if there are
+/// none. Bad lines are skipped.
+fn load_addresses(dir: &Path) -> Vec<SavedAddress> {
+    let text = std::fs::read_to_string(dir.join(ADDRESSES_FILE)).unwrap_or_default();
+    let mut list: Vec<SavedAddress> = text
+        .lines()
+        .filter_map(|line| {
+            let (address, name) = line.split_once(' ')?;
+            let address = hex::encode(wallet::decode_address(address).ok()?);
+            let name = name.trim();
+            (!name.is_empty()).then(|| SavedAddress { name: name.to_string(), address })
+        })
+        .collect();
+    sort_addresses(&mut list);
+    list
+}
+
+fn save_addresses(dir: &Path, list: &[SavedAddress]) -> std::io::Result<()> {
+    let text: String = list.iter().map(|a| format!("{} {}\n", a.address, a.name)).collect();
+    std::fs::write(dir.join(ADDRESSES_FILE), text)
+}
+
+fn sort_addresses(list: &mut [SavedAddress]) {
+    list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+}
+
 /// Where and how this instance runs. Environment variables override the
 /// defaults, for testing: `JCOIN_APP_DATA` (data folder), `JCOIN_APP_RELAY` (a
 /// relay multiaddr, or `none`), `JCOIN_APP_PEER` (a peer to dial), and
@@ -270,6 +303,14 @@ pub struct KeyEntry {
     pub address: String,
 }
 
+/// An address saved under a name, to pick when sending.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedAddress {
+    pub name: String,
+    /// 64 lowercase hex characters.
+    pub address: String,
+}
+
 pub struct Backend {
     pub settings: Settings,
     /// Address of the key in use: it receives mining rewards and signs sends.
@@ -295,6 +336,8 @@ pub struct Backend {
     /// GPU names by adapter index; filled in by a background thread.
     gpus: Arc<Mutex<Option<Vec<String>>>>,
     pub sent: Vec<SentTx>,
+    /// The address book, sorted by name.
+    addresses: Vec<SavedAddress>,
     /// When the last once-a-minute `status` line was logged.
     last_status: std::time::Instant,
 }
@@ -393,6 +436,7 @@ impl Backend {
         }
 
         let sent = load_sent(&settings.data_dir);
+        let addresses = load_addresses(&settings.data_dir);
         let mut backend = Backend {
             settings,
             address,
@@ -411,6 +455,7 @@ impl Backend {
             mining_error: None,
             gpus,
             sent,
+            addresses,
             // Emit the first status line about a minute after start.
             last_status: std::time::Instant::now(),
         };
@@ -513,6 +558,77 @@ impl Backend {
 
     pub fn key_file(&self) -> PathBuf {
         wallet::key_path(&self.settings.data_dir, &self.key_name)
+    }
+
+    /// The saved addresses, sorted by name.
+    pub fn addresses(&self) -> &[SavedAddress] {
+        &self.addresses
+    }
+
+    /// The name `address` is saved under, if it is saved.
+    pub fn address_name(&self, address: &str) -> Option<&str> {
+        let address = address.trim().to_lowercase();
+        self.addresses.iter().find(|a| a.address == address).map(|a| a.name.as_str())
+    }
+
+    /// Save `address` under `name`. An address already saved is renamed. A
+    /// name already used for another address is refused.
+    pub fn save_address(&mut self, name: &str, address: &str) -> Result<SavedAddress, String> {
+        let address = hex::encode(wallet::decode_address(address.trim())?);
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("enter a name".into());
+        }
+        if name.chars().count() > MAX_ADDRESS_NAME {
+            return Err(format!("the name is longer than {MAX_ADDRESS_NAME} characters"));
+        }
+        if name.chars().any(char::is_control) {
+            return Err("the name has a control character".into());
+        }
+        if let Some(other) = self
+            .addresses
+            .iter()
+            .find(|a| a.name.to_lowercase() == name.to_lowercase() && a.address != address)
+        {
+            return Err(format!("'{}' is already the name of {}", other.name, short(&other.address)));
+        }
+        let entry = SavedAddress { name: name.to_string(), address };
+        let mut list: Vec<SavedAddress> =
+            self.addresses.iter().filter(|a| a.address != entry.address).cloned().collect();
+        list.push(entry.clone());
+        sort_addresses(&mut list);
+        save_addresses(&self.settings.data_dir, &list)
+            .map_err(|e| format!("cannot write {ADDRESSES_FILE}: {e}"))?;
+        self.addresses = list;
+        Ok(entry)
+    }
+
+    /// Remove a saved address.
+    pub fn remove_address(&mut self, address: &str) -> Result<(), String> {
+        let address = hex::encode(wallet::decode_address(address.trim())?);
+        if !self.addresses.iter().any(|a| a.address == address) {
+            return Err(format!("{} is not saved", short(&address)));
+        }
+        let list: Vec<SavedAddress> = self.addresses.iter().filter(|a| a.address != address).cloned().collect();
+        save_addresses(&self.settings.data_dir, &list)
+            .map_err(|e| format!("cannot write {ADDRESSES_FILE}: {e}"))?;
+        self.addresses = list;
+        Ok(())
+    }
+
+    /// Addresses the key in use has sent to that are not saved, newest
+    /// first, at most `max`.
+    pub fn recent_recipients(&self, max: usize) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for tx in self.sent.iter().rev().filter(|tx| tx.sender == self.address) {
+            if out.len() == max {
+                break;
+            }
+            if self.address_name(&tx.recipient).is_none() && !out.contains(&tx.recipient) {
+                out.push(tx.recipient.clone());
+            }
+        }
+        out
     }
 
     /// Sign a transfer and submit it to the embedded node. `amount` and `fee`
@@ -1101,6 +1217,68 @@ mod tests {
         let back = load_sent(&dir);
         assert_eq!(back.len(), 1);
         assert_eq!((back[0].id.as_str(), back[0].amount, back[0].nonce), ("bb", 5, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn addresses_are_saved_renamed_removed_and_remembered() {
+        let dir = std::env::temp_dir().join(format!("jcoin-app-addresses-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let settings = || Settings {
+            data_dir: dir.clone(),
+            relay: None,
+            peers: Vec::new(),
+            regtest: true,
+        };
+        let mut backend = Backend::start(settings()).unwrap();
+        assert!(backend.addresses().is_empty());
+        let (a, b) = ("AB".repeat(32), "cd".repeat(32));
+
+        let saved = backend.save_address("  Zoe  ", &format!("0x{a}")).unwrap();
+        assert_eq!(saved, SavedAddress { name: "Zoe".into(), address: a.to_lowercase() });
+        backend.save_address("adam", &b).unwrap();
+        let names: Vec<&str> = backend.addresses().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["adam", "Zoe"], "sorted by name, ignoring case");
+        assert_eq!(backend.address_name(&a), Some("Zoe"));
+
+        assert!(backend.save_address("ZOE", &b).is_err(), "name used for another address");
+        assert!(backend.save_address("", &b).is_err());
+        assert!(backend.save_address("x".repeat(MAX_ADDRESS_NAME + 1).as_str(), &b).is_err());
+        assert!(backend.save_address("tab\there", &b).is_err());
+        assert!(backend.save_address("short", "abc").is_err());
+        // Saving a saved address again renames it.
+        backend.save_address("Adam B", &b).unwrap();
+        assert_eq!(backend.addresses().len(), 2);
+        assert_eq!(backend.address_name(&b), Some("Adam B"));
+
+        // Recent recipients leave out saved ones and repeats.
+        let (c, a) = ("ef".repeat(32), a.to_lowercase());
+        let me = backend.address.clone();
+        for (recipient, nonce) in [(&c, 0), (&a, 1), (&c, 2)] {
+            backend.sent.push(SentTx {
+                sender: me.clone(),
+                id: format!("{nonce:064}"),
+                recipient: recipient.clone(),
+                amount: 1,
+                nonce,
+            });
+        }
+        assert_eq!(backend.recent_recipients(5), [c.clone()]);
+        assert_eq!(backend.recent_recipients(0), Vec::<String>::new());
+
+        backend.remove_address(&a).unwrap();
+        assert!(backend.remove_address(&a).is_err(), "already removed");
+        assert_eq!(backend.recent_recipients(5), [c.clone(), a.clone()]);
+
+        // A bad line in the file is skipped; the rest is read on the next start.
+        let file = dir.join(ADDRESSES_FILE);
+        std::fs::write(&file, std::fs::read_to_string(&file).unwrap() + "garbage\n").unwrap();
+        let again = Backend::start(settings()).unwrap();
+        assert_eq!(
+            again.addresses(),
+            [SavedAddress { name: "Adam B".into(), address: b.clone() }]
+        );
+        drop((backend, again));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

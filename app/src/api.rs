@@ -22,7 +22,7 @@ use axum::extract::{Path as UrlPath, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use jcoin::amount::format_jef;
 use jcoin_gpu_miner::kernel::Kernel;
@@ -176,6 +176,8 @@ fn router(state: AppState) -> Router {
         .route("/keys/active/secret", get(secret))
         .route("/send", post(send))
         .route("/sent", get(sent))
+        .route("/addresses", get(list_addresses).post(save_address))
+        .route("/addresses/{address}", delete(remove_address))
         .route("/mining", get(mining))
         .route("/mining/start", post(start_mining))
         .route("/mining/stop", post(stop_mining))
@@ -686,6 +688,52 @@ async fn sent(State(s): State<AppState>) -> Json<Vec<SentReply>> {
         })
         .await,
     )
+}
+
+/// An address saved under a name.
+#[derive(Serialize, Deserialize, ToSchema)]
+struct AddressEntry {
+    /// At most 40 characters; unique, ignoring case.
+    name: String,
+    /// 64 hex characters.
+    address: String,
+}
+
+/// The saved addresses, sorted by name.
+#[utoipa::path(get, path = "/api/addresses", tag = "wallet",
+    responses((status = 200, body = Vec<AddressEntry>)))]
+async fn list_addresses(State(s): State<AppState>) -> Json<Vec<AddressEntry>> {
+    Json(
+        with_backend(&s, |b| {
+            b.addresses()
+                .iter()
+                .map(|a| AddressEntry { name: a.name.clone(), address: a.address.clone() })
+                .collect()
+        })
+        .await,
+    )
+}
+
+/// Save an address under a name. An address already saved is renamed.
+#[utoipa::path(post, path = "/api/addresses", tag = "wallet", request_body = AddressEntry,
+    responses((status = 201, body = AddressEntry),
+              (status = 400, description = "Bad address or name, or the name is used for another address", body = ErrorReply)))]
+async fn save_address(State(s): State<AppState>, Json(req): Json<AddressEntry>) -> Result<(StatusCode, Json<AddressEntry>), ApiError> {
+    with_backend(&s, move |b| b.save_address(&req.name, &req.address))
+        .await
+        .map(|a| (StatusCode::CREATED, Json(AddressEntry { name: a.name, address: a.address })))
+        .map_err(bad)
+}
+
+/// Remove a saved address.
+#[utoipa::path(delete, path = "/api/addresses/{address}", tag = "wallet",
+    params(("address" = String, Path, description = "64 hex characters")),
+    responses((status = 204), (status = 400, description = "Bad or unsaved address", body = ErrorReply)))]
+async fn remove_address(State(s): State<AppState>, UrlPath(address): UrlPath<String>) -> Result<StatusCode, ApiError> {
+    with_backend(&s, move |b| b.remove_address(&address))
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(bad)
 }
 
 // --- mining ------------------------------------------------------------------
@@ -1216,7 +1264,7 @@ async fn log(State(s): State<AppState>, Query(q): Query<LogQuery>) -> Json<Vec<L
         status, restart, device, set_device, diagnostics, log,
         node_chain, node_recent, node_peers, node_signal, node_balance, node_transaction,
         list_keys, create_key, import_key, select_key, secret,
-        send, sent,
+        send, sent, list_addresses, save_address, remove_address,
         mining, start_mining, stop_mining, set_gpu_limit, set_kernel, won_blocks, gpus,
         updates, check_updates, install_update, install_state, install_app, uninstall,
     ),
@@ -1226,7 +1274,7 @@ async fn log(State(s): State<AppState>, Query(q): Query<LogQuery>) -> Json<Vec<L
         (name = "app", description = "State, restart, label, diagnostics, log"),
         (name = "node", description = "The embedded node's REST replies, passed through"),
         (name = "keys", description = "Stored keys and the key in use"),
-        (name = "wallet", description = "Sending and the sent list"),
+        (name = "wallet", description = "Sending, the sent list, and saved addresses"),
         (name = "mining", description = "The GPU miner"),
         (name = "updates", description = "Releases, updating, installing"),
     )
@@ -1271,6 +1319,7 @@ mod tests {
                 "GET" => self.http.get(url),
                 "POST" => self.http.post(url),
                 "PUT" => self.http.put(url),
+                "DELETE" => self.http.delete(url),
                 other => panic!("method {other}"),
             };
             if let Some(t) = token {
@@ -1407,6 +1456,20 @@ mod tests {
         assert_eq!(code, 400);
         assert!(err["error"].as_str().unwrap().contains("balance too low"), "{err}");
         assert_eq!(c.get("/api/sent").1, json!([]));
+
+        // Saved addresses: save, refuse a taken name, rename, remove.
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let (code, entry) = c.post("/api/addresses", json!({"name": "Sam", "address": a}));
+        assert_eq!((code, entry), (201, json!({"name": "Sam", "address": a})));
+        assert_eq!(c.post("/api/addresses", json!({"name": "sam", "address": b})).0, 400);
+        assert_eq!(c.post("/api/addresses", json!({"name": "Bea", "address": b})).0, 201);
+        assert_eq!(c.post("/api/addresses", json!({"name": "Sam R", "address": a})).0, 201);
+        let names: Vec<Value> = c.get("/api/addresses").1.as_array().unwrap().iter().map(|e| e["name"].clone()).collect();
+        assert_eq!(names, [json!("Bea"), json!("Sam R")]);
+        let delete = |address: &str| c.call("DELETE", &format!("/api/addresses/{address}"), None, Some(&token)).0;
+        assert_eq!(delete(&b), 204);
+        assert_eq!(delete(&b), 400);
+        assert_eq!(c.get("/api/addresses").1, json!([{"name": "Sam R", "address": a}]));
 
         // The label, the log, and the diagnostics.
         assert_eq!(c.put("/api/device", json!({"label": "Test box"})).1["label"], "Test box");

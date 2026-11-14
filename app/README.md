@@ -64,6 +64,14 @@ once the wallet's confirmed nonce has passed the transfer's nonce. The node
 keeps pending transfers in `pending.dat`, so they are still pending after a
 restart.
 
+The Send section keeps an address book in `addresses.txt` (one line per
+address: the address, a space, the name). Typing a valid address that is not
+saved shows a field to save it under a name of up to 40 characters; names are
+unique, ignoring case, and saving a saved address renames it. The "Saved" list
+next to the address field offers the saved addresses, then up to five
+unsaved addresses the key in use sent to recently. The "Sent" list shows the
+name of a saved recipient. "Saved addresses" lists them with Use and Remove.
+
 ## Developer section
 
 Collapsed by default (`JCOIN_APP_DEV=1` starts with it open). It shows:
@@ -175,8 +183,8 @@ workflow checks this, and builds only for a tag whose commit is on `main`.
 ## Local API
 
 The app serves an HTTP API on 127.0.0.1 with what the window shows and does:
-status, keys (create, import, select, read the secret), sending and the sent
-list, mining (start, stop, GPU, limit, kernel, blocks mined), updates and
+status, keys (create, import, select, read the secret), sending, the sent
+list, saved addresses (list, save, remove), mining (start, stop, GPU, limit, kernel, blocks mined), updates and
 install, the computer's label, diagnostics, the log, restart, and the node's
 chain, blocks, peers, balances and transactions passed through from its REST
 server. It listens only on 127.0.0.1, port 3100 or another free one.
