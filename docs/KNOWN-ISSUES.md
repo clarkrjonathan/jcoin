@@ -42,9 +42,10 @@ Every connection, relayed ones included, is encrypted end to end with Noise
 and authenticated by libp2p peer id, so neither the relay nor a man in the
 middle can read or alter traffic or impersonate a node. What remains: the relay
 can refuse service, drop circuits, or omit peers from rendezvous answers, and a
-node behind NAT that knows no other peer depends on it. Peer ids are not tied
-to any allowlist, so anyone can join an open network. Fix directions: support
-several relays per node, persist the address book, and add peer scoring (V2).
+node behind NAT whose saved peers are all unreachable depends on it. Peer ids
+are not tied to any allowlist, so anyone can join an open network. Fix
+directions: a node with a public address that apps dial at startup (planned,
+`app-default-peer`), several relays per node, and peer scoring (V2).
 
 ## Operational limitations (correctness-safe, but rough edges)
 

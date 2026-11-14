@@ -112,6 +112,12 @@ pub async fn run(config: ServiceConfig) -> Result<(), String> {
 
     let network = Network::new(node_tx.clone(), listen_port, Vec::new(), config.max_peers);
     network.set_own_label(config.label.clone());
+    if let Some(dir) = &config.data_dir {
+        match network.use_book_file(dir.join(crate::p2p::network::BOOK_FILE)) {
+            Ok(n) => crate::log_info!("[p2p] address book: {n} saved addresses"),
+            Err(e) => crate::log_error!("[p2p] cannot read the address book: {e}"),
+        }
+    }
 
     // P2P host: identity, listener, bootstrap peers, and the optional relay.
     let key_file = config

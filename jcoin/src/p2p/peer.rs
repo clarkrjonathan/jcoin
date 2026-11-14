@@ -274,9 +274,10 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
         Message::GetAddr => write_message(write_half, &Message::Addr(network.known_addrs()))
             .await
             .is_ok(),
-        // Learn new addresses and try to connect to fresh direct ones.
+        // Learn new addresses and try to connect to fresh ones. The sender
+        // vouches for its own addresses.
         Message::Addr(endpoints) => {
-            let fresh = network.learn(endpoints);
+            let fresh = network.learn_from(endpoints, network.session_peer(peer_id));
             network.maybe_dial(fresh);
             true
         }

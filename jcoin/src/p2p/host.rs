@@ -256,6 +256,7 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                 SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                     network.set_connected(peer_id, true);
                     if let Some(addr) = pending.remove(&connection_id) {
+                        network.vouch(&addr);
                         network.dial_finished(&addr, true);
                     }
                     if endpoint.is_dialer() {
@@ -427,15 +428,21 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
                     }
                     rendezvous::client::Event::Discovered { registrations, cookie: next, .. } => {
                         cookie = Some(next);
-                        let mut addrs = Vec::new();
+                        // A registration is signed by its peer, so it vouches
+                        // for its addresses. They go into the same book as
+                        // gossiped ones.
+                        let mut fresh = Vec::new();
                         for reg in registrations {
                             let peer = reg.record.peer_id();
-                            if peer == local_id || network.is_connected(&peer) {
+                            if peer == local_id {
                                 continue;
                             }
-                            addrs.extend(reg.record.addresses().iter().map(|a| with_peer(a.clone(), peer)));
+                            let addrs = reg.record.addresses().iter().map(|a| with_peer(a.clone(), peer)).collect();
+                            let learned = network.learn_from(addrs, Some(peer));
+                            if !network.is_connected(&peer) {
+                                fresh.extend(learned);
+                            }
                         }
-                        let fresh = network.learn(addrs.clone());
                         network.maybe_dial(fresh);
                     }
                     rendezvous::client::Event::DiscoverFailed { error, .. } => {
@@ -501,6 +508,13 @@ pub async fn run_host(config: HostConfig, network: Network) -> Result<(), Box<dy
             }
 
             _ = ticker.tick() => {
+                // The address book: drop stale entries, dial random ones while
+                // below the peer cap, and save it if it changed.
+                network.expire_book();
+                network.dial_from_book();
+                if let Err(e) = network.save_book() {
+                    crate::log_error!("[p2p] cannot save the address book: {e}");
+                }
                 for (addr, known) in &bootstrap {
                     let connected = known.map(|p| swarm.is_connected(&p)).unwrap_or(false);
                     if !connected {

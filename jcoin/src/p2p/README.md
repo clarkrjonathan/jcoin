@@ -158,12 +158,32 @@ Encoding: a `u16` count, then for each address a `u16` length and the
 multiaddr's binary encoding. An address longer than 512 bytes, invalid
 multiaddr bytes, or trailing bytes reject the whole message.
 
-A node sends its own addresses plus up to 64 from its address book. A receiver
-reads at most 256 entries per message, keeps at most 1,000 addresses (a random
-entry is evicted when full), and dials new ones within its peer cap. Dials
-still in progress count toward the cap. Because the address names the peer id,
-a dial reaches only that peer; a stale or forged address fails the Noise
-handshake.
+Each side sends `ADDR` and `GET_ADDR` when a session opens. A node sends its
+own addresses plus a random sample of up to 64 from its address book. A
+receiver reads at most 256 entries per message, keeps at most 1,000 addresses
+(a random entry is evicted when full), and dials new ones within its peer cap.
+Dials still in progress count toward the cap. Because the address names the
+peer id, a dial reaches only that peer; a stale or forged address fails the
+Noise handshake.
+
+**The address book.** Gossiped addresses and rendezvous answers go into one
+book. Each entry keeps the time it was last vouched for: sent by the peer it
+names (its own `ADDR`, or its signed rendezvous registration), or dialed
+successfully. An address passed on by another peer keeps the time it was first
+learned, so a dead address does not live on by being passed around. Entries
+not vouched for in 7 days are dropped. A node with a data folder saves the
+book to `peers.txt` there (one line per address: the Unix second it was last
+vouched for, a space, the multiaddr) whenever it changes, checked every 10
+seconds, and reads it at start. On each 10-second tick a node dials from the
+book, each address at most once every 10 minutes: first the direct addresses
+of peers it reaches only through the relay (outside the peer cap), then,
+while below its peer cap, addresses picked at random of peers it is not
+connected to. So after a restart it reconnects without the relay or
+`--peer`, as long as some saved peers are still reachable, and a relayed
+session with a node that has a public address moves to a direct connection
+even if the first direct dial failed. A hole punch cannot do that: it
+expects both sides to dial at once, and the public node cannot dial into a
+home network, so the two sides wait on each other until the dial times out.
 
 A peer reached only through the relay is the exception to "dial new ones
 within the cap". Each direct address learned for it is dialed once, outside
@@ -255,7 +275,9 @@ A compatible node needs:
 
 ### Known limitations
 
-- The address book is not persisted; after a restart a node depends on
-  `--peer` and the relay again.
+- A node behind NAT advertises its LAN and relayed addresses, never its
+  public one. Saved addresses of a home node work only from its own network
+  or through the relay; only a node with a public address (`--advertise`) can
+  be reached from anywhere by its saved address.
 - Only one relay per node (`--relay`). Several relays would remove the single
   point of failure for nodes behind NAT.

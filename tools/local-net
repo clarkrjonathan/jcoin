@@ -7,6 +7,9 @@
 #              and find each other through its rendezvous, like the app.
 #              They listen on all interfaces, so their LAN addresses are
 #              advertised (tests direct connections replacing relayed ones)
+#   tools/local-net restart [norelay]  restart the nodes on their data;
+#              norelay also stops the relay and drops --relay and --peer, so
+#              the nodes have only their saved address books (peers.txt)
 #   tools/local-net status     one line for each node (and the relay)
 #   tools/local-net peers      each node's connections, one line each
 #   tools/local-net down       stop them and delete their data
@@ -50,11 +53,37 @@ case "${1:-}" in
         [ "$i" -gt 1 ] && args+=(--peer 127.0.0.1:3911)
       fi
       [ "$i" -eq 1 ] && [ $mine -eq 1 ] && args+=(--mine --miner "$miner")
+      printf '%s\n' "${args[@]}" > "$dir/node$i.args"
       setsid nohup "$bin/node" "${args[@]}" > "$dir/node$i.log" 2>&1 < /dev/null &
       echo $! >> "$dir/pids"
     done
     sleep 2
     echo "started $n nodes$([ $relay -eq 1 ] && echo " behind a relay ($relay_addr)"); miner key 'miner' in $dir/keys (address $miner)"
+    "$0" status
+    ;;
+  restart)
+    [ -f "$dir/pids" ] || { echo "no local net is running" >&2; exit 1; }
+    norelay=0
+    case "${2:-}" in norelay) norelay=1 ;; '') ;; *) echo "unknown argument: $2" >&2; exit 2 ;; esac
+    while read -r pid; do kill "$pid" 2>/dev/null || true; done < "$dir/pids"
+    if [ $norelay -eq 1 ] && [ -f "$dir/relay.pid" ]; then
+      kill "$(cat "$dir/relay.pid")" 2>/dev/null || true; rm -f "$dir/relay.pid"
+    fi
+    sleep 1
+    n=$(wc -l < "$dir/pids"); : > "$dir/pids"
+    for i in $(seq 1 "$n"); do
+      mapfile -t saved < "$dir/node$i.args"
+      args=(); skip=0
+      for a in "${saved[@]}"; do
+        if [ $skip -eq 1 ]; then skip=0; continue; fi
+        if [ $norelay -eq 1 ] && { [ "$a" = --relay ] || [ "$a" = --peer ]; }; then skip=1; continue; fi
+        args+=("$a")
+      done
+      setsid nohup "$bin/node" "${args[@]}" >> "$dir/node$i.log" 2>&1 < /dev/null &
+      echo $! >> "$dir/pids"
+    done
+    sleep 2
+    echo "restarted $n nodes$([ $norelay -eq 1 ] && echo " without the relay or --peer")"
     "$0" status
     ;;
   status|peers)
@@ -75,5 +104,5 @@ case "${1:-}" in
     done
     rm -rf "$dir"; echo "stopped and removed"
     ;;
-  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
